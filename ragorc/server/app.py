@@ -118,6 +118,7 @@ from ragorc.core.telemetry import (
     CostLedger,
     configure_logging,
     new_request_context,
+    redact_identifiers,
     timed,
     trace_step,
 )
@@ -204,12 +205,16 @@ def _safe_detail(detail: dict[str, Any]) -> dict[str, Any]:
         lowered = str(key).lower()
         if any(hint in lowered for hint in _SECRET_HINTS):
             continue
+        # Values are redacted as well as keys. Key filtering alone lets a provider
+        # error body through under `body` or `message` with a key-management URL
+        # and an account id inside it — the credential quoted in someone else's
+        # prose, which is exactly the shape a key-name rule cannot see.
         if isinstance(value, (str, int, float, bool)) or value is None:
-            out[str(key)] = value[:500] if isinstance(value, str) else value
+            out[str(key)] = redact_identifiers(value[:500]) if isinstance(value, str) else value
         elif isinstance(value, (list, tuple)):
-            out[str(key)] = [str(v)[:200] for v in list(value)[:20]]
+            out[str(key)] = [redact_identifiers(str(v)[:200]) for v in list(value)[:20]]
         else:
-            out[str(key)] = str(value)[:500]
+            out[str(key)] = redact_identifiers(str(value)[:500])
     return out
 
 

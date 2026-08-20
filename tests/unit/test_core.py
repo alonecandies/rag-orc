@@ -28,7 +28,13 @@ from ragorc.core.models import (
     dedupe_scored,
 )
 from ragorc.core.registry import available, register, resolve
-from ragorc.core.telemetry import CostLedger, new_request_context, timed
+from ragorc.core.telemetry import (
+    CostLedger,
+    _redact_secrets,
+    new_request_context,
+    redact_identifiers,
+    timed,
+)
 from ragorc.core.tokens import TokenBudget, count_tokens, count_tokens_batch, truncate_to_tokens
 
 
@@ -528,3 +534,65 @@ def test_late_chunking_docs_do_not_call_it_the_default() -> None:
     # terms — "preferred, but not running" is only actionable if it says so.
     assert "resolves to early" in normalized(cost)
     assert "chosen=early" in embed
+
+
+# ---------------------------------------------------------------------------
+# Redaction: the credential quoted inside somebody else's prose
+# ---------------------------------------------------------------------------
+def test_redact_identifiers_strips_operator_identity_from_free_text() -> None:
+    """Key-name filtering cannot see a secret that arrives inside a value.
+
+    A provider's 4xx body is a sentence, and OpenRouter's carries a
+    key-management URL with the key id in it plus the account user id. That body
+    is attached to the raised error and travels to the abstention reason, the
+    HTTP error detail and the CLI, so it reaches whoever called the API.
+    """
+    body = (
+        '{"error":{"message":"Insufficient credit. To purchase more, visit '
+        'https://openrouter.ai/workspaces/default/keys/0f1e2d3c4b5a69788796a5b4c3d2e1f0"},'
+        '"user_id":"user_EXAMPLEaccountEXAMPLE00000"}'
+    )
+    out = redact_identifiers(body)
+    assert "0f1e2d3c4b5a69788796a5b4c3d2e1f0" not in out
+    assert "user_EXAMPLEaccountEXAMPLE00000" not in out
+    assert "Insufficient credit" in out, "the useful sentence must survive"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Bearer sk-or-v1-c985a601a9ecbf64a186ea7b0d695b3abc3340db",
+        "key=sk-or-v1-c985a601a9ecbf64a186ea7b0d695b3abc3340db failed",
+        "token ghp_16CharactersAtLeastHere00",
+    ],
+)
+def test_redact_identifiers_removes_credential_shapes(text: str) -> None:
+    out = redact_identifiers(text)
+    assert "c985a601" not in out
+    assert "16CharactersAtLeastHere00" not in out
+
+
+def test_redact_identifiers_leaves_ordinary_text_alone() -> None:
+    """It runs on every log line, so it must not mangle normal messages."""
+    for text in (
+        'relation "orders" does not exist',
+        "retrieved 12 chunks in 43ms",
+        "SELECT id FROM orders WHERE sku = 'sk-9'",
+    ):
+        assert redact_identifiers(text) == text
+
+
+def test_log_redactor_scrubs_values_not_only_secret_keys() -> None:
+    """`body` is not a credential-shaped key, and that is the whole problem."""
+    event = _redact_secrets(
+        None,
+        "info",
+        {
+            "event": "provider_error",
+            "body": "visit https://openrouter.ai/workspaces/default/keys/abcdef0123456789",
+            "api_key": "sk-or-v1-should-be-masked-by-the-key-rule",
+        },
+    )
+    assert "abcdef0123456789" not in event["body"]
+    assert event["api_key"].endswith("***"), "the key-name rule must still apply"
+    assert event["event"] == "provider_error"

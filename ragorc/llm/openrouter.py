@@ -40,7 +40,7 @@ from ragorc.core.errors import (
 )
 from ragorc.core.models import Usage
 from ragorc.core.settings import LLMSettings, get_settings
-from ragorc.core.telemetry import current_ledger
+from ragorc.core.telemetry import current_ledger, redact_identifiers
 
 log = structlog.get_logger(__name__)
 
@@ -224,6 +224,20 @@ class OpenRouterLLM:
             calls=1,
         )
 
+    @staticmethod
+    def _provider_detail(text: str, limit: int = 400) -> str:
+        """Clip a provider error body and strip the operator's identity from it.
+
+        The body is genuinely useful — it carries the sentence that says what is
+        actually wrong — but OpenRouter's 4xx bodies also carry a key-management
+        URL containing the key id and an account ``user_id``. That body is
+        attached to the raised error, and from there it reaches the abstention
+        reason, the HTTP error detail and the CLI, so it ends up shown to whoever
+        called the API. Redacting once here covers all of them; the unredacted
+        body still goes to the local log.
+        """
+        return redact_identifiers(text[:limit])
+
     # -- core call ---------------------------------------------------------
     @retry_async(max_attempts=4, retry_on=(TransientError,))
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -239,7 +253,7 @@ class OpenRouterLLM:
 
         if response.status_code in _RETRY_STATUS:
             retry_after = response.headers.get("retry-after")
-            message = response.text[:400]
+            message = self._provider_detail(response.text)
             if response.status_code == 429:
                 raise RateLimited(
                     "rate limited by provider",
@@ -558,7 +572,9 @@ class OpenRouterLLM:
                     "POST", "/chat/completions", content=orjson.dumps(body)
                 ) as response:
                     if response.status_code >= 400:
-                        detail = (await response.aread())[:600].decode(errors="replace")
+                        detail = self._provider_detail(
+                            (await response.aread()).decode(errors="replace"), 600
+                        )
                         if response.status_code in _RETRY_STATUS:
                             raise TransientError(
                                 f"stream failed {response.status_code}", body=detail

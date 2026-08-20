@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import re
 import sys
 import time
 from collections.abc import Iterator
@@ -82,14 +83,50 @@ def configure_logging(level: str = "INFO", json_logs: bool = True, redact: bool 
 _SECRET_HINTS = ("api_key", "apikey", "password", "token", "secret", "authorization", "dsn")
 
 
+#: Identifiers that leak through a value rather than through a key name. Key
+#: filtering cannot catch these: they arrive inside a provider's prose error body
+#: under an innocuous key like ``body`` or ``message``, and that body is echoed
+#: into an abstention reason, an HTTP error detail and the CLI. What they expose
+#: is the *operator's* account — a key-management URL carrying the key id, an
+#: account user id — to whoever called the API.
+_IDENTIFIER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bsk-(?:or-v\d+-)?[A-Za-z0-9]{16,}"), "sk-***"),
+    (re.compile(r"\b(?:gh[pousr]_|xox[baprs]-)[A-Za-z0-9-]{10,}"), "***"),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{10,}", re.IGNORECASE), "Bearer ***"),
+    (re.compile(r"https?://[^\s\"'<>]*/keys/[A-Za-z0-9._-]{8,}"), "<key-url-redacted>"),
+    (re.compile(r"(user_id\\?\"?\s*[:=]\s*\\?\"?)[A-Za-z0-9_-]{6,}"), r"\1<redacted>"),
+)
+
+#: Cheap pre-filter. Almost every string that reaches the redactor contains none
+#: of these, and a substring scan is an order of magnitude cheaper than five
+#: regex passes — which matters because this runs on log lines.
+_IDENTIFIER_MARKERS = ("sk-", "/keys/", "user_id", "earer ", "ghp_", "gho_", "xox")
+
+
+def redact_identifiers(text: str) -> str:
+    """Blank operator-identifying values inside free text.
+
+    Complements the key-name filtering below rather than replacing it: that
+    catches ``{"api_key": ...}``, this catches the same secret quoted inside
+    ``{"body": "...visit https://.../keys/abc123 ..."}``, which is how provider
+    errors actually deliver it.
+    """
+    if not text or not any(marker in text for marker in _IDENTIFIER_MARKERS):
+        return text
+    for pattern, replacement in _IDENTIFIER_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _redact_secrets(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Never let a credential reach a log sink. Cheap insurance."""
     for key in list(event_dict):
-        lowered = key.lower()
-        if any(hint in lowered for hint in _SECRET_HINTS):
-            value = event_dict[key]
+        value = event_dict[key]
+        if any(hint in key.lower() for hint in _SECRET_HINTS):
             if isinstance(value, str) and value:
                 event_dict[key] = f"{value[:4]}***" if len(value) > 8 else "***"
+        elif isinstance(value, str):
+            event_dict[key] = redact_identifiers(value)
     return event_dict
 
 

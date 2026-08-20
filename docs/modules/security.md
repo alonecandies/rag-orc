@@ -60,6 +60,20 @@ self-correction loop can retry it. The property tests
 (`tests/unit/test_guard_properties.py`) assert the same invariant on generated
 input: everything the guard hands back re-parses to a read, at every depth.
 
+## Why redaction filters values, not just keys
+
+Dropping anything whose *key* looks like a credential (`api_key`, `password`,
+`dsn`) catches the structured case and misses the one that actually happens: a
+provider's 4xx body is a sentence, and OpenRouter's carries a key-management URL
+with the key id in it and the account `user_id`. That body is attached to the
+raised error, and from there it reaches the abstention reason, the HTTP error
+detail and the CLI — so it is shown to whoever called the API, under a key named
+`body`. `redact_identifiers` blanks those shapes inside free text; the client
+applies it where the body is captured, so every sink downstream is covered at
+once, and the HTTP layer applies it again on the way out. The unredacted body
+still goes to the local log, which is the one place the operator's own identity
+is not a leak.
+
 ## Why retrieved text is wrapped
 
 `wrap_untrusted` puts a passage inside delimiters its own content cannot close, and

@@ -253,3 +253,42 @@ class _FakeRequest:
 
     async def form(self) -> _FakeForm:
         return self._form
+
+
+def test_error_detail_redacts_a_provider_body_quoted_under_a_harmless_key() -> None:
+    """The scrubber drops credential-shaped *keys*; this is the other half.
+
+    A provider 402 arrives as prose under `body`, carrying a key-management URL
+    and the operator's account id. Nothing about the key name says "secret", so
+    without value-level redaction the whole thing becomes the response body.
+    """
+    from ragorc.server.app import _safe_detail
+
+    out = _safe_detail(
+        {
+            "body": (
+                "Insufficient credit. Visit "
+                "https://openrouter.ai/workspaces/default/keys/0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+            ),
+            "candidates": ['{"user_id":"user_EXAMPLEaccountEXAMPLE00000"}'],
+            "api_key": "sk-or-v1-dropped-by-the-key-rule",
+            "sql": "SELECT id FROM orders",
+        }
+    )
+    assert "0f1e2d3c4b5a69788796a5b4c3d2e1f0" not in out["body"]
+    assert "Insufficient credit" in out["body"], "the actionable part must survive"
+    assert "user_EXAMPLEaccountEXAMPLE00000" not in out["candidates"][0]
+    assert "api_key" not in out, "credential-shaped keys are still dropped whole"
+    assert out["sql"] == "SELECT id FROM orders", "ordinary detail is untouched"
+
+
+async def test_provider_body_is_redacted_where_it_is_captured() -> None:
+    """Redacting at the capture site is what makes every sink safe at once."""
+    from ragorc.llm.openrouter import OpenRouterLLM
+
+    detail = OpenRouterLLM._provider_detail(
+        '{"error":"see https://openrouter.ai/workspaces/default/keys/deadbeefcafe1234",'
+        '"user_id":"user_EXAMPLEaccountEXAMPLE00000"}'
+    )
+    assert "deadbeefcafe1234" not in detail
+    assert "user_EXAMPLEaccountEXAMPLE00000" not in detail
