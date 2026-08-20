@@ -1,0 +1,57 @@
+---
+title: The two feedback loops — CRAG and Self-RAG
+---
+stateDiagram-v2
+    [*] --> Retrieve
+
+    Retrieve --> GradeDocs: CRAG
+    state GradeDocs {
+        [*] --> Grading
+        Grading --> [*]
+    }
+
+    GradeDocs --> Correct: any doc above threshold
+    GradeDocs --> Ambiguous: mixed
+    GradeDocs --> Incorrect: none pass
+
+    Correct --> Refine: strip irrelevant sentences
+    Ambiguous --> Both: internal + web
+    Incorrect --> RewriteQ: discard all
+
+    RewriteQ --> WebSearch
+    WebSearch --> Retrieve: bounded retries
+
+    Refine --> Generate
+    Both --> Generate
+
+    Generate --> VerifyCites: free, decisive
+    VerifyCites --> Ungrounded: phantom marker or fake quote
+    VerifyCites --> GradeAnswer: passes
+
+    state GradeAnswer {
+        [*] --> Groundedness : ISSUP
+        Groundedness --> Utility : ISUSE
+        Utility --> [*]
+    }
+
+    GradeAnswer --> Grounded: supported and useful
+    GradeAnswer --> Ungrounded: unsupported claim or contradiction
+
+    Ungrounded --> RewriteA: Self-RAG / RRR within max_retries
+    RewriteA --> Retrieve
+    Ungrounded --> Abstain: retries exhausted
+
+    Grounded --> [*]
+    Abstain --> [*]
+
+    note right of Abstain
+        An abstention is a success.
+        Without one, the worst answers
+        look exactly like the best.
+    end note
+
+    note right of VerifyCites
+        Cheap check first: string matching
+        catches fabricated attribution before
+        any model call is spent on grading.
+    end note

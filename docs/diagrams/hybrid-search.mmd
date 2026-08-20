@@ -1,0 +1,46 @@
+---
+title: Hybrid search — one gRPC round trip, fused server-side
+---
+flowchart TB
+    Q(["Question"]) --> E["Embed once:<br/>dense + sparse + ColBERT"]
+
+    E --> ONE["Single query_points call over gRPC"]
+
+    subgraph QDRANT["Inside Qdrant — Rust, next to the data"]
+        direction TB
+        subgraph PRE["prefetch"]
+            direction LR
+            D["dense vector<br/>HNSW ef=128<br/>limit = fetch_k"]
+            S["sparse vector<br/>BM25 · Modifier.IDF<br/>limit = fetch_k"]
+        end
+        F["FusionQuery(RRF)"]
+        MS["ColBERT MaxSim rerank<br/>multivector · hnsw m=0"]
+        D --> F
+        S --> F
+        F --> MS
+    end
+
+    ONE --> PRE
+    MS --> OUT["fetch_k candidates"]
+
+    OUT --> CLIENT
+
+    subgraph CLIENT["In our process"]
+        direction TB
+        X["Cross-store fusion<br/>+ Postgres FTS + Neo4j"]
+        N["NoiseFilter"]
+        R["Cross-encoder rerank → top_k"]
+        X --> N --> R
+    end
+
+    R --> A(["To generation"])
+
+    NOTE1["Why one call: gRPC protobuf beats<br/>JSON float arrays 2-3x, and fusion<br/>in Rust beats two transfers + a<br/>Python merge"]
+    NOTE2["Why m=0 on ColBERT: it is a<br/>reranking field reached via prefetch,<br/>never a first-stage index — indexing it<br/>would cost 100x storage for nothing"]
+    QDRANT -.- NOTE1
+    MS -.- NOTE2
+
+    classDef note fill:#fffbeb,stroke:#d97706,color:#78350f,font-size:11px
+    classDef engine fill:#dbeafe,stroke:#1d4ed8
+    class NOTE1,NOTE2 note
+    class QDRANT,PRE,D,S,F,MS engine

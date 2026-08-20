@@ -1,0 +1,48 @@
+---
+title: Ingest pipeline — with the chunking-strategy ladder
+---
+flowchart TB
+    SRC(["Source: files · URLs · JSON · PDF"]) --> LOAD["Loaders → Document<br/>+ deterministic id + checksum"]
+    LOAD --> VALID["DocumentValidator<br/>size · encoding · binary · tenant"]
+    VALID --> SKIP{"checksum<br/>unchanged?"}
+    SKIP -->|yes| DONE(["Skip — a re-ingest<br/>becomes a no-op"])
+    SKIP -->|no| SPLIT
+
+    SPLIT["Split — boundaries only,<br/>exact start_char / end_char,<br/>NO vectors yet"]
+
+    SPLIT --> LADDER{"resolve_strategy()"}
+
+    LADDER -->|"embedder exposes<br/>token vectors"| LATE["LATE CHUNKING<br/>one forward pass over the whole doc,<br/>mean-pool per chunk span"]
+    LADDER -->|"hosted API,<br/>contextual enabled"| CTX["CONTEXTUAL<br/>LLM situating prefix per chunk<br/>(prompt-cache warm)"]
+    LADDER -->|otherwise| EARLY["EARLY<br/>embed each chunk in isolation<br/>+ parent expansion at query time"]
+
+    LATE --> VEC
+    CTX --> VEC
+    EARLY --> VEC
+
+    VEC["Vectors: dense + sparse<br/>+ optional ColBERT multivector"]
+
+    VEC --> OPT{"optional stages"}
+    OPT --> MR["Multi-representation<br/>parent · summary · Dense-X"]
+    OPT --> RAP["RAPTOR<br/>UMAP → GMM → summarize → recurse"]
+    OPT --> GR["GraphRAG<br/>extract → resolve → Leiden → reports"]
+
+    MR --> WRITE
+    RAP --> WRITE
+    GR --> NEO[("Neo4j")]
+    OPT --> WRITE
+
+    WRITE["Batched upsert<br/>bulk_load_mode: indexing_threshold=0"]
+    WRITE --> QD[("Qdrant")]
+    WRITE --> PG[("Postgres — chunks + pgvector + tsvector")]
+
+    QD --> REPORT(["IngestReport: docs, skipped,<br/>chunks, vectors, timings, cost, strategy"])
+    PG --> REPORT
+    NEO --> REPORT
+
+    classDef ladder fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+    classDef store fill:#e0e7ff,stroke:#4338ca
+    classDef terminal fill:#dcfce7,stroke:#15803d
+    class LATE,CTX,EARLY,LADDER ladder
+    class QD,PG,NEO store
+    class DONE,REPORT terminal

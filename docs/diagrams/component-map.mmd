@@ -1,0 +1,93 @@
+---
+title: Architecture panels mapped to modules
+---
+flowchart LR
+    subgraph QT["Query Translation — ragorc/translate/"]
+        direction TB
+        QT1["multi_query.py"]
+        QT2["rag_fusion.py — RRF"]
+        QT3["step_back.py"]
+        QT4["decomposition.py"]
+        QT5["hyde.py"]
+    end
+
+    subgraph RO["Routing — ragorc/route/"]
+        direction TB
+        RO1["logical.py — LLM picks store"]
+        RO2["semantic.py — embedding picks prompt"]
+        RO3["hybrid.py — rule fast-path first"]
+    end
+
+    subgraph QC["Query Construction — ragorc/construct/"]
+        direction TB
+        QC1["text_to_sql.py → Postgres"]
+        QC2["text_to_cypher.py → Neo4j"]
+        QC3["self_query.py → Qdrant filters"]
+    end
+
+    subgraph IX["Indexing — ragorc/index/"]
+        direction TB
+        IX1["split/ — semantic, recursive, token,<br/>markdown, code, sentence-window"]
+        IX2["multirep/ — parent-document,<br/>summary, Dense-X propositions"]
+        IX3["contextual.py — situating prefix"]
+        IX4["colbert.py — late interaction"]
+        IX5["raptor.py — UMAP+GMM tree"]
+        IX6["graph/ — extract → resolve →<br/>Leiden → community reports"]
+    end
+
+    subgraph RT["Retrieval — ragorc/retrieve/"]
+        direction TB
+        RT1["hybrid.py — server-side fusion"]
+        RT2["fusion.py — RRF / DBSF / weighted"]
+        RT3["rerank.py · rankgpt.py"]
+        RT4["noise.py — dedupe, MMR, cutoff"]
+        RT5["compress.py"]
+        RT6["crag.py — grade → rewrite → web"]
+        RT7["graph.py — local / global / DRIFT"]
+        RT8["multihop.py — IRCoT + bridge paths"]
+    end
+
+    subgraph GE["Generation — ragorc/generate/"]
+        direction TB
+        GE1["answer.py"]
+        GE2["groundedness.py — claim entailment"]
+        GE3["citations.py — span attribution"]
+        GE4["abstain.py"]
+        GE5["consistency.py — self-consistency"]
+        GE6["self_rag.py · rrr.py"]
+    end
+
+    subgraph FO["Foundation"]
+        direction TB
+        F1["core/ — models, protocols, settings,<br/>concurrency, telemetry, ids"]
+        F2["llm/ — OpenRouter, prompts,<br/>model cascade, cache"]
+        F3["embed/ — FastEmbed ONNX,<br/>late chunking"]
+        F4["stores/ — Qdrant, Postgres, Neo4j"]
+        F5["security/ — guards, injection,<br/>PII, tenancy, audit"]
+        F6["cache/ — memory → redis → semantic"]
+        F7["context/ — budget, pack, summarize"]
+    end
+
+    QT --> RO --> QC --> RT --> GE
+    IX -.->|"populates"| RT
+    FO -.->|"used by all"| QT
+    FO -.-> RO
+    FO -.-> QC
+    FO -.-> IX
+    FO -.-> RT
+    FO -.-> GE
+
+    classDef translate fill:#fee2e2,stroke:#b91c1c
+    classDef route fill:#ffedd5,stroke:#c2410c
+    classDef construct fill:#fef9c3,stroke:#a16207
+    classDef index fill:#dbeafe,stroke:#1d4ed8
+    classDef retrieve fill:#dcfce7,stroke:#15803d
+    classDef generate fill:#f3e8ff,stroke:#7e22ce
+    classDef foundation fill:#f1f5f9,stroke:#475569
+    class QT,QT1,QT2,QT3,QT4,QT5 translate
+    class RO,RO1,RO2,RO3 route
+    class QC,QC1,QC2,QC3 construct
+    class IX,IX1,IX2,IX3,IX4,IX5,IX6 index
+    class RT,RT1,RT2,RT3,RT4,RT5,RT6,RT7,RT8 retrieve
+    class GE,GE1,GE2,GE3,GE4,GE5,GE6 generate
+    class FO,F1,F2,F3,F4,F5,F6,F7 foundation

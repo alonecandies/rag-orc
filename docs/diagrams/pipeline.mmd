@@ -1,0 +1,85 @@
+---
+title: Query pipeline — from question to grounded answer
+---
+flowchart TB
+    Q(["Question"]) --> VAL
+
+    subgraph V["Validate"]
+        VAL["QueryValidator<br/>NFC · length · injection · PII"]
+    end
+
+    VAL --> CACHE{"Semantic<br/>cache hit?"}
+    CACHE -->|"cos ≥ 0.97"| ANS(["Answer"])
+    CACHE -->|miss| TRANS
+
+    subgraph T["Query Translation"]
+        TRANS["Multi-Query · RAG-Fusion<br/>Step-Back · Decomposition · HyDE"]
+    end
+
+    TRANS --> ROUTE
+
+    subgraph R["Routing"]
+        ROUTE["rule fast-path → semantic (embedding)<br/>→ logical (LLM)"]
+    end
+
+    ROUTE --> CON
+
+    subgraph C["Query Construction"]
+        CON["Text-to-SQL · Text-to-Cypher · Self-Query"]
+        GUARD["SQL / Cypher guards<br/>AST allowlist · read-only txn · RO role"]
+        CON --> GUARD
+    end
+
+    GUARD --> FAN{"Fan out<br/>concurrently"}
+
+    FAN --> QD[("Qdrant<br/>dense + BM25 + ColBERT")]
+    FAN --> PG[("Postgres<br/>SQL + pgvector + FTS")]
+    FAN --> NE[("Neo4j<br/>Cypher + GraphRAG")]
+    FAN -.->|"CRAG fallback"| WEB[("Web")]
+
+    QD --> FUSE
+    PG --> FUSE
+    NE --> FUSE
+    WEB --> FUSE
+
+    subgraph POST["Post-retrieval"]
+        FUSE["Fusion — RRF / DBSF"]
+        NOISE["Noise: dedupe · near-dupe<br/>relative cutoff · MMR"]
+        RERANK["Rerank — cross-encoder /<br/>RankGPT / ColBERT MaxSim"]
+        COMP["Compress — extract /<br/>embedding filter"]
+        FUSE --> NOISE --> RERANK --> COMP
+    end
+
+    COMP --> GRADE{"CRAG grade"}
+    GRADE -->|incorrect| REWRITE["Rewrite query"]
+    REWRITE --> FAN
+    GRADE -->|"correct / ambiguous"| BUDGET
+
+    subgraph G["Generation"]
+        BUDGET["Token budget<br/>reserve output first"]
+        PACK["Pack: knapsack by relevance/token<br/>+ lost-in-the-middle order"]
+        GEN["Generate"]
+        BUDGET --> PACK --> GEN
+    end
+
+    GEN --> VERIFY
+
+    subgraph VF["Verification"]
+        VERIFY["Citations exist? Quotes real?"]
+        GROUND["Groundedness — claim-level entailment"]
+        VERIFY --> GROUND
+    end
+
+    GROUND --> GATE{"Fit to return?"}
+    GATE -->|"Self-RAG: ungrounded"| REWRITE
+    GATE -->|"no evidence"| ABSTAIN(["Abstain —<br/>an honest non-answer"])
+    GATE -->|yes| ANS
+
+    classDef store fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef gate fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef terminal fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef guard fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    class QD,PG,NE,WEB store
+    class CACHE,GRADE,GATE,FAN gate
+    class ANS,ABSTAIN terminal
+    class GUARD guard

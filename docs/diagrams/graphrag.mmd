@@ -1,0 +1,65 @@
+---
+title: GraphRAG — construction and the three search modes
+---
+flowchart TB
+    subgraph BUILD["Construction (ingest time)"]
+        direction TB
+        CH["Chunks"] --> EX["Extract entities + relations<br/>+ gleaning passes"]
+        EX --> RES["Resolve entities<br/>exact → normalized → embedding<br/>(blocked, not O(n²))"]
+        RES --> W["Write to Neo4j<br/>UNWIND batched MERGE"]
+        W --> COM["Hierarchical Leiden<br/>→ communities, N levels"]
+        COM --> SUM["Community reports<br/>bottom-up: parents reuse<br/>children's summaries"]
+    end
+
+    SUM --> GRAPH[("Neo4j:<br/>Entity · MENTIONS · Community")]
+
+    subgraph SEARCH["Retrieval (query time)"]
+        direction TB
+
+        subgraph L["LOCAL — 'what does X do?'"]
+            direction TB
+            L1["Match question entities via<br/>fulltext index (no LLM call)"]
+            L2["Expand ego network N hops"]
+            L3["Collect MENTIONS chunks<br/>+ verbalize the subgraph"]
+            L1 --> L2 --> L3
+        end
+
+        subgraph G["GLOBAL — 'what are the themes?'"]
+            direction TB
+            G1["Map: one call per<br/>community report"]
+            G2["Drop zero-scored partials"]
+            G3["Reduce: synthesize,<br/>keep disagreements visible"]
+            G1 --> G2 --> G3
+        end
+
+        subgraph D["DRIFT — the hybrid"]
+            direction TB
+            D1["Vector search for seeds"]
+            D2["Take entities those chunks mention"]
+            D3["Expand graph from them, merge"]
+            D1 --> D2 --> D3
+        end
+    end
+
+    GRAPH --> L
+    GRAPH --> G
+    GRAPH --> D
+
+    subgraph MH["Multi-hop reasoning"]
+        direction TB
+        M1["IRCoT: retrieve → reason →<br/>'is this sufficient?' → retrieve again"]
+        M2["Bridge entities: shortest paths<br/>between named entities,<br/>scored weight ÷ length"]
+    end
+
+    GRAPH --> MH
+    L --> OUT(["Evidence"])
+    G --> OUT
+    D --> OUT
+    MH --> OUT
+
+    classDef build fill:#fef9c3,stroke:#a16207
+    classDef search fill:#dcfce7,stroke:#15803d
+    classDef store fill:#e0e7ff,stroke:#4338ca
+    class BUILD,CH,EX,RES,W,COM,SUM build
+    class SEARCH,L,G,D,L1,L2,L3,G1,G2,G3,D1,D2,D3,MH,M1,M2 search
+    class GRAPH store
