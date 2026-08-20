@@ -137,3 +137,25 @@ def test_qdrant_client_range_matches_the_compose_image() -> None:
         f"qdrant-client floor {floor} and image v{image} differ by more than one minor; "
         "the client will warn about incompatibility at runtime"
     )
+
+
+def test_the_package_ships_its_type_information() -> None:
+    """PEP 561: without this marker the annotations are invisible downstream.
+
+    Every module here type-checks clean, but a consumer importing `ragorc` into
+    their own typed project sees `Any` unless the distribution declares itself
+    typed. The marker is the entire mechanism — an empty file whose presence is
+    the signal — which is exactly why it is easy to omit and worth pinning.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2]
+    assert (root / "ragorc" / "py.typed").is_file(), (
+        "ragorc/py.typed is missing; the library's types will not reach consumers"
+    )
+
+    # And it must actually be shipped: hatchling includes every file under the
+    # configured package, so the only way to lose it is an exclude rule.
+    config = tomllib.loads((root / "pyproject.toml").read_text())
+    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
+    assert wheel["packages"] == ["ragorc"]
+    for key in ("exclude", "only-include", "artifacts"):
+        assert key not in wheel, f"{key} rule could drop py.typed from the wheel"
