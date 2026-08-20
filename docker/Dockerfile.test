@@ -1,0 +1,43 @@
+# Runs the integration suite from inside the compose network.
+#
+# Two reasons this exists rather than just running pytest on the host:
+#
+# 1. **It is how CI must do it.** A CI runner reaches the services by their
+#    compose service names, not through published host ports, so this is the
+#    configuration that actually gets exercised on every push.
+# 2. **It does not depend on host port publishing.** On Docker Desktop the
+#    host→container forwarder can wedge (typically after the machine sleeps)
+#    while the services themselves are perfectly healthy — see `make doctor`.
+#    Container-to-container traffic is unaffected, so the store layer stays
+#    verifiable.
+#
+# Only the store-facing dependencies are installed. The embedding models are not
+# needed: the integration tests exercise the three store bindings, and pulling
+# ONNX plus a model download would add minutes to every run for no coverage.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # Never read the host's __pycache__ from the mounted source tree. Python
+    # validates bytecode against the source mtime, and the macOS-host / Linux-
+    # container views of those timestamps can disagree — so the runner can execute
+    # stale bytecode for a file you just edited. The symptom is a fix that appears
+    # not to work, which costs far more than the recompile this causes.
+    PYTHONPYCACHEPREFIX=/tmp/pycache
+
+WORKDIR /app
+
+# Installed by name rather than from pyproject.toml so a change to an unrelated
+# extra does not invalidate this layer on every run.
+RUN pip install \
+      "pydantic>=2.9,<3" "pydantic-settings>=2.5,<3" \
+      "orjson>=3.10" "httpx[http2]>=0.27" "tenacity>=9.0" "numpy>=1.26" \
+      "tiktoken>=0.8" "structlog>=24.4" "cachetools>=5.5" "sqlglot>=25.24" \
+      "qdrant-client>=1.12" "psycopg[binary,pool]>=3.2" "pgvector>=0.3.6" \
+      "neo4j>=5.25" \
+      "pytest>=8.3" "pytest-asyncio>=0.24"
+
+# The source is mounted at run time, so an edit needs no rebuild.
+ENV PYTHONPATH=/app
+CMD ["pytest", "tests/integration", "-m", "integration", "-p", "no:cacheprovider"]

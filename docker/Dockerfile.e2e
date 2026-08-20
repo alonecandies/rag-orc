@@ -1,0 +1,41 @@
+# End-to-end verification: real embeddings, real stores, a real OpenRouter call.
+#
+# Separate from Dockerfile.test because it is a different trade. The integration
+# image installs only store drivers and builds in seconds; this one adds ONNX
+# Runtime and downloads embedding models, which is minutes and hundreds of
+# megabytes. Keeping them apart means the fast suite stays fast.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # See Dockerfile.test: never read the host's __pycache__ from the mounted tree.
+    PYTHONPYCACHEPREFIX=/tmp/pycache \
+    # The teardown race this avoids is documented in ragorc/embed/_runtime.py.
+    ORT_DISABLE_TELEMETRY=1 \
+    # Models live in the image, not in a per-run download.
+    HF_HOME=/models \
+    FASTEMBED_CACHE_PATH=/models/fastembed
+
+WORKDIR /app
+
+RUN pip install \
+      "pydantic>=2.9,<3" "pydantic-settings>=2.5,<3" \
+      "orjson>=3.10" "httpx[http2]>=0.27" "tenacity>=9.0" "numpy>=1.26" \
+      "tiktoken>=0.8" "structlog>=24.4" "cachetools>=5.5" "sqlglot>=25.24" \
+      "qdrant-client>=1.19,<2" "fastembed>=0.4" \
+      "psycopg[binary,pool]>=3.2" "pgvector>=0.3.6" "neo4j>=5.25" \
+      "langgraph>=0.2.45"
+
+# Bake the models in. A cold start that downloads ~90 MB on the first request is
+# the difference between a pod that is ready and one that times out its probe.
+RUN python -c "\
+from fastembed import TextEmbedding, SparseTextEmbedding; \
+from fastembed.rerank.cross_encoder import TextCrossEncoder; \
+TextEmbedding('BAAI/bge-small-en-v1.5'); \
+SparseTextEmbedding('Qdrant/bm25'); \
+TextCrossEncoder('Xenova/ms-marco-MiniLM-L-6-v2'); \
+print('models cached')"
+
+ENV PYTHONPATH=/app
+CMD ["python", "-c", "print('pass a command')"]

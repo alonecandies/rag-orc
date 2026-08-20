@@ -1,0 +1,68 @@
+# Overlay that adds the integration-test runner to the stack.
+#
+#   docker compose -f docker-compose.yml -f docker/docker-compose.test.yml \
+#     run --rm --build integration
+#
+# or simply: make test-docker
+name: ragorc
+
+services:
+  integration:
+    build:
+      # Paths here are relative to the FIRST compose file's directory (the repo
+      # root), not to this overlay's directory — a compose behaviour that is easy
+      # to get wrong and fails with a confusing "lstat ...: no such file".
+      context: .
+      dockerfile: docker/Dockerfile.test
+    volumes:
+      # Mounted read-only: a test run must never modify the working tree, and
+      # pytest's cache is disabled in the image's CMD for the same reason.
+      - ./ragorc:/app/ragorc:ro
+      - ./tests:/app/tests:ro
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    environment:
+      # Service names, not localhost: this is the whole point of running here.
+      RAGORC_QDRANT__URL: http://qdrant:6333
+      RAGORC_QDRANT__PREFER_GRPC: "true"
+      RAGORC_POSTGRES__DSN: postgresql://ragorc:ragorc@postgres:5432/ragorc
+      RAGORC_POSTGRES__READONLY_DSN: postgresql://ragorc_ro:ragorc_ro@postgres:5432/ragorc
+      RAGORC_NEO4J__URI: bolt://neo4j:7687
+      RAGORC_NEO4J__PASSWORD: ragorcpass
+      RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION: "false"
+      RAGORC_CACHE__ENABLED: "false"
+      RAGORC_EMBEDDING__DENSE_DIMENSION: "32"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+
+  # Real embeddings + real stores + a real OpenRouter call. Run with:
+  #   make test-e2e
+  e2e:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.e2e
+    volumes:
+      - ./ragorc:/app/ragorc:ro
+      - ./examples:/app/examples:ro
+      - ./scripts:/app/scripts:ro
+    environment:
+      RAGORC_QDRANT__URL: http://qdrant:6333
+      RAGORC_QDRANT__PREFER_GRPC: "true"
+      RAGORC_QDRANT__COLLECTION: ragorc_e2e
+      RAGORC_POSTGRES__DSN: postgresql://ragorc:ragorc@postgres:5432/ragorc
+      RAGORC_POSTGRES__READONLY_DSN: postgresql://ragorc_ro:ragorc_ro@postgres:5432/ragorc
+      RAGORC_NEO4J__URI: bolt://neo4j:7687
+      RAGORC_NEO4J__PASSWORD: ragorcpass
+      RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION: "false"
+      RAGORC_OBSERVABILITY__LOG_LEVEL: WARNING
+      # Supplied from the host environment / .env — never baked into the image.
+      RAGORC_LLM__API_KEY: ${RAGORC_LLM__API_KEY:?set RAGORC_LLM__API_KEY in .env}
+      RAGORC_LLM__MODEL: ${RAGORC_LLM__MODEL:-anthropic/claude-sonnet-4.5}
+      RAGORC_LLM__FAST_MODEL: ${RAGORC_LLM__FAST_MODEL:-google/gemini-2.5-flash-lite}
+    depends_on:
+      qdrant:
+        condition: service_healthy

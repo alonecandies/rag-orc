@@ -1,0 +1,200 @@
+# Local stack for rag-orc: Postgres+pgvector, Neo4j, Qdrant.
+#
+# Tuning notes are inline. The defaults that ship with each image are sized for
+# a laptop demo, not for vector workloads, and three of them matter enough that
+# leaving them alone will make the system look slow for the wrong reason.
+#
+#   docker compose up -d
+#   docker compose ps          # wait for all three to report healthy
+#   make seed                  # load the example corpus
+#
+# Host ports are overridable so an existing local service does not block the
+# stack — a hardcoded 5432 collides with whatever Postgres a developer already
+# runs, and "port is already allocated" is a failure a compose file can spare
+# people. Set them in .env (compose reads it for interpolation) or inline:
+#
+#   RAGORC_PG_PORT=5433 docker compose up -d
+#
+# The container-side ports never change, so nothing inside the compose network
+# is affected — only what the host publishes.
+
+name: ragorc
+
+services:
+  # ---------------------------------------------------------------------------
+  postgres:
+    # pgvector ships prebuilt for pg16; building the extension yourself is a
+    # needless step.
+    image: pgvector/pgvector:pg16
+    container_name: ragorc-postgres
+    environment:
+      POSTGRES_USER: ragorc
+      POSTGRES_PASSWORD: ragorc
+      POSTGRES_DB: ragorc
+      # Checksums cost ~2% write throughput and turn silent corruption into a
+      # loud error. Worth it.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "${RAGORC_PG_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init/postgres:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      # HNSW index builds are memory-bound: maintenance_work_mem is the single
+      # setting that decides whether building an index on 1M vectors takes
+      # minutes or hours.
+      - -c
+      - maintenance_work_mem=1GB
+      # Vector scans read a lot of pages; give the planner a real cache estimate.
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      # pgvector HNSW search is single-threaded per scan, but index *builds* and
+      # seq scans parallelize.
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_maintenance_workers=4
+      # SSD-appropriate: the default 4.0 assumes spinning disks and pushes the
+      # planner away from index scans.
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - work_mem=32MB
+      - -c
+      - jit=off  # JIT hurts on the short, repetitive queries a RAG app issues
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ragorc -d ragorc"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    shm_size: 256mb
+
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: ragorc-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/ragorcpass
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+      # The page cache holds the graph; the heap holds query state. Traversals
+      # thrash if the page cache is too small, and GraphRAG traversals are the
+      # whole point of this service.
+      NEO4J_server_memory_pagecache_size: 1G
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,db.*"
+      NEO4J_PLUGINS: '["apoc"]'
+      # Stop a runaway generated Cypher query from pinning a core forever. The
+      # guard layer bounds hops; this bounds wall clock.
+      NEO4J_db_transaction_timeout: 30s
+      NEO4J_server_bolt_thread__pool__max__size: "100"
+    ports:
+      - "${RAGORC_NEO4J_HTTP_PORT:-7474}:7474"   # HTTP browser
+      - "${RAGORC_NEO4J_BOLT_PORT:-7687}:7687"   # Bolt
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+      # No `import` mount. Neo4j's entrypoint chowns that directory at startup, so
+      # a read-only bind makes the container exit ("chown: Read-only file system"),
+      # and a writable one would only serve LOAD CSV — which the Cypher guard
+      # forbids outright (see docs/adr/0006-layered-query-guards.md). Schema and
+      # seed data are applied by `ragorc init` over Bolt instead.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  qdrant:
+    # Kept in step with the `qdrant-client` floor in pyproject.toml. The client
+    # refuses to guarantee compatibility when the major differs or the minor drifts
+    # by more than one, and says so at runtime ("client 1.19.0 is incompatible with
+    # server 1.12.4") — a warning that precedes real protocol differences. Bump
+    # both together.
+    image: qdrant/qdrant:v1.19.0
+    container_name: ragorc-qdrant
+    ports:
+      - "${RAGORC_QDRANT_HTTP_PORT:-6333}:6333"   # REST + dashboard at /dashboard
+      - "${RAGORC_QDRANT_GRPC_PORT:-6334}:6334"   # gRPC — the port the client uses
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      # More segments = more parallelism during search, at the cost of more open
+      # files. Match it to available cores.
+      QDRANT__STORAGE__OPTIMIZERS__DEFAULT_SEGMENT_NUMBER: 4
+      # Build the HNSW index in parallel on ingest.
+      QDRANT__STORAGE__OPTIMIZERS__MAX_OPTIMIZATION_THREADS: 4
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: 0   # 0 = all cores
+      QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT__LOG_LEVEL: INFO
+    healthcheck:
+      # A real HTTP readiness probe, not a TCP-accept probe.
+      #
+      # The obvious `:> /dev/tcp/127.0.0.1/6333` only proves something accepted a
+      # connection — it reports "healthy" while Qdrant is still loading and would
+      # refuse every query. This speaks HTTP and requires a 200 from /readyz,
+      # which is Qdrant's *ready to serve* endpoint (/healthz only says the
+      # process is alive).
+      #
+      # Written with bash's /dev/tcp because the image ships no curl, wget or nc.
+      #
+      # Note what no container healthcheck can tell you: whether the port is
+      # reachable from the *host*. This runs inside the container, so a broken
+      # Docker Desktop port forwarder still shows "healthy" — use `make doctor`
+      # to distinguish the two.
+      #
+      # CMD, not CMD-SHELL: CMD-SHELL runs `/bin/sh -c`, and in this image /bin/sh
+      # is dash, which has no /dev/tcp — the probe fails with "Directory
+      # nonexistent" and the container reports unhealthy forever. bash is present
+      # and is invoked explicitly.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333 &&
+          printf 'GET /readyz HTTP/1.0\r\n\r\n' >&3 &&
+          head -n 1 <&3 | grep -q ' 200'
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Optional shared cache tier. Only needed with more than one API worker; a
+  # single process is served fine by the in-memory tier.
+  redis:
+    image: redis:7.4-alpine
+    container_name: ragorc-redis
+    ports:
+      - "${RAGORC_REDIS_PORT:-6379}:6379"
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      # LRU, not noeviction: a full cache should evict, never refuse writes.
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""          # cache only; persistence would just cost fsyncs
+      - --appendonly
+      - "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    profiles: ["cache"]
+
+volumes:
+  postgres-data:
+  neo4j-data:
+  neo4j-logs:
+  qdrant-data:

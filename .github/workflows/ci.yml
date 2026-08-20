@@ -1,0 +1,62 @@
+# CI for rag-orc.
+#
+# Two jobs, separated by what they need:
+#
+#   fast   — lint and the offline unit suite. No services, no API key, no model
+#            downloads, so it gates every push in well under a minute.
+#   stores — the integration suite against real Postgres, Neo4j and Qdrant,
+#            reached by *service name*. It never uses published host ports, which
+#            is both how a CI runner works and why this is the configuration
+#            worth testing (see docs/operations.md).
+#
+# `make test-e2e` is deliberately not here: it spends a real OpenRouter call and
+# needs a secret, so it belongs on a release tag rather than on every push.
+
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: lint + unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv venv --python 3.12
+      - run: uv pip install -e ".[dev,server,redis,raptor,graphrag,loaders,otel,langchain,web]"
+      - name: ruff
+        run: |
+          .venv/bin/ruff check ragorc tests scripts
+          .venv/bin/ruff format --check ragorc tests scripts
+      - name: unit tests
+        # Integration tests are deselected by pyproject's addopts, so this runs
+        # fully offline — a bare `pytest` must never try to reach a database.
+        run: .venv/bin/python -m pytest tests
+
+  stores:
+    name: integration (live stores)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: start the stack
+        run: docker compose up -d --wait
+      - name: integration suite, from inside the network
+        run: |
+          docker compose -f docker-compose.yml -f docker/docker-compose.test.yml \
+            run --rm --build integration
+      - name: diagnostics on failure
+        if: failure()
+        run: docker compose ps && docker compose logs --tail=60
+      - name: tear down
+        if: always()
+        run: docker compose down -v
