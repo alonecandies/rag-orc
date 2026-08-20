@@ -1,0 +1,224 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ragorc"
+version = "0.1.0"
+description = "A complete, production-grade RAG orchestration library: every component of the RAG From Scratch architecture over Postgres, Neo4j, Qdrant and OpenRouter."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "rag-orc contributors" }]
+keywords = ["rag", "retrieval", "llm", "qdrant", "neo4j", "postgres", "graphrag", "openrouter"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# ---------------------------------------------------------------------------
+# Base dependencies.
+#
+# Every entry here is a deliberate performance choice; see docs/performance.md
+# and the ADRs for the reasoning. Rules of thumb applied:
+#   * Rust/C cores over pure Python (pydantic-v2, orjson, tiktoken, sqlglot).
+#   * ONNX Runtime over PyTorch for inference (fastembed) -> no torch in base.
+#   * Native async drivers with connection pooling for every datastore.
+#   * gRPC over REST where the server supports it (Qdrant).
+# ---------------------------------------------------------------------------
+dependencies = [
+  # --- models & config: pydantic v2 has a Rust core, ~5-50x v1 -------------
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  # --- serialization: orjson is 3-10x stdlib json -------------------------
+  "orjson>=3.12,<4",
+  # --- HTTP: h2 enables multiplexing to OpenRouter over one connection ----
+  "httpx[http2]>=0.28,<1",
+  "httpx-sse>=0.4",
+  # --- resilience ---------------------------------------------------------
+  "tenacity>=9.0,<10",
+  # --- numerics: all scoring/fusion/MaxSim is vectorized ------------------
+  # numpy 2 changed scalar promotion and several C-API details; the vectorized
+  # scoring here is written and tested against 2.x.
+  "numpy>=2.0,<3",
+  # --- tokenization: tiktoken is a Rust BPE, ~100x a Python tokenizer -----
+  "tiktoken>=0.8,<1",
+  # --- logging: structlog is faster than logging for structured events ----
+  "structlog>=26.0,<27",
+  # --- in-process cache tier ----------------------------------------------
+  "cachetools>=7.0,<8",
+  # --- SQL safety: sqlglot parses to an AST so we can allowlist by node ---
+  # The SQL guard matches on `sqlglot.exp` node classes, so an AST rename in a
+  # new major is a silent hole in the allowlist rather than an import error.
+  # Capped deliberately: this pin is a security boundary, not a preference.
+  "sqlglot>=30.0,<31",
+  # --- vector store: async + gRPC + multivector + server-side fusion ------
+  # Keep the floor in step with the image tag in docker-compose.yml: the client
+  # only guarantees compatibility within one minor version of the server.
+  "qdrant-client>=1.19,<2",
+  # --- embeddings: ONNX; covers dense, sparse/BM25, ColBERT and reranking -
+  "fastembed>=0.8,<1",
+  # --- relational: psycopg3 binary protocol + pipeline mode + async pool --
+  "psycopg[binary,pool]>=3.3,<4",
+  "pgvector>=0.5,<1",
+  # --- graph: official async driver ---------------------------------------
+  # 6.x is what the store is written against; 5.x lacks some of the driver
+  # surface used here and 7 does not exist yet.
+  "neo4j>=6.0,<7",
+  # --- orchestration: LangGraph for the cyclic pipelines (see ADR-0001) ---
+  # The graphs use the 1.x StateGraph/reducer API. A 0.2 floor would let a
+  # fresh install resolve a version whose API these pipelines predate.
+  "langgraph>=1.0,<2",
+  # --- CLI ----------------------------------------------------------------
+  "typer>=0.15,<1",
+  "rich>=15.0,<16",
+  # --- event loop: 2-4x asyncio throughput on Linux/macOS -----------------
+  "uvloop>=0.21; sys_platform != 'win32'",
+]
+
+[project.optional-dependencies]
+# HTTP service
+server = [
+  "fastapi>=0.141,<1",
+  "uvicorn[standard]>=0.32,<1",
+  "sse-starlette>=2.1,<4",
+  "python-multipart>=0.0.17",
+]
+# Distributed cache tier
+redis = ["redis[hiredis]>=8.0,<9"]
+# RAPTOR hierarchical indexing: UMAP + Gaussian Mixture clustering
+raptor = ["umap-learn>=0.5.7", "scikit-learn>=1.5"]
+# GraphRAG community detection: Leiden via the C igraph core
+graphrag = ["networkx>=3.4", "python-igraph>=0.11", "leidenalg>=0.10"]
+# Document loaders. PyMuPDF is the fastest pure-Python PDF text extractor.
+loaders = ["pymupdf>=1.24", "beautifulsoup4>=4.12", "lxml>=5.3", "markdown-it-py>=3.0", "python-docx>=1.1"]
+# Local torch-based models (only if you want sentence-transformers / HF)
+local = ["sentence-transformers>=3.3", "torch>=2.5", "transformers>=4.46"]
+# Embedding fine-tuning toolkit (scripts/, not the request path)
+finetune = ["sentence-transformers>=3.3", "torch>=2.5", "datasets>=3.1", "accelerate>=1.1"]
+# Hosted embedding providers
+openai = ["openai>=1.54"]
+voyage = ["voyageai>=0.3"]
+cohere = ["cohere>=5.11"]
+# Web fallback for CRAG active retrieval
+web = ["tavily-python>=0.5", "ddgs>=9.0"]
+# Tracing / metrics
+otel = ["opentelemetry-sdk>=1.28", "opentelemetry-exporter-otlp>=1.28", "prometheus-client>=0.21"]
+# Drop-in interop with existing LangChain / LCEL projects
+# Paired with the langgraph pin above: langgraph 1.x brings langchain-core 1.x.
+langchain = ["langchain-core>=1.0,<2"]
+# NLI-based groundedness + contradiction filtering without an LLM call
+nli = ["sentence-transformers>=3.3", "torch>=2.5"]
+
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "pytest-benchmark>=5.1",
+  "hypothesis>=6.165,<7",
+  "respx>=0.21",
+  "ruff>=0.7",
+  "mypy>=1.13",
+  "types-cachetools",
+]
+
+all = [
+  "ragorc[server,redis,raptor,graphrag,loaders,openai,voyage,cohere,web,otel,langchain]",
+]
+
+[project.scripts]
+ragorc = "ragorc.cli:app"
+
+[project.urls]
+Documentation = "https://github.com/your-org/rag-orc/tree/main/docs"
+Source = "https://github.com/your-org/rag-orc"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ragorc"]
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The project root, NOT ["ragorc", "tests"]: naming the packages here makes
+# isort classify `ragorc.*` as third-party (merging our imports into the wrong
+# block) and makes `mypy ragorc/` fail with "source file found twice under
+# different module names".
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",      # pycodestyle / pyflakes
+  "I",                # isort
+  "B",                # bugbear
+  "C4",               # comprehensions
+  "UP",               # pyupgrade
+  "ASYNC",            # async antipatterns (blocking calls in coroutines)
+  "S",                # bandit security rules
+  "RUF",
+  "PERF",             # performance antipatterns
+  "SIM",
+]
+ignore = [
+  "E501",    # line length is handled by the formatter
+  "S101",    # assert is fine in this codebase
+  "B008",    # typer/FastAPI depend on calls in defaults
+  "UP042",   # (str, Enum) is kept over StrEnum: str(x) semantics differ and
+             # these values are embedded in prompts and payloads
+  "RUF100",  # BLE001 is intentionally not enabled; its noqa comments document why
+             # a broad except is correct in degrade-don't-fail paths
+]
+
+[tool.ruff.lint.per-file-ignores]
+# ASYNC240 flags pathlib in async functions. In tests a stat() is a fixture
+# precondition, not request-path I/O, and adding anyio to the test deps to
+# satisfy a linter would be the wrong trade.
+"tests/**" = ["S", "PERF", "ASYNC240"]
+"scripts/**" = ["S"]
+# The injection scanner contains homoglyph and bidi characters on purpose:
+# they are the attack payloads it exists to normalize away.
+"ragorc/security/injection.py" = ["RUF001", "RUF002", "RUF003"]
+# The quote/dash folding table necessarily contains the ambiguous characters
+# it maps away.
+"ragorc/validate/output.py" = ["RUF001"]
+# ddl.py and store.py compose SQL from our own validated identifiers, never
+# from user input; parameters are always bound.
+"ragorc/stores/postgres/*.py" = ["S608"]
+
+[tool.mypy]
+python_version = "3.12"
+# Needed because tests/ and ragorc/ are both roots; without it mypy reports
+# "source file found twice under different module names".
+explicit_package_bases = true
+mypy_path = "."
+plugins = ["pydantic.mypy"]
+warn_redundant_casts = true
+warn_unused_ignores = false
+disallow_untyped_defs = false
+ignore_missing_imports = true
+follow_imports = "silent"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# The default run must be OFFLINE. Without the marker filter here, a bare
+# `pytest` collects the integration tests and hangs trying to reach Postgres,
+# Neo4j and Qdrant — which makes the suite unusable for anyone who has not
+# started the compose stack. Opt in explicitly: `pytest -m integration`.
+addopts = "-q --strict-markers -m 'not integration and not llm and not slow'"
+markers = [
+  "integration: requires live Postgres/Neo4j/Qdrant (docker compose up)",
+  "llm: performs real OpenRouter calls (costs money)",
+  "slow: long-running benchmark or model-download test",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["ragorc"]
+omit = ["*/scripts/*"]
