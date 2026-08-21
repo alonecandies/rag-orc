@@ -671,8 +671,13 @@ class IngestPipeline:
         # Anything neither accepted nor rejected was an identical-checksum
         # duplicate of a document already in this batch: two ids, one payload,
         # which would take two result slots and double-assert the same fact.
-        report.documents_rejected = len(validation.rejected)
-        report.documents_duplicate = len(documents) - len(accepted) - len(validation.rejected)
+        # ``+=``, because this method runs once per document *window* and the two
+        # lists beside it already accumulate. Assigning reported the last window's
+        # numbers against every window's list, so the count contradicted the list
+        # it counts and `documents_in` stopped reconciling with the sum of the
+        # outcome counters — the invariant the whole report exists to hold.
+        report.documents_rejected += len(validation.rejected)
+        report.documents_duplicate += len(documents) - len(accepted) - len(validation.rejected)
         report.rejected.extend(validation.rejected)
         report.warnings.extend(validation.warnings)
 
@@ -682,7 +687,9 @@ class IngestPipeline:
             if not doc.checksum:
                 doc.checksum = content_hash(doc.content)
 
-        report.timings_ms["validate"] = _elapsed_ms(started)
+        report.timings_ms["validate"] = report.timings_ms.get("validate", 0.0) + _elapsed_ms(
+            started
+        )
         log.info(
             "documents_validated",
             accepted=len(accepted),

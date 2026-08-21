@@ -1282,3 +1282,49 @@ async def test_summary_sources_are_not_written_before_the_document_row() -> None
     assert report.documents_failed == 0, report.warnings
     assert not any("disabled" in w for w in report.warnings), report.warnings
     assert store.chunks, "the summarised sources must be persisted for expansion"
+
+
+# ---------------------------------------------------------------------------
+# Report counters under a windowed ingest
+# ---------------------------------------------------------------------------
+async def test_windowed_ingest_accumulates_the_validation_counters(tmp_path: Any) -> None:
+    """`_validate` runs once per document window, and three of its report fields
+    assigned where every sibling accumulates.
+
+    So a directory ingest reported the *last* window's rejects and duplicates
+    while `report.rejected` carried all of them: the count and the list
+    contradicted each other, and `documents_in` stopped reconciling with the sum
+    of the outcome counters — the one invariant the report exists to hold.
+    """
+    from ragorc.validate.schema import DocumentValidator
+    from tests.fakes import FakeDocumentStore
+
+    # Two windows, each holding one document validation rejects and one it
+    # accepts. The size limit is the deterministic rejection: the binary heuristic
+    # runs *after* control characters are substituted out, so a file of NUL bytes
+    # reaches it looking like ordinary words.
+    sentence = "Refunds are processed within five business days. "
+    for i in range(4):
+        (tmp_path / f"doc-{i}.md").write_text(sentence * (20 if i % 2 else 60))
+
+    store = FakeDocumentStore()
+    pipeline = _fk_pipeline(store)
+    pipeline.settings.indexing.document_window = 2
+    pipeline.validator = DocumentValidator(pipeline.settings, max_bytes=1500)
+
+    report = await pipeline.ingest(tmp_path)
+
+    assert report.documents_in == 4
+    assert len(report.rejected) == 2, report.rejected
+    assert report.documents_rejected == len(report.rejected), (
+        "the count and the list are the same fact and must agree across windows"
+    )
+    accounted = (
+        report.documents_indexed
+        + report.documents_skipped
+        + report.documents_rejected
+        + report.documents_duplicate
+        + report.documents_failed
+        + report.documents_empty
+    )
+    assert accounted == report.documents_in, report.summary()
