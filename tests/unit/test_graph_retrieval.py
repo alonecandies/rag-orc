@@ -115,8 +115,8 @@ class SearchableGraph(FakeGraphStore):
 
 
 class ChunkBodies(FakeVectorStore):
-    """The shared vector fake, with the ``with_vectors`` keyword the graph path
-    passes and an outage switch for the chunk-store degradation path."""
+    """The shared vector fake, recording the ids requested and honouring
+    ``with_vectors``, plus an outage switch for the degradation path."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -127,7 +127,10 @@ class ChunkBodies(FakeVectorStore):
         if self.fail:
             raise StoreUnavailable("qdrant", "chunk store offline")
         self.requested.append(list(ids))
-        return await super().get(ids)
+        # Forwarded, not swallowed. Ignoring it made a real bug untestable: code
+        # that stops asking for vectors still got them here, so removing the
+        # similarity term left every test green.
+        return await super().get(ids, with_vectors=with_vectors)
 
 
 def graph_settings(**graph: Any) -> Settings:
@@ -922,6 +925,18 @@ async def test_drift_prices_agreement_between_its_two_halves() -> None:
     assert out[0].component_scores["drift_graph"] == pytest.approx((0.4 + 0.25 * 2 / 3) / 0.65)
     assert out[3].source is RetrievalSource.DENSE, "the seed-only hit keeps its own provenance"
 
+    # The merge must keep the *graph-annotated* body, not the seed's copy of the
+    # same chunk. Both objects share an id and a score, so asserting only those
+    # cannot tell them apart — and the annotation is the verbalized relationship
+    # the generator needs to explain why the passage is relevant.
+    both_halves = next(c for c in out if c.chunk.id == "c-beta")
+    assert both_halves.chunk.content.startswith("Graph context for this passage:"), (
+        f"merged body lost its graph annotation: {both_halves.chunk.content[:80]!r}"
+    )
+    assert out[3].chunk.content == "payments team catering schedule", (
+        "a seed-only hit must keep its plain body"
+    )
+
 
 async def test_drift_enters_the_graph_from_the_passage_not_only_the_question() -> None:
     """This is the whole point of DRIFT: a descriptive question names no entity, so
@@ -1163,3 +1178,28 @@ async def test_load_chunks_rejects_a_store_it_cannot_read() -> None:
 
     with pytest.raises(RetrievalError, match="neither get"):
         await load_chunks(Opaque(), ["a"])
+
+
+async def test_graph_annotation_does_not_mutate_the_store_s_own_chunk() -> None:
+    """Annotating a chunk must not write into the object it was handed.
+
+    The old code prefixed `content` in place and justified it by saying the chunk
+    was built by this call's own store read and therefore owned by it. That holds
+    for Postgres and Qdrant, which deserialize a fresh object per read, and fails
+    for any store handing back a reference it also keeps — a cache tier, or a
+    third-party `VectorStore`, which the protocol invites. The annotation then
+    leaks into whatever reads that chunk next.
+    """
+    graph, store = await build_drift()
+    before = (await store.get(["c-beta"], with_vectors=True))[0].content
+
+    retriever = GraphLocalRetriever(graph, store, settings=graph_settings())
+    out = await retriever.retrieve(Query(text="payments engine"))
+
+    annotated = next(c for c in out if c.chunk.id == "c-beta")
+    assert annotated.chunk.content.startswith("Graph context for this passage:"), (
+        "the returned chunk must carry the annotation"
+    )
+    after = (await store.get(["c-beta"], with_vectors=True))[0].content
+    assert after == before, "the store's own copy must be untouched"
+    assert "graph_context" not in (await store.get(["c-beta"]))[0].metadata

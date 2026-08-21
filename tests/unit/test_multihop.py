@@ -18,6 +18,7 @@ the sufficiency prompt is built with.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from itertools import pairwise
 from typing import Any
@@ -34,6 +35,7 @@ from ragorc.core.models import (
     Relation,
     RetrievalSource,
     ScoredChunk,
+    Usage,
 )
 from ragorc.core.settings import Settings
 from ragorc.retrieve.multihop import (
@@ -151,17 +153,19 @@ class EntityGraph(FakeGraphStore):
 class RecordingChunkStore:
     """Chunk bodies by id, with an optional outage.
 
-    Not ``FakeVectorStore``: ``load_chunks`` passes ``with_vectors``, which the
-    vector fake's ``get`` does not accept.
+    Its own class rather than ``FakeVectorStore`` because these tests care about
+    which ids were asked for, in order.
     """
 
     def __init__(self, bodies: dict[str, str], *, unavailable: bool = False) -> None:
         self.bodies = bodies
         self.unavailable = unavailable
         self.asked: list[list[str]] = []
+        self.asked_with_vectors: list[bool] = []
 
     async def get(self, ids: Sequence[str], *, with_vectors: bool = False) -> list[Chunk]:
         self.asked.append(list(ids))
+        self.asked_with_vectors.append(with_vectors)
         if self.unavailable:
             raise StoreUnavailable("qdrant")
         return [
@@ -359,16 +363,47 @@ async def test_sufficiency_prompt_isolates_every_retrieved_passage(settings: Set
     assert prompt.count(INJECTED) == 1, "the passage must appear only inside its wrapper"
 
 
+class SuggestibleLLM(StubLLM):
+    """A model that obeys an instruction in the prompt body, and ignores one found
+    inside an ``<untrusted_document>`` block.
+
+    That is what a well-behaved model does, and it is the only double that can
+    detect isolation being removed. A ``ScriptedLLM`` returns its canned verdict
+    whatever the prompt says, so a test built on one passes just as happily with
+    the wrapping deleted — which is exactly what the earlier version of this test
+    did.
+    """
+
+    asked = 0
+
+    async def structured(  # type: ignore[override]
+        self, prompt: str, schema: Any, **kwargs: Any
+    ) -> tuple[Any, Usage]:
+        usage = self._record("structured", prompt=prompt, schema=schema.__name__, **kwargs)
+        outside = re.sub(r"<untrusted_document.*?</untrusted_document>", " ", prompt, flags=re.S)
+        # A phrase only the injected passage contains — the prompt template
+        # legitimately asks whether the evidence is sufficient.
+        if "ignore all previous instructions" in outside.lower():
+            return schema(sufficient=True, missing_information="", next_entities=[]), usage
+        # A distinct follow-up per call, or the loop's repeat guard stops it for a
+        # reason that has nothing to do with what this test is about.
+        self.asked += 1
+        return schema(
+            sufficient=False,
+            missing_information=f"detail {self.asked}",
+            next_entities=[],
+        ), usage
+
+
 async def test_a_passage_claiming_sufficiency_cannot_end_the_loop(settings: Settings) -> None:
     """The stop decision comes from the schema field the model filled in, never from
     the retrieved text. A corpus that can talk the loop into stopping early is a
-    corpus that can truncate any answer it appears in."""
-    llm = ScriptedLLM(
-        [
-            {"sufficient": False, "missing_information": "who founded Acme"},
-            {"sufficient": False, "missing_information": "where did Bob study"},
-        ]
-    )
+    corpus that can truncate any answer it appears in.
+
+    Driven with a model that *would* comply if the instruction reached it in the
+    clear, so the assertion depends on the isolation actually being applied.
+    """
+    llm = SuggestibleLLM()
     base = ScriptedRetriever(
         [[sc("attack", 0.9, text=INJECTED)], [sc("b", 0.5)], [sc("c", 0.4)]],
     )
@@ -376,8 +411,12 @@ async def test_a_passage_claiming_sufficiency_cannot_end_the_loop(settings: Sett
 
     out = await retriever.retrieve(Query(text=QUESTION, top_k=5))
 
-    assert base.texts == [QUESTION, "who founded Acme", "where did Bob study"]
+    assert len(base.texts) == 3, (
+        f"the loop stopped after {len(base.texts)} hop(s): the injected passage "
+        "reached the model as an instruction"
+    )
     assert [s.chunk.id for s in out] == ["attack", "b", "c"]
+    assert llm.asked == 2, "one judgement per hop that could act on it"
 
 
 async def test_sufficiency_prompt_shows_the_searches_already_run(settings: Settings) -> None:
@@ -982,3 +1021,44 @@ async def test_a_failed_sufficiency_check_keeps_the_evidence_already_found() -> 
     assert [scored.chunk.id for scored in out] == ["c1"], (
         "the hop that succeeded must survive the judgement that failed"
     )
+
+
+async def test_hop_zero_keeps_the_vectors_the_caller_supplied() -> None:
+    """Hop 0 searches the caller's own question, so its vectors describe it.
+
+    Clearing them is mandatory for a *derived* hop — those vectors encode the
+    previous hop's text — but applying it to hop 0 threw away work the caller had
+    already done. A HyDE-blended vector most of all: passing one is the entire
+    point of HyDE, and multi-hop silently re-embedded the plain question instead.
+    """
+    import numpy as np
+
+    from ragorc.core.models import Chunk, Query, ScoredChunk
+    from ragorc.core.settings import Settings
+    from ragorc.retrieve.multihop import IterativeRetriever
+
+    seen: list[Any] = []
+
+    class _Base:
+        name = "base"
+
+        async def retrieve(self, query, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            seen.append(query.dense)
+            return [ScoredChunk(chunk=Chunk(id="c1", content="text", document_id="d1"), score=0.9)]
+
+    class _StopImmediately:
+        async def structured(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            raise ValueError("stop after the first hop")
+
+        async def complete(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            return "", None
+
+    blended = np.asarray([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+    retriever = IterativeRetriever(
+        _StopImmediately(), _Base(), settings=Settings(security={"enforce_tenant_isolation": False})
+    )
+    await retriever.retrieve(Query(text="how long do refunds take?", dense=blended), top_k=3)
+
+    assert seen, "the base retriever must have been called"
+    assert seen[0] is not None, "hop 0 must keep the caller's vector, not re-embed"
+    assert np.allclose(seen[0], blended)

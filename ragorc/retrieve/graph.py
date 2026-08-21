@@ -79,6 +79,7 @@ instead of penalizing every candidate equally.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
@@ -649,10 +650,10 @@ class GraphLocalRetriever:
             if similarity is not None:
                 component["dense"] = float(similarity[index])
             related = candidates[cid][2]
-            self._annotate(chunk, related, entities)
+            annotated = self._annotate(chunk, related, entities)
             out.append(
                 ScoredChunk(
-                    chunk=chunk,
+                    chunk=annotated,
                     score=float(blended[index]),
                     source=RetrievalSource.GRAPH_LOCAL,
                     rank=rank,
@@ -671,26 +672,36 @@ class GraphLocalRetriever:
         chunk: Chunk,
         relations: Sequence[Relation],
         entities: Mapping[str, Entity],
-    ) -> None:
-        """Prefix a chunk's text with the graph context tied to that chunk.
+    ) -> Chunk:
+        """Return a copy of ``chunk`` prefixed with the graph context tied to it.
 
-        Mutating ``content`` is safe here: these ``Chunk`` objects were built by
-        this call's own store read and are owned by it, exactly as the context
-        packer's parent expansion relies on. The header is also kept in metadata so
-        a citation validator can tell the graph preamble from the source prose.
+        A copy, not a mutation. This used to write into ``content`` on the argument
+        and justify it by saying the object was built by this call's own store read
+        and therefore owned by it. That is true of Postgres and Qdrant, which
+        deserialize a fresh object per read, and false of any store that hands back
+        a reference it also keeps — an in-process cache tier, or a third-party
+        implementation of the ``VectorStore`` protocol, which this library invites.
+        The annotation then leaks into whatever else reads that chunk, including a
+        later unrelated query.
+
+        The header is also kept in metadata so a citation validator can tell the
+        graph preamble from the source prose.
         """
         if not relations:
-            return
+            return chunk
         names = {rel.source for rel in relations} | {rel.target for rel in relations}
         mentioned = [entities[name] for name in sorted(names) if name in entities]
         header = verbalize_subgraph(
             mentioned, list(relations), title="Graph context for this passage:"
         )
-        chunk.metadata["graph_context"] = header
-        chunk.content = f"{header}\n\n{chunk.content}"
-        # The body changed, so any cached token count is now a lie the budgeter
-        # would trust.
-        chunk.token_count = None
+        return replace(
+            chunk,
+            content=f"{header}\n\n{chunk.content}",
+            metadata={**chunk.metadata, "graph_context": header},
+            # The body changed, so any cached token count is now a lie the budgeter
+            # would trust.
+            token_count=None,
+        )
 
     def _subgraph_chunk(
         self,

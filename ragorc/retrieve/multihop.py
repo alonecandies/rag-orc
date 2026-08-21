@@ -126,6 +126,10 @@ def _hop_query(query: Query, text: str) -> Query:
     hop's vector search runs the previous question again while the lexical and
     structured legs run the new one — a bug that produces plausible results and no
     error, and would make the iteration look ineffective rather than broken.
+
+    Only call this for a hop whose text actually changed. Applied to the caller's
+    own question it discards vectors that describe it correctly, which silently
+    defeats a HyDE-blended vector and pays to re-embed a question already embedded.
     """
     return replace(
         query,
@@ -227,7 +231,14 @@ class IterativeRetriever:
         with Timer("retrieve.iterative") as timer:
             for hop in range(max_iterations):
                 history.append(current)
-                hits = await self.base.retrieve(_hop_query(query, current), top_k=limit)
+                # Only *derived* hops lose the cached vectors. At hop 0 the text is
+                # still the caller's question, so its vectors describe it correctly,
+                # and clearing them threw away work the caller had already done —
+                # a HyDE-blended vector most of all, which is the entire point of
+                # passing one. It also paid for a re-embed of a question already
+                # embedded.
+                hop_query = query if current == query.text else _hop_query(query, current)
+                hits = await self.base.retrieve(hop_query, top_k=limit)
                 added_per_hop.append(self._absorb(gathered, hits, hop=hop))
 
                 if hop == max_iterations - 1:

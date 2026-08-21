@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from itertools import pairwise
 from typing import Any
 
@@ -79,6 +80,7 @@ class FakeVectorStore:
 
     def __init__(self) -> None:
         self.chunks: dict[str, Chunk] = {}
+        self.get_calls: list[tuple[list[str], bool]] = []
         self.searches: list[dict[str, Any]] = []
         self.upserts = 0
         self.collection_created = False
@@ -141,8 +143,20 @@ class FakeVectorStore:
             item.component_scores = {"dense": item.score}
         return out
 
-    async def get(self, ids: Sequence[str]) -> list[Chunk]:
-        return [self.chunks[i] for i in ids if i in self.chunks]
+    async def get(self, ids: Sequence[str], *, with_vectors: bool = False) -> list[Chunk]:
+        """Chunk bodies by id, modelling Qdrant's ``with_vectors``.
+
+        The flag is honoured rather than accepted-and-ignored, because ignoring it
+        makes a whole class of bug untestable: production code that stops asking
+        for vectors gets them anyway from the fake, so a change that silently
+        deletes a similarity term against real Qdrant leaves every test green.
+        Asked without vectors, a real point comes back without them.
+        """
+        self.get_calls.append((list(ids), with_vectors))
+        found = [self.chunks[i] for i in ids if i in self.chunks]
+        if with_vectors:
+            return found
+        return [replace(chunk, dense=None, sparse=None, multi=None) for chunk in found]
 
     async def delete(self, ids: Sequence[str] | None = None, **kwargs: Any) -> int:
         if ids is None:
