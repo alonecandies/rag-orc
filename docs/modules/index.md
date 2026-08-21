@@ -52,10 +52,32 @@ IngestPipeline(*, vector_store=None, relational_store=None, splitter=None,
     async close() -> None                     # closes only the stores it created
 
 IngestReport(documents_in, documents_indexed, documents_skipped, documents_rejected,
-             documents_duplicate, documents_failed, chunks_created, vectors_written,
-             strategy, total_ms, timings_ms, usage, rejected, failed, warnings)
+             documents_duplicate, documents_failed, documents_empty, chunks_created,
+             vectors_written, points_in_store, strategy, total_ms, timings_ms, usage,
+             rejected, failed, warnings)
     .cost_usd  .skip_rate  .summary()
 
+```
+
+**`vectors_written` vs `points_in_store`.** The first counts vectors *sent*, the
+second is what the collection reports holding after the run's one flush. They are
+separate numbers because Qdrant and Postgres share no transaction and
+`qdrant.wait_on_upsert` is off, so the only honest answer to "did it land?" comes
+from asking the store. Into an empty collection they should agree; on a re-ingest
+`points_in_store` is lower, because points are overwritten by id while
+`vectors_written` counts writes. `points_in_store` is `None` when the store could
+not be asked, and the failure is recorded in `warnings` rather than passed off as
+zero.
+
+**Write order is a constraint, not a preference.** `chunks.document_id` is a
+foreign key to `documents(id)` with `ON DELETE CASCADE`, so per window the order
+is: build chunks → purge the stale ones → write document rows → write everything
+the enrichment stages want persisted (parents, summarised sources) → write chunks.
+Parent-document and multi-representation writes are buffered during processing and
+flushed at that point; doing them inline put them before the row they reference and
+before a cascade that would have deleted them.
+
+```
 build_splitter(name=None, *, embedder=None, settings=None) -> Splitter
 load(source, **kw) -> list[Document]          # TextLoader, MarkdownLoader, PDFLoader, ...
 GraphBuilder(llm, store: Neo4jStore, *, embedder=None, settings=None, ...)

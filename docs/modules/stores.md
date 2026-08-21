@@ -22,6 +22,7 @@ QdrantStore(settings=None, client=None, dense_embedder=None,
     async get(ids, *, with_vectors=False) -> list[Chunk]
     async scroll(...) / count(...) / delete(ids=None, *, filters=None, tenant_id=None)
     bulk_load()                                  # async context manager: indexing off during ingest
+    async flush(*, timeout_s=300.0) -> int       # wait for green, then read back the exact count
 ```
 
 `search` issues **one** `query_points` call whose `prefetch` list runs the dense and

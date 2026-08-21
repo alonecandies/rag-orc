@@ -657,6 +657,7 @@ def _merge_report(into: Any, other: Any) -> None:
         "documents_rejected",
         "documents_duplicate",
         "documents_failed",
+        "documents_empty",
         "chunks_created",
         "vectors_written",
         "total_ms",
@@ -666,6 +667,11 @@ def _merge_report(into: Any, other: Any) -> None:
         into.timings_ms[stage] = into.timings_ms.get(stage, 0.0) + value
     into.usage = into.usage + other.usage
     into.strategy = other.strategy or into.strategy
+    # Not a sum: it is the size of the whole collection, read back after each
+    # batch's flush, so the last batch's answer is the run's answer. Summing it
+    # would multiply the collection by the number of batches.
+    if other.points_in_store is not None:
+        into.points_in_store = other.points_in_store
     into.rejected.extend(other.rejected)
     into.failed.extend(other.failed)
     into.warnings.extend(w for w in other.warnings if w not in into.warnings)
@@ -703,8 +709,13 @@ def _report_table(report: Any) -> Table:
         "rejected",
         "duplicate",
         "failed",
+        "empty",
         "chunks",
         "vectors",
+        # What the store says it holds, beside what this run sent. The operator's
+        # cross-check for "did it land?", and the reason it is printed rather than
+        # only logged: the two stores share no transaction.
+        "points_in_store",
         "strategy",
         "skip_rate",
         "llm_calls",

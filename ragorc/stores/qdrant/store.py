@@ -89,6 +89,7 @@ from ragorc.stores.qdrant.collections import (
     SPARSE_VECTOR,
     bulk_load_mode,
     ensure_payload_indexes,
+    wait_for_green,
 )
 from ragorc.stores.qdrant.collections import ensure_collection as ensure_collection_schema
 from ragorc.stores.qdrant.filters import to_qdrant_filter, with_tenant
@@ -463,8 +464,8 @@ class QdrantStore:
         ``qdrant.parallel_upserts`` at a time: one giant request serializes on a
         single shard connection, and one request per chunk pays the round trip
         per point. ``wait_on_upsert`` is ``False`` in production so batches
-        return as soon as the write is queued — the ingest pipeline does one
-        final waiting flush rather than blocking on every batch.
+        return as soon as the write is queued — :meth:`flush` is the one waiting
+        barrier, at the end of a run, rather than blocking on every batch.
         """
         if not chunks:
             return 0
@@ -484,6 +485,29 @@ class QdrantStore:
             batches=len(batches),
             waited=qs.wait_on_upsert,
         )
+        return total
+
+    async def flush(self, *, timeout_s: float = 300.0) -> int:
+        """Wait for queued writes to settle, and report what the server holds.
+
+        The barrier two docstrings promised and no code provided. Because
+        ``wait_on_upsert`` is ``False``, :meth:`upsert` returns once Qdrant has
+        accepted a batch — not once its points are searchable — so a run reported
+        the vectors it *sent*. Combined with the ingest's commit marker living in
+        Postgres, a collection that never finished applying those points was
+        indistinguishable from a good run, and the next run skipped the documents
+        as already done.
+
+        Two steps, answering two different questions. ``wait_for_green`` waits for
+        the optimizer, so a search issued right after ingest is served by a
+        finished index instead of a brute-force scan over unindexed segments. The
+        exact count is the read-back: what the collection actually contains, which
+        is the only number worth comparing against what the ingest thought it
+        wrote. Returns that count; a caller comparing it is the point.
+        """
+        green = await wait_for_green(self.client, self.collection, timeout_s=timeout_s)
+        total = await self.count(exact=True)
+        log.info("qdrant_flushed", collection=self.collection, green=green, points=total)
         return total
 
     # -- query vectors ----------------------------------------------------

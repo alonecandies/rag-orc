@@ -1328,3 +1328,79 @@ async def test_windowed_ingest_accumulates_the_validation_counters(tmp_path: Any
         + report.documents_empty
     )
     assert accounted == report.documents_in, report.summary()
+
+
+# ---------------------------------------------------------------------------
+# "Did it land?" must be answered by the store, not by the sender
+# ---------------------------------------------------------------------------
+async def test_ingest_flushes_the_vector_store_and_reports_what_it_holds() -> None:
+    """`qdrant.wait_on_upsert` is False, so an upsert returns once the write is
+    accepted — not once its points are searchable.
+
+    Two docstrings promised "one final waiting flush" and no such call existed
+    anywhere, so the run reported the vectors it *sent*. That is the dangerous
+    number to report, because the commit marker for "this document is ingested"
+    is the Postgres chunk rows: a collection that never finished applying its
+    points looked exactly like a good run, and the next run skipped those
+    documents as already done.
+
+    Run with a sparse leg on purpose: a chunk is one *point* carrying two named
+    vectors there, so the read-back and `vectors_written` differ by construction.
+    Comparing those two numbers is what the first version of this check did, and
+    it reported a shortfall on every healthy hybrid run.
+    """
+    from tests.fakes import FakeDocumentStore, FakeVectorStore, StubSparseEmbedder
+
+    class _Flushing(FakeVectorStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flushes = 0
+
+        async def flush(self, *, timeout_s: float = 300.0) -> int:
+            self.flushes += 1
+            return len(self.chunks)
+
+    store = _Flushing()
+    pipeline = _fk_pipeline(FakeDocumentStore())
+    pipeline.vector = store
+    pipeline.sparse_embedder = StubSparseEmbedder()
+    pipeline.settings.retrieval.use_sparse = True
+    document = Document(id="d1", content="Refunds are processed within five business days. " * 60)
+
+    report = await pipeline.ingest([document])
+
+    assert store.flushes == 1, "exactly one barrier per run, not one per batch"
+    assert report.points_in_store == len(store.chunks)
+    assert report.points_in_store == report.chunks_created, (
+        "a chunk is one point; into an empty collection the counts must agree"
+    )
+    assert report.vectors_written > report.chunks_created, (
+        "the fixture must be a multi-vector collection, or the check below is vacuous"
+    )
+    assert not [w for w in report.warnings if "holds" in w], (
+        "vectors_written counts named vectors and points_in_store counts points; "
+        f"comparing them warns on every healthy hybrid run: {report.warnings}"
+    )
+    assert report.summary()["points_in_store"] == report.points_in_store, (
+        "the read-back is the operator's cross-check and has to reach the report"
+    )
+
+
+async def test_a_flush_that_fails_is_reported_not_swallowed() -> None:
+    """The flush *is* the check, so losing it silently defeats its purpose. It is
+    not fatal either — the writes were accepted; only the confirmation failed."""
+    from tests.fakes import FakeDocumentStore, FakeVectorStore
+
+    class _Unflushable(FakeVectorStore):
+        async def flush(self, *, timeout_s: float = 300.0) -> int:
+            raise TimeoutError("collection never went green")
+
+    pipeline = _fk_pipeline(FakeDocumentStore())
+    pipeline.vector = _Unflushable()
+    document = Document(id="d1", content="Refunds are processed within five business days. " * 60)
+
+    report = await pipeline.ingest([document])
+
+    assert report.documents_indexed == 1, "a failed confirmation is not a failed ingest"
+    assert report.points_in_store is None, "unknown must not read as zero"
+    assert any("could not confirm" in w for w in report.warnings), report.warnings

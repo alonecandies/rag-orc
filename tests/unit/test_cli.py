@@ -112,3 +112,64 @@ def test_bench_treats_hash_lines_in_a_question_file_as_comments() -> None:
     )
     result = runner.invoke(app, ["bench", "--queries", str(questions), "--help"])
     assert result.exit_code == 0, result.output
+
+
+def test_the_batched_ingest_report_carries_every_field_the_table_prints() -> None:
+    """`ragorc ingest` merges one report per batch, and the merge enumerates the
+    fields it carries by name — so a field added to `IngestReport` is silently
+    dropped until someone remembers this list.
+
+    Two already had been: `documents_empty`, which exists precisely so the counters
+    reconcile with `documents_in`, and `points_in_store`, which the table printed
+    as `None` on a run whose log showed the real number.
+    """
+    from ragorc.cli import _merge_report, _report_table
+    from ragorc.index.pipeline import IngestReport
+
+    def batch(**kwargs: object) -> IngestReport:
+        report = IngestReport()
+        for key, value in kwargs.items():
+            setattr(report, key, value)
+        return report
+
+    merged = IngestReport()
+    _merge_report(
+        merged,
+        batch(
+            documents_in=3,
+            documents_indexed=2,
+            documents_empty=1,
+            chunks_created=5,
+            vectors_written=10,
+            points_in_store=5,
+        ),
+    )
+    _merge_report(
+        merged,
+        batch(
+            documents_in=2,
+            documents_indexed=2,
+            chunks_created=4,
+            vectors_written=8,
+            points_in_store=9,
+        ),
+    )
+
+    assert merged.documents_empty == 1, "the counter that makes the report reconcile"
+    accounted = (
+        merged.documents_indexed
+        + merged.documents_skipped
+        + merged.documents_rejected
+        + merged.documents_duplicate
+        + merged.documents_failed
+        + merged.documents_empty
+    )
+    assert accounted == merged.documents_in == 5, merged.summary()
+    # The collection's size, not a per-batch delta: summing would report 14 points
+    # in a collection holding 9.
+    assert merged.points_in_store == 9
+
+    # Every key the table asks for must exist in the merged summary, or rendering
+    # raises KeyError on a real run.
+    rendered = _report_table(merged)
+    assert rendered.row_count >= 12

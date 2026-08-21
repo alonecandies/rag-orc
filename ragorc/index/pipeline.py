@@ -207,6 +207,13 @@ class IngestReport:
     ``skip_rate`` — a healthy signal that must not be inflated by a silent loss."""
     chunks_created: int = 0
     vectors_written: int = 0
+    points_in_store: int | None = None
+    """Points the vector store reports holding after the final flush.
+
+    ``vectors_written`` counts what was *sent*; this counts what is *there*. They
+    are separate numbers because the two stores are not in one transaction and the
+    writes do not wait, so the only honest way to answer "did it land?" is to ask
+    the store. ``None`` when the store cannot be asked."""
     strategy: str = ChunkingStrategy.AUTO.value
     total_ms: float = 0.0
     timings_ms: dict[str, float] = field(default_factory=dict)
@@ -240,6 +247,7 @@ class IngestReport:
             "empty": self.documents_empty,
             "chunks": self.chunks_created,
             "vectors": self.vectors_written,
+            "points_in_store": self.points_in_store,
             "strategy": self.strategy,
             "skip_rate": round(self.skip_rate, 3),
             "cost_usd": round(self.cost_usd, 6),
@@ -538,6 +546,8 @@ class IngestPipeline:
                 report.total_ms = _elapsed_ms(run_started)
                 log.warning("ingest_all_rejected", **report.summary())
                 return report
+
+            await self._flush_vectors(report)
 
         report.total_ms = _elapsed_ms(run_started)
         log.info("ingest_complete", **report.summary())
@@ -1223,6 +1233,55 @@ class IngestPipeline:
         )
         index = await indexer.build(document)
         return list(index.children), list(index.parents)
+
+    async def _flush_vectors(self, report: IngestReport) -> None:
+        """Make the vector writes durable and searchable before reporting success.
+
+        Batches do not wait (``qdrant.wait_on_upsert``), so without this the run
+        reported the vectors it *sent*. That was the more dangerous of the two
+        numbers to report, because the ingest's commit marker is the Postgres chunk
+        rows: a collection that never finished applying its points looked like a
+        successful run, and the next run skipped those documents as already done.
+
+        A store with no ``flush`` is left alone rather than warned about — the
+        method is an optimization over waiting per batch, not part of the store
+        contract, and a store that waits per write has nothing to flush.
+        """
+        flush = getattr(self.vector, "flush", None)
+        if not callable(flush):
+            return
+        started = time.perf_counter()
+        try:
+            report.points_in_store = int(await flush())
+        except Exception as exc:
+            # Not fatal: the writes were accepted and this is the read-back. But it
+            # must be visible, because its whole purpose is to be the check.
+            report.warnings.append(f"could not confirm the vector store's contents: {exc}")
+            log.warning("vector_flush_failed", error=str(exc)[:200], error_type=type(exc).__name__)
+            return
+        report.timings_ms["flush"] = _elapsed_ms(started)
+        # Against `chunks_created`, not `vectors_written`: a chunk is one *point*
+        # carrying up to three named vectors, so `vectors_written` is 2x the point
+        # count on a hybrid collection and comparing the two reports a shortfall on
+        # every healthy run.
+        #
+        # Even this comparison only holds one way. The collection accumulates
+        # across runs and points are overwritten by id, so `points_in_store` is
+        # normally *larger* than one run's chunks and equal after a full reindex.
+        # Smaller is the interesting case: this run wrote more chunks than the whole
+        # collection now holds, which means some of them are not there.
+        if report.points_in_store < report.chunks_created:
+            log.warning(
+                "fewer_points_than_chunks_written",
+                chunks_written=report.chunks_created,
+                in_store=report.points_in_store,
+                hint="the collection holds fewer points than this run wrote; "
+                "check for rejected upserts",
+            )
+            report.warnings.append(
+                f"vector store holds {report.points_in_store} points but this run wrote "
+                f"{report.chunks_created} chunks"
+            )
 
     async def _flush_deferred(self, report: IngestReport) -> None:
         """Write the chunks nothing will search, now that their rows exist.
