@@ -796,6 +796,19 @@ class IngestPipeline:
         query_side: Any = chunker if strategy is ChunkingStrategy.LATE else self._dense()
         dimension = await self._pin_dimension(query_side, measure=strategy is ChunkingStrategy.LATE)
 
+        # Before the stores, not on first use: `_ensure_stores` declares the
+        # collection's named vectors *from these objects*, so an embedder built
+        # lazily inside `_process_document` arrives after the schema it decides.
+        # `_colbert_dim()` then reads `None` and falls back to ColBERTv2's 128 —
+        # correct for the default model and 32 too wide for
+        # `answerai-colbert-small-v1`, whose every upsert the server then rejects.
+        # Sparse has no width but does have `is_lexical`, which picks the IDF
+        # modifier; guessed from `use_splade` it can disagree with the provider
+        # that will actually produce the vectors. Same discipline as
+        # `_pin_dimension`: ask the thing itself, once, before it matters.
+        self._sparse()
+        self._colbert()
+
         self._stages = self._build_stages(report)
         await self._ensure_stores(query_side, dimension)
 

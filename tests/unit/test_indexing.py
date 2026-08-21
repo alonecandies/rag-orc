@@ -906,3 +906,88 @@ async def test_parent_document_replaces_the_split_and_persists_the_parents(
     assert all(p.dense is None for batch in persisted for p in batch), (
         "a parent carries no vector: nothing ever searches one"
     )
+
+
+# ---------------------------------------------------------------------------
+# The collection is declared from the embedders, so they must exist first
+# ---------------------------------------------------------------------------
+def _stub_providers(monkeypatch: pytest.MonkeyPatch, pipeline: Any, *, colbert_dim: int) -> None:
+    """Route the pipeline's lazy provider lookups to stubs.
+
+    Without this the pipeline resolves `fastembed` for real, which loads an ONNX
+    session and may reach a model host — neither belongs in a unit test.
+    """
+    from tests.fakes import StubLateInteractionEmbedder, StubSparseEmbedder
+
+    class _Late(StubLateInteractionEmbedder):
+        def __init__(self, **_: Any) -> None:
+            super().__init__(dimension=colbert_dim, max_tokens=40)
+
+    class _Sparse(StubSparseEmbedder):
+        def __init__(self, **_: Any) -> None:
+            super().__init__(is_lexical=True)
+
+    classes = {"sparse_embedder": _Sparse, "late_interaction_embedder": _Late}
+    monkeypatch.setattr(pipeline, "_provider_class", lambda kind, provider: classes[kind])
+
+
+async def test_the_collection_is_declared_from_the_real_embedders_not_a_guess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_prepare` creates the collection, so every embedder that shapes it must
+    already be built when it runs.
+
+    The sparse and ColBERT embedders were built lazily, on first use — which is
+    inside `_process_document`, *after* the collection exists. So with
+    `enable_late_interaction` on and no hand-injected embedder, `_colbert_dim()`
+    saw `None` and fell back to ColBERTv2's 128. The configured model decides the
+    real width, and `answerdotai/answerai-colbert-small-v1` is 96: the collection
+    was then declared 96 wide short of what every upsert would send, and Qdrant
+    rejected the whole batch. `_pin_dimension` already forces a real forward pass
+    for the dense vector for exactly this reason; the other two named vectors need
+    the same discipline.
+
+    `is_lexical` rides along: it decides the IDF modifier, and read off `None` it
+    is guessed from `use_splade` instead of from the provider that will actually
+    produce the vectors.
+    """
+    from ragorc.index.pipeline import IngestPipeline
+    from tests.fakes import StubEmbedder
+
+    seen: dict[str, Any] = {}
+
+    async def spy(self: Any, query_side: Any, dimension: int) -> None:
+        seen["late"] = self.late_embedder
+        seen["sparse"] = self.sparse_embedder
+
+    monkeypatch.setattr(IngestPipeline, "_ensure_stores", spy)
+    pipeline = IngestPipeline(
+        dense_embedder=StubEmbedder(dimension=32),
+        settings=Settings(
+            security={"enforce_tenant_isolation": False},
+            cache={"enabled": False},
+            embedding={"dense_dimension": 32, "enable_late_interaction": True},
+            indexing={"splitter": "recursive", "skip_unchanged": False},
+            retrieval={"use_sparse": True},
+        ),
+    )
+    _stub_providers(monkeypatch, pipeline, colbert_dim=96)
+
+    await pipeline._prepare()
+
+    assert seen["sparse"] is not None, "the sparse leg decides the IDF modifier"
+    assert seen["late"] is not None, "the ColBERT leg decides the multivector width"
+    assert seen["late"].dimension == 96
+
+    # The consequence, at the seam that suffered it. This is the value the
+    # collection is created with; 128 here is a collection no upsert can satisfy.
+    from ragorc.stores.qdrant.store import QdrantStore
+
+    guessed = QdrantStore(pipeline.settings, dense_embedder=StubEmbedder(dimension=32))
+    assert guessed._colbert_dim() == 128, "the fallback guess, for contrast"
+    sized = QdrantStore(
+        pipeline.settings,
+        dense_embedder=StubEmbedder(dimension=32),
+        late_embedder=seen["late"],
+    )
+    assert sized._colbert_dim() == 96, "what the pipeline must hand it"
