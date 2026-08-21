@@ -881,3 +881,60 @@ async def test_parent_document_says_so_rather_than_half_running() -> None:
 
     assert [c.id for c in produced] == ["c1"], "nothing is re-chunked here"
     assert usage.calls == 0, "and nothing is spent pretending to"
+
+
+async def test_force_reindexes_documents_the_skip_would_drop() -> None:
+    """The zero-downtime reindex is documented as: build into a new collection,
+    then swap the alias. The checksum skip asks Postgres whether a document was
+    ingested and has no notion of *which* collection is being written, so that
+    procedure skipped every document, reported success, and swapped the alias onto
+    an empty index."""
+    from ragorc.core.models import Document
+    from ragorc.index.pipeline import IngestReport
+
+    pipeline = _stub_pipeline()
+    documents = [Document(id="d1", content="text", checksum="same")]
+
+    class _Store:
+        async def existing_checksums(self, ids):  # noqa: ANN001, ANN202
+            return {"d1": "same"}
+
+    pipeline.relational = _Store()  # type: ignore[assignment]
+    pipeline._existing_checksums = _Store().existing_checksums  # type: ignore[method-assign]
+
+    todo, _ = await pipeline._select_changed(documents, IngestReport())
+    assert todo == [], "an unchanged document is skipped, which is the whole feature"
+
+    todo, _ = await pipeline._select_changed(documents, IngestReport(), force=True)
+    assert [d.id for d in todo] == ["d1"], "force must reindex it anyway"
+
+
+async def test_skipping_everything_into_an_empty_collection_is_reported() -> None:
+    """The footgun above, caught without being asked.
+
+    If every document was skipped as unchanged and the target collection holds
+    nothing, the run is about to look like a success and leave an empty index.
+    """
+    from ragorc.index.pipeline import IngestReport
+
+    class _Empty:
+        async def count(self, **kwargs: Any) -> int:
+            return 0
+
+    class _Full:
+        async def count(self, **kwargs: Any) -> int:
+            return 4321
+
+    pipeline = _stub_pipeline()
+    report = IngestReport()
+    report.documents_skipped = 10
+    pipeline.vector = _Empty()  # type: ignore[assignment]
+    await pipeline._warn_if_target_is_empty(report)
+    assert any("empty" in w for w in report.warnings), report.warnings
+    assert any("force" in w for w in report.warnings), "the warning must name the fix"
+
+    quiet = IngestReport()
+    quiet.documents_skipped = 10
+    pipeline.vector = _Full()  # type: ignore[assignment]
+    await pipeline._warn_if_target_is_empty(quiet)
+    assert quiet.warnings == [], "a populated collection is the normal no-op case"

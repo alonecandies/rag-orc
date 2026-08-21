@@ -410,6 +410,15 @@ def ingest(
     batch_size: int = typer.Option(
         _INGEST_BATCH_DOCUMENTS, "--batch-size", min=1, help="Documents per pipeline call."
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Reindex documents the checksum skip would drop. Needed when building "
+            "into a new collection: the skip is a question about Postgres and does "
+            "not know which collection you are writing."
+        ),
+    ),
     as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
 ) -> None:
     """Load, split, embed and write documents.
@@ -443,7 +452,7 @@ def ingest(
             raise typer.Exit(EXIT_OK)
 
         async with _service(settings) as service:
-            report = await _ingest_batched(service, documents, batch_size)
+            report = await _ingest_batched(service, documents, batch_size, force=force)
 
         if as_json:
             _print_json(report.summary())
@@ -498,7 +507,9 @@ async def _discover(
     return documents
 
 
-async def _ingest_batched(service: RagService, documents: Sequence[Any], batch: int) -> Any:
+async def _ingest_batched(
+    service: RagService, documents: Sequence[Any], batch: int, *, force: bool = False
+) -> Any:
     """Ingest in batches, advancing a bar, and merge the reports into one."""
     from ragorc.index.pipeline import IngestReport
 
@@ -514,7 +525,7 @@ async def _ingest_batched(service: RagService, documents: Sequence[Any], batch: 
         task = progress.add_task("indexing", total=len(documents))
         for start in range(0, len(documents), batch):
             window = list(documents[start : start + batch])
-            report = await service.linear.ingest(window)
+            report = await service.linear.ingest(window, force=force)
             _merge_report(merged, report)
             progress.update(
                 task,

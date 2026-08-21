@@ -490,13 +490,20 @@ class IngestPipeline:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    async def ingest(self, target: Any) -> IngestReport:
+    async def ingest(self, target: Any, *, force: bool = False) -> IngestReport:
         """Ingest documents or a source, and report what happened.
 
         ``target`` is a :class:`~ragorc.core.models.Document`, a path to a file or
         directory, or any iterable mixing the two. Paths go through
         :func:`ragorc.index.loaders.load`, which is what supplies the deterministic
         id and the checksum the skip depends on.
+
+        ``force`` ignores the checksum skip. Needed for the documented
+        zero-downtime reindex — build into a *new* collection, then swap the alias
+        — because the skip is a question about Postgres and knows nothing about
+        which Qdrant collection is being written. Without it, re-ingesting an
+        unchanged corpus into an empty collection skips every document and reports
+        success, and the alias is then swapped onto an empty index.
         """
         report = IngestReport()
         run_started = time.perf_counter()
@@ -515,9 +522,12 @@ class IngestPipeline:
                 if strategy is None:
                     strategy = await self._prepare(report)
                     report.strategy = strategy.value
-                todo, changed = await self._select_changed(accepted, report)
+                todo, changed = await self._select_changed(accepted, report, force=force)
                 if todo:
                     await self._run(todo, changed, strategy, report)
+
+            if report.documents_in and not report.chunks_created:
+                await self._warn_if_target_is_empty(report)
 
             if not report.documents_in:
                 log.warning("ingest_nothing_to_do", target=str(target)[:200])
@@ -610,6 +620,38 @@ class IngestPipeline:
             return documents
         raise TypeError(f"cannot ingest {type(target).__name__}: expected documents or a source")
 
+    async def _warn_if_target_is_empty(self, report: IngestReport) -> None:
+        """Catch the skip that produced an empty index.
+
+        The checksum skip asks Postgres whether a document was ingested; it has no
+        notion of *which* vector collection is being written. So the documented
+        zero-downtime reindex — build into a new collection, swap the alias — skips
+        every document and reports success, and the alias goes onto an empty index.
+        The failure is silent, and it is silent at exactly the moment an operator
+        is trusting it.
+
+        Rather than leave the footgun documented, look: if everything was skipped
+        and the target collection holds nothing, say so and name the fix. One
+        `count` on a path that has already decided to do no work.
+        """
+        if not self.vector or not report.documents_skipped:
+            return
+        try:
+            present = await self.vector.count(exact=False)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never fail a run
+            log.debug("ingest_target_count_failed", error=str(exc)[:200])
+            return
+        if present:
+            return
+        warning = (
+            f"every document was skipped as unchanged and the target collection "
+            f"'{self.settings.qdrant.collection}' is empty — the checksum skip is a "
+            f"question about Postgres and does not know which collection you are "
+            f"writing. Re-run with force=True (CLI: --force) to reindex into it."
+        )
+        log.warning("ingest_skipped_into_empty_collection", hint=warning)
+        report.warnings.append(warning)
+
     async def _validate(
         self, documents: Sequence[Document], report: IngestReport
     ) -> list[Document]:
@@ -651,10 +693,10 @@ class IngestPipeline:
     # b. checksum skip
     # ------------------------------------------------------------------
     async def _select_changed(
-        self, documents: Sequence[Document], report: IngestReport
+        self, documents: Sequence[Document], report: IngestReport, *, force: bool = False
     ) -> tuple[list[Document], set[str]]:
         """Split into work and no-ops. Returns ``(to_index, ids_that_changed)``."""
-        if not self.config.skip_unchanged or self.relational is None:
+        if force or not self.config.skip_unchanged or self.relational is None:
             return list(documents), set()
 
         started = time.perf_counter()

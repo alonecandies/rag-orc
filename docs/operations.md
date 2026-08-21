@@ -13,8 +13,16 @@ Running `ragorc` beyond a laptop: scaling, deployment, monitoring, failure modes
 1M - 10M | `on_disk_payload=true`, `hnsw_m=32`, raise `hnsw_ef_construct` to 256 |
 > 10M | `on_disk_vectors=true` **with** `quantization_always_ram=true`, shard (`shard_number` > 1), consider `binary` quantization for ≥1024-dim models |
 
-Zero-downtime reindex: build into a new collection, then `swap_alias()`. Never
-mutate a live collection's vector config — it requires a rebuild.
+Zero-downtime reindex: build into a new collection with `--force`, then
+`swap_alias()`. Never mutate a live collection's vector config — it requires a
+rebuild.
+
+`--force` is not optional here. The checksum skip asks Postgres whether a
+document was ingested; it has no notion of which Qdrant collection is being
+written, so an unchanged corpus re-ingested into a *new* collection skips every
+document and reports success — and the alias then points at an empty index. If it
+is forgotten, the ingest says so: skipping everything into an empty collection is
+reported on `IngestReport.warnings`.
 
 Multi-tenancy: keep one collection with a `tenant_id` payload index
 (`is_tenant=True`). One collection per tenant does not scale past a few hundred
@@ -151,6 +159,7 @@ A chunk mentions "it" and is never retrieved | early chunking lost the anteceden
 `BudgetExceeded` on normal queries | a loop is retrying; groundedness threshold too strict | inspect `ledger.report()["by_stage"]` |
 `StructuredOutputError` on one model | the provider ignores `response_format` | `require_parameters=true`, or pin `provider_order` |
 Abstention rate spikes after a reindex | vectors written with a different embedding model | dimensions must match; rebuild the collection |
+Reindex reported success but the new collection is empty | the checksum skip dropped every document — it knows Postgres, not which collection you are writing | re-run `ragorc ingest --force`; the report now warns when this happens |
 `Abort trap: 6` / exit 134 at process exit, with a macOS crash report naming `Microsoft::Applications::Events` | ONNX Runtime's bundled telemetry client races static destruction while sessions are still alive | already mitigated — `ORT_DISABLE_TELEMETRY=1` plus an `atexit` session release in `ragorc/embed/_runtime.py`. The work had completed; only the exit was dirty |
 Text-to-SQL always refuses, rule `generated_query_isolation` | tenant isolation is on and the deployment has not declared how tenants are separated — the default, and deliberately fail-closed | set `security.generated_query_isolation` to `rls` (recommended), `database` or `trusted`; see docs/security.md |
 Text-to-SQL always refuses, other rules | `postgres.allowed_tables` too narrow, or the schema summary is stale | widen the allowlist; `schema_summary(refresh=True)` |
