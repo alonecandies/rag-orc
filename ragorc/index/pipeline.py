@@ -483,6 +483,7 @@ class IngestPipeline:
         self.validator = validator or DocumentValidator(self.settings)
         self._strategy: ChunkingStrategy | None = None
         self._enricher: Any | None = None
+        self._colbert_indexer: Any | None = None
         self._stages: list[tuple[_Plugin, Any]] = []
         self._embedding_cache: Any | None = None
         self._owns_stores = False
@@ -1294,14 +1295,32 @@ class IngestPipeline:
         A ColBERT matrix is ~100x a dense vector on disk, so this is off by
         default; when it is on it is the multivector Qdrant rescores the fused
         candidates with, server-side.
+
+        Delegated to :class:`~ragorc.index.colbert.ColBERTIndexer` rather than done
+        here. It used to be five lines inline, which cost four things: the matrices
+        were never pruned, so ``late_interaction_max_tokens`` bounded nothing and
+        the largest field in the collection grew without limit; the whole window
+        went out as one request instead of ``embedding.batch_size`` batches;
+        a width disagreement between the embedder and the collection surfaced as
+        the server rejecting an entire upsert instead of an error naming both
+        numbers; and the text embedded was ``content``, so ColBERT alone among the
+        three vectors indexed the chunk without its contextual prefix. It also
+        skips chunks that already have a matrix, which is what makes a resumed
+        ingest cheap.
         """
         embedder = self._colbert()
         if embedder is None:
             return
+        if self._colbert_indexer is None:
+            from ragorc.index.colbert import ColBERTIndexer
+
+            self._colbert_indexer = ColBERTIndexer(
+                embedder,
+                settings=self.settings,
+                max_tokens_per_doc=self.settings.embedding.late_interaction_max_tokens,
+            )
         started = time.perf_counter()
-        matrices = await embedder.embed_documents([chunk.content for chunk in chunks])
-        for chunk, matrix in zip(chunks, matrices, strict=True):
-            chunk.multi = matrix
+        await self._colbert_indexer.index(chunks)
         report.timings_ms["embed_colbert"] = report.timings_ms.get(
             "embed_colbert", 0.0
         ) + _elapsed_ms(started)

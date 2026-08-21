@@ -149,6 +149,14 @@ class EmbeddingSettings(BaseModel):
     """ColBERT multivectors are ~100x the storage of a single dense vector.
     Worth it as a *reranking* stage on the top ~200 candidates (see
     ``RetrievalSettings.colbert_rerank``), rarely worth it as a first-stage index."""
+    late_interaction_max_tokens: int = 192
+    """Token vectors kept per chunk, longest-norm first (``prune_tokens``).
+
+    The dial that decides what ColBERT costs, since storage is linear in it: at
+    128 dimensions and float32 this is 96 KB per chunk. Lowering it trades recall
+    on long chunks for storage, and only tokens a query could have matched are
+    lost. It was reachable only by constructing :class:`~ragorc.index.colbert.ColBERTIndexer`
+    by hand until the ingest path started using it."""
 
     reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     """ONNX cross-encoder. No torch required."""

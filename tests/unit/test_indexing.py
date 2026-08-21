@@ -991,3 +991,130 @@ async def test_the_collection_is_declared_from_the_real_embedders_not_a_guess(
         late_embedder=seen["late"],
     )
     assert sized._colbert_dim() == 96, "what the pipeline must hand it"
+
+
+# ---------------------------------------------------------------------------
+# The ingest path must use the ColBERT indexer, not re-implement it
+# ---------------------------------------------------------------------------
+async def test_ingest_colbert_vectors_are_pruned_and_carry_the_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_add_colbert` re-implemented `ColBERTIndexer.index` in five lines.
+
+    What the re-implementation dropped: token pruning, so
+    `late_interaction_max_tokens` bounded nothing and a field already ~100x a
+    dense vector grew without limit; batching, so one request carried a whole
+    window; the dimension check, which turns a server-side rejection of the entire
+    upsert into a message naming both widths; and `embed_text`, so ColBERT alone
+    among the three vectors indexed the chunk without its contextual prefix.
+    """
+    import numpy as np
+
+    from ragorc.core.models import ChunkingStrategy, Document
+    from ragorc.index.pipeline import IngestPipeline, IngestReport
+    from tests.fakes import FakeVectorStore, StubEmbedder
+
+    cap = 6
+
+    class _RecordingLate:
+        """One token row per whitespace-separated word, so length is predictable."""
+
+        dimension = 8
+        model_name = "stub/colbert"
+
+        def __init__(self, **_: Any) -> None:
+            self.seen: list[str] = []
+
+        async def embed_documents(self, texts: Any) -> list[Any]:
+            self.seen.extend(texts)
+            return [
+                np.ones((max(1, len(t.split())), self.dimension), dtype=np.float32) for t in texts
+            ]
+
+    late = _RecordingLate()
+    pipeline = IngestPipeline(
+        dense_embedder=StubEmbedder(dimension=32),
+        late_embedder=late,
+        vector_store=FakeVectorStore(),
+        settings=Settings(
+            security={"enforce_tenant_isolation": False},
+            cache={"enabled": False},
+            embedding={
+                "dense_dimension": 32,
+                "enable_late_interaction": True,
+                "late_interaction_max_tokens": cap,
+            },
+            indexing={"splitter": "recursive", "skip_unchanged": False},
+            retrieval={"use_sparse": False},
+        ),
+    )
+
+    document = Document(id="d1", content="Refunds are processed within five days. " * 40)
+    chunks = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport())
+
+    assert chunks, "the fixture must produce chunks to have anything to assert on"
+    assert all(c.multi is not None for c in chunks), "late interaction is on"
+    widths = {int(c.multi.shape[0]) for c in chunks if c.multi is not None}
+    assert widths and max(widths) <= cap, (
+        f"every matrix must be pruned to late_interaction_max_tokens={cap}, saw {sorted(widths)}"
+    )
+
+    # And the prefix reaches it. Set one by hand: the enricher is an LLM call, and
+    # the property under test is which attribute the indexer reads.
+    marker = "SITUATED IN THE REFUNDS POLICY"
+    chunk = chunks[0]
+    chunk.multi = None
+    chunk.contextual_prefix = marker
+    late.seen.clear()
+    await pipeline._add_colbert([chunk], IngestReport())
+
+    assert late.seen, "the indexer must have re-embedded the chunk it had no matrix for"
+    assert any(marker in text for text in late.seen), (
+        "ColBERT must index embed_text like dense and sparse do, not bare content"
+    )
+
+
+async def test_a_chunk_that_already_has_a_matrix_is_not_re_embedded() -> None:
+    """The resume property `skip_unchanged` gives the document level, at the chunk
+    level: a re-run of an interrupted ingest must not re-pay for the matrices it
+    already has. The inline version re-embedded every chunk unconditionally."""
+    import numpy as np
+
+    from ragorc.core.models import Chunk
+    from ragorc.index.pipeline import IngestPipeline, IngestReport
+    from tests.fakes import StubEmbedder
+
+    class _Counting:
+        dimension = 8
+        model_name = "stub/colbert"
+
+        def __init__(self) -> None:
+            self.batches = 0
+
+        async def embed_documents(self, texts: Any) -> list[Any]:
+            self.batches += 1
+            return [np.ones((2, self.dimension), dtype=np.float32) for _ in texts]
+
+    late = _Counting()
+    pipeline = IngestPipeline(
+        dense_embedder=StubEmbedder(dimension=32),
+        late_embedder=late,
+        settings=Settings(
+            security={"enforce_tenant_isolation": False},
+            cache={"enabled": False},
+            embedding={"dense_dimension": 32, "enable_late_interaction": True},
+            retrieval={"use_sparse": False},
+        ),
+    )
+    done = Chunk(id="c1", content="already indexed", document_id="d1")
+    done.multi = np.ones((2, 8), dtype=np.float32)
+    todo = Chunk(id="c2", content="not yet indexed", document_id="d1")
+
+    await pipeline._add_colbert([done, todo], IngestReport())
+
+    assert late.batches == 1, "one batch for the one chunk that needed it"
+    assert todo.multi is not None
+
+    late.batches = 0
+    await pipeline._add_colbert([done, todo], IngestReport())
+    assert late.batches == 0, "nothing left to do must cost nothing"

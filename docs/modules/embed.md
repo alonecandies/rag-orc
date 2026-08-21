@@ -97,7 +97,7 @@ ingest pipeline and the retriever: two instances mean two loaded ONNX sessions.
 `embedding.dense_model` · `dense_dimension` | dimension is auto-detected when unset |
 `embedding.query_prefix` · `document_prefix` | required by asymmetric models |
 `embedding.sparse_model` · `use_splade` · `splade_model` | BM25-as-sparse by default |
-`embedding.late_interaction_model` · `enable_late_interaction` | ColBERT is ~100x the storage; worth it as a rerank stage, rarely as an index |
+`embedding.late_interaction_model` · `enable_late_interaction` · `late_interaction_max_tokens` | ColBERT is ~100x the storage; `max_tokens` is what that is proportional to, and the collection is sized from the model, so changing the model needs a new collection |
 `embedding.reranker_model` | ONNX cross-encoder, no torch |
 `embedding.batch_size` · `max_length` · `threads` | tuned for ONNX on CPU; raise batch size on GPU |
 `embedding.normalize` | L2 so cosine reduces to a dot product |
