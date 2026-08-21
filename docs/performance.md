@@ -3,6 +3,21 @@
 Every library choice and default in `ragorc` is a performance decision. This is
 the reasoning, and the dials worth turning.
 
+## Why streams have their own concurrency pool
+
+`max_concurrency` bounds in-flight LLM requests. A streaming call cannot draw on
+that pool, because an async generator holds its permit across every `yield` — the
+permit is released when the *consumer* finishes reading, not when the provider
+finishes sending. One shared pool therefore lets `max_concurrency` slow SSE
+readers park every permit and stop all other LLM work in the process: grading,
+routing, synthesis, ingest. Nothing is overloaded and nothing errors; it just
+stops.
+
+`max_concurrent_streams` (default 4) is a separate ceiling, so streams contend
+only with each other. The bound still exists — an unbounded stream pool is the
+denial of service the ceiling was for — but exhausting it now degrades streaming
+alone.
+
 ## The rules that produced these choices
 
 1. **Rust/C cores over pure Python** where the work is mechanical.

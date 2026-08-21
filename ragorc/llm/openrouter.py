@@ -93,6 +93,10 @@ class OpenRouterLLM:
         self.settings = settings or get_settings().llm
         self.cache = cache
         self._semaphore = asyncio.Semaphore(self.settings.max_concurrency)
+        # Streams get their own pool. See LLMSettings.max_concurrent_streams: a
+        # generator holds its permit until the consumer stops reading, so sharing
+        # one pool lets slow SSE clients block the entire pipeline.
+        self._stream_semaphore = asyncio.Semaphore(max(1, self.settings.max_concurrent_streams))
         self._limiter = RateLimiter(
             requests_per_minute=self.settings.requests_per_minute,
             tokens_per_minute=self.settings.tokens_per_minute,
@@ -564,7 +568,11 @@ class OpenRouterLLM:
             extra=kwargs,
         )
         await self._limiter.acquire()
-        async with self._semaphore:
+        # `_stream_semaphore`, not `_semaphore`: this block stays entered across
+        # every `yield` below, for as long as the caller takes to consume the
+        # generator. Held on the shared pool, `max_concurrency` slow readers were
+        # enough to stop all other LLM work in the process.
+        async with self._stream_semaphore:
             loop = asyncio.get_running_loop()
             started = loop.time()
             try:

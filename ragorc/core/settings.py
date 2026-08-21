@@ -74,6 +74,16 @@ class LLMSettings(BaseModel):
     max_concurrency: int = 16
     """Global cap on in-flight LLM requests. Bounds both provider rate-limit
     pressure and our own memory when a map stage fans out over 10k chunks."""
+    max_concurrent_streams: int = 4
+    """Separate cap for SSE streams, because a stream's duration is set by the
+    *client* reading it, not by the provider.
+
+    An async generator holds its permit across every ``yield``, so a permit taken
+    from ``max_concurrency`` stays taken until the consumer finishes reading. With
+    one shared pool, that many slow readers stall every non-streaming call in the
+    process — grading, routing, synthesis, ingest. A separate pool keeps a slow
+    client from starving work it has nothing to do with; streams then contend only
+    with each other."""
     max_retries: int = 4
     retry_base_delay_s: float = 0.5
     retry_max_delay_s: float = 20.0
