@@ -35,6 +35,7 @@ KeyedRateLimiter.from_settings(settings=None)
 AuditLog(settings=None)                                # .query / .blocked / .generated_query / .answered
 require_tenant(tenant_id, settings=None) -> str | None
 scope_filter(...) / scope_sql_where(...) / scope_cypher_where(...)
+require_generated_query_isolation(target, settings) -> None   # raises unless declared
 ```
 
 ## Why the SQL guard walks an AST

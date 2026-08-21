@@ -1293,9 +1293,10 @@ class PipelineNodes:
     async def multihop_retrieve(self, state: RAGState) -> dict[str, Any]:
         """Delegate the whole multi-hop decision to :class:`MultiHopRetriever`.
 
-        Used by the agentic graph, where multi-hop is one tool among several and its
-        internal branch (path search versus iteration) is not something the outer
-        graph needs to see. The dedicated
+        Available for a graph that wants multi-hop as one tool among several, where
+        its internal branch (path search versus iteration) is not something the
+        outer graph needs to see. No shipped graph wires it — the agentic graph
+        uses :meth:`hop`, and this docstring used to claim otherwise. The dedicated
         :mod:`ragorc.pipeline.graphs.multihop` graph unrolls the same loop into nodes
         instead, because there the loop *is* the subject.
         """

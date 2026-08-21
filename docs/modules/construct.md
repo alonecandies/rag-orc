@@ -60,8 +60,14 @@ untouched rather than asking the model to invent fields.
 
 ```python
 from ragorc.construct import AttributeInfo, SelfQueryConstructor, TextToSQLConstructor
+from ragorc.core.settings import Settings
 
-sql = TextToSQLConstructor(llm, postgres)
+# Refused by default. A generated query is only bounded by the guard, which says
+# nothing about *whose* rows it reads, so it will not run until the deployment
+# declares how tenants are isolated. See docs/security.md.
+settings = Settings(security={"generated_query_isolation": "rls"})
+
+sql = TextToSQLConstructor(llm, postgres, settings=settings)
 rows, validation, usage = await sql.construct_and_execute(Query(text="ARR by segment"))
 print(validation.sql, validation.tables, validation.has_limit)
 

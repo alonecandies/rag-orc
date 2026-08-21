@@ -48,6 +48,7 @@ on GitHub, which renders `.mmd` inline.
 3. [ADR-0002](adr/0002-late-chunking.md) and [ADR-0003](adr/0003-server-side-fusion.md) — the two decisions that most affect retrieval quality.
 4. `tests/unit/test_security_guards.py` — the attack corpus explains the security model faster than prose does.
 5. `docs/internal/CONTRACTS.md` — the rules every module follows.
+[Open items](internal/OPEN-ITEMS.md) — known gaps, each verified against the code
 
 ## What is deliberately not claimed
 

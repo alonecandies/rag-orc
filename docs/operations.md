@@ -152,7 +152,8 @@ A chunk mentions "it" and is never retrieved | early chunking lost the anteceden
 `StructuredOutputError` on one model | the provider ignores `response_format` | `require_parameters=true`, or pin `provider_order` |
 Abstention rate spikes after a reindex | vectors written with a different embedding model | dimensions must match; rebuild the collection |
 `Abort trap: 6` / exit 134 at process exit, with a macOS crash report naming `Microsoft::Applications::Events` | ONNX Runtime's bundled telemetry client races static destruction while sessions are still alive | already mitigated — `ORT_DISABLE_TELEMETRY=1` plus an `atexit` session release in `ragorc/embed/_runtime.py`. The work had completed; only the exit was dirty |
-Text-to-SQL always refuses | `postgres.allowed_tables` too narrow, or the schema summary is stale | widen the allowlist; `schema_summary(refresh=True)` |
+Text-to-SQL always refuses, rule `generated_query_isolation` | tenant isolation is on and the deployment has not declared how tenants are separated — the default, and deliberately fail-closed | set `security.generated_query_isolation` to `rls` (recommended), `database` or `trusted`; see docs/security.md |
+Text-to-SQL always refuses, other rules | `postgres.allowed_tables` too narrow, or the schema summary is stale | widen the allowlist; `schema_summary(refresh=True)` |
 Graph search finds nothing | entity resolution did not run, so the graph is fragmented | `graph.resolve_entities=true`, lower `resolution_threshold` |
 p99 latency tracks the slowest store | `per_store_timeout_s` too high | lower it; a slow store should be dropped, not waited for |
 

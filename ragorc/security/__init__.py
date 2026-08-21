@@ -7,6 +7,7 @@ from ragorc.security.pii import PIIFinding, PIIRedactor, PIIResult
 from ragorc.security.ratelimit import KeyedRateLimiter
 from ragorc.security.sql_guard import SQLGuard, SQLValidation
 from ragorc.security.tenancy import (
+    require_generated_query_isolation,
     require_tenant,
     scope_cypher_where,
     scope_filter,
@@ -26,6 +27,7 @@ __all__ = [
     "PIIResult",
     "SQLGuard",
     "SQLValidation",
+    "require_generated_query_isolation",
     "require_tenant",
     "scope_cypher_where",
     "scope_filter",
