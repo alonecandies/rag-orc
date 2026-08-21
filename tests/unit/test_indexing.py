@@ -712,3 +712,58 @@ def test_stages_that_do_work_still_build_and_report_nothing() -> None:
 
     assert [plugin.label for plugin, _ in built] == ["raptor"]
     assert report.warnings == []
+
+
+async def test_a_directory_is_ingested_a_window_at_a_time(tmp_path) -> None:  # noqa: ANN001
+    """The module's memory policy claims a bound independent of corpus size.
+
+    That was true of the chunk stream and false of the document list: loading a
+    directory materialized every document's text before the first vector was
+    written, and at 100k documents the document list is the larger of the two.
+    """
+    for i in range(7):
+        (tmp_path / f"doc{i}.md").write_text(f"# Document {i}\n\nSome policy text here.\n")
+
+    pipeline = _stub_pipeline(indexing={"document_window": 2})
+    seen: list[int] = []
+    original = pipeline._validate
+
+    async def _spy(documents, report):  # noqa: ANN001, ANN202
+        seen.append(len(documents))
+        return await original(documents, report)
+
+    pipeline._validate = _spy  # type: ignore[method-assign]
+    await pipeline.ingest(tmp_path)
+
+    assert sum(seen) == 7, f"every document must still be ingested, saw {seen}"
+    assert max(seen) <= 2, f"never more than one window resident, saw {seen}"
+    assert len(seen) == 4, f"7 documents in windows of 2 is four passes, saw {seen}"
+
+
+async def test_a_small_directory_still_takes_one_pass(tmp_path) -> None:  # noqa: ANN001
+    """The default window is large enough that ordinary corpora are unaffected —
+    the streaming is for the case that needs it, not a behaviour change for
+    everyone."""
+    for i in range(3):
+        (tmp_path / f"doc{i}.md").write_text(f"# Doc {i}\n\ntext\n")
+
+    pipeline = _stub_pipeline()
+    seen: list[int] = []
+    original = pipeline._validate
+
+    async def _spy(documents, report):  # noqa: ANN001, ANN202
+        seen.append(len(documents))
+        return await original(documents, report)
+
+    pipeline._validate = _spy  # type: ignore[method-assign]
+    report = await pipeline.ingest(tmp_path)
+
+    assert seen == [3], f"one window for a small corpus, saw {seen}"
+    assert report.documents_in == 3
+
+
+async def test_an_empty_directory_still_reports_nothing_to_do(tmp_path) -> None:  # noqa: ANN001
+    """The early-return outcomes must survive the rewrite of the loop."""
+    report = await _stub_pipeline().ingest(tmp_path)
+    assert report.documents_in == 0
+    assert report.strategy == "auto", "the strategy is never resolved when there is no work"

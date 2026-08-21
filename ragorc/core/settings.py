@@ -501,6 +501,19 @@ class IndexingSettings(BaseModel):
     # --- ingest pipeline -------------------------------------------------
     batch_size: int = 128
     max_concurrent_documents: int = 8
+    document_window: int = 512
+    """How many documents to load before indexing any of them, when ingesting a
+    directory.
+
+    The chunk stream is bounded, but the *document* list was not: loading a
+    directory materialized every document's text before the first vector was
+    written, so peak memory scaled with the corpus even though the module's memory
+    policy claims a bound independent of it. At 100k documents the document list is
+    the larger number, not the chunk stream.
+
+    512 is chosen so anything smaller behaves exactly as before — one window, one
+    pass — while a large corpus is held a window at a time. Only directory ingests
+    stream; an explicit list of documents is already in the caller's memory."""
     skip_unchanged: bool = True
     """Checksum comparison before embedding. Turns a full re-ingest into a
     no-op for unchanged documents."""

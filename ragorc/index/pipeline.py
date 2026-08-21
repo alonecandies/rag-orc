@@ -21,17 +21,26 @@ lookups. It is done in **one batched query per few hundred documents**, never on
 per document: at 5 ms per round trip, a per-document probe over 100k documents is
 eight minutes of pure latency spent deciding to do nothing.
 
-Backpressure: the chunk list is never materialized
---------------------------------------------------
+Backpressure: neither the chunk list nor the document list is materialized
+-------------------------------------------------------------------------
 Documents are processed ``max_concurrent_documents`` at a time and their chunks are
 streamed to the stores in ``batch_size`` batches. Nothing accumulates.
+
+The document list used to, which made the bound below false at the scale it was
+quoted for: ingesting a directory loaded every document's text before the first
+vector was written, and at 100k documents the document list is the larger of the
+two numbers. A directory is now read ``indexing.document_window`` documents at a
+time (512, chosen so that anything smaller behaves exactly as it did — one window,
+one pass). An explicit list of documents is not windowed: it is already in the
+caller's memory, so bounding it here would bound nothing.
 
 The arithmetic is the reason. A 100k-document corpus at ~40 chunks per document is
 4M chunks; each carries its text (~2 KB) plus a dense vector (384 float32 = 1.5 KB)
 plus a sparse vector, so building the full list before the first write needs tens
 of gigabytes and then performs one all-or-nothing write at the end. Streaming
-bounds live memory to ``max_concurrent_documents`` documents' worth of chunks plus
-one pending batch — a few megabytes, independent of corpus size — and every batch
+bounds live memory to one window of documents, ``max_concurrent_documents``
+documents' worth of chunks and one pending batch — tens of megabytes, independent
+of corpus size — and every batch
 that lands is durable, so a crash costs one batch instead of the whole run.
 
 Failure policy: two rules, opposite directions
@@ -103,7 +112,7 @@ import contextlib
 import importlib
 import inspect
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -128,6 +137,7 @@ from ragorc.core.registry import resolve
 from ragorc.core.settings import IndexingSettings, Settings, get_settings
 from ragorc.core.telemetry import current_ledger, timed
 from ragorc.embed.late_chunking import LateChunkingEmbedder, resolve_strategy
+from ragorc.index.loaders import DirectoryLoader
 from ragorc.index.loaders import load as load_source
 from ragorc.index.split import build_splitter
 from ragorc.stores.postgres.ddl import chunks_table, documents_table
@@ -492,24 +502,30 @@ class IngestPipeline:
         run_started = time.perf_counter()
 
         with timed("ingest"):
-            documents = await self._collect(target, report)
-            report.documents_in = len(documents)
-            if not documents:
+            strategy: ChunkingStrategy | None = None
+            async for documents in self._document_windows(target, report):
+                report.documents_in += len(documents)
+                accepted = await self._validate(documents, report)
+                if not accepted:
+                    continue
+                # Resolved on the first window that has work, and reused: the
+                # strategy is a property of the configuration and the embedder, not
+                # of a window, and re-resolving it would re-measure the model's
+                # dimension once per window.
+                if strategy is None:
+                    strategy = await self._prepare(report)
+                    report.strategy = strategy.value
+                todo, changed = await self._select_changed(accepted, report)
+                if todo:
+                    await self._run(todo, changed, strategy, report)
+
+            if not report.documents_in:
                 log.warning("ingest_nothing_to_do", target=str(target)[:200])
                 return report
-
-            accepted = await self._validate(documents, report)
-            if not accepted:
+            if strategy is None:
                 report.total_ms = _elapsed_ms(run_started)
                 log.warning("ingest_all_rejected", **report.summary())
                 return report
-
-            strategy = await self._prepare(report)
-            report.strategy = strategy.value
-
-            todo, changed = await self._select_changed(accepted, report)
-            if todo:
-                await self._run(todo, changed, strategy, report)
 
         report.total_ms = _elapsed_ms(run_started)
         log.info("ingest_complete", **report.summary())
@@ -532,7 +548,43 @@ class IngestPipeline:
     # ------------------------------------------------------------------
     # a. collect + validate
     # ------------------------------------------------------------------
+    async def _document_windows(
+        self, target: Any, report: IngestReport
+    ) -> AsyncIterator[list[Document]]:
+        """Yield the documents to ingest, a window at a time.
+
+        Only a directory streams. Everything else — a single file, a Document, an
+        iterable of them — is already in the caller's memory, so windowing it would
+        bound nothing and only complicate the report.
+
+        The module's memory policy claims a bound independent of corpus size. That
+        was true of the chunk stream and false of the document list: loading a
+        directory materialized every document's text before the first vector was
+        written, and at 100k documents the document list is the larger of the two
+        numbers. `indexing.document_window` is what makes the claim true.
+        """
+        started = time.perf_counter()
+        window = max(1, self.config.document_window)
+        root = target if isinstance(target, Path) else None
+        if isinstance(target, str):
+            root = Path(target)
+        if root is not None and root.is_dir():
+            loader = DirectoryLoader(tenant_id=self.settings.tenant_id, settings=self.settings)
+            async for batch in loader.iter_documents(root, window=window):
+                report.timings_ms["load"] = report.timings_ms.get("load", 0.0) + _elapsed_ms(
+                    started
+                )
+                started = time.perf_counter()
+                if batch:
+                    yield batch
+            return
+        documents = await self._resolve_target(target)
+        report.timings_ms["load"] = _elapsed_ms(started)
+        if documents:
+            yield documents
+
     async def _collect(self, target: Any, report: IngestReport) -> list[Document]:
+        """Load everything at once. Retained for callers that want one list."""
         started = time.perf_counter()
         documents = await self._resolve_target(target)
         report.timings_ms["load"] = _elapsed_ms(started)

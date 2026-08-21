@@ -60,7 +60,7 @@ import contextlib
 import csv
 import fnmatch
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -1232,6 +1232,38 @@ class DirectoryLoader(BaseLoader):
             failed=len(self.failures),
         )
         return docs
+
+    async def iter_documents(self, root: Path, *, window: int) -> AsyncIterator[list[Document]]:
+        """Yield loaded documents in windows of ``window`` files.
+
+        Discovery is cheap — it is a walk producing paths, not content — so the
+        expensive part can be bounded. :meth:`load` materializes every document
+        first, which for a large corpus means the whole corpus's *text* is resident
+        before the first vector is written; the chunk stream is bounded but the
+        document list is not, and at 100k documents the document list is the larger
+        number. Windowing lets the caller hold one window at a time.
+        """
+        root = _as_path(root) or root
+        if not root.is_dir():
+            raise ValidationFailed("DirectoryLoader source is not a directory", source=str(root))
+        self.failures = []
+        self.skipped = 0
+        paths = await asyncio.to_thread(self._discover, root)
+        step = max(1, window)
+        for start in range(0, len(paths), step):
+            batches = await bounded_gather(
+                (self._load_one(path, root) for path in paths[start : start + step]),
+                limit=self.concurrency,
+            )
+            yield [doc for batch in batches for doc in batch]
+        log.info(
+            "directory_streamed",
+            root=str(root),
+            files=len(paths),
+            window=step,
+            skipped=self.skipped,
+            failed=len(self.failures),
+        )
 
     # -- discovery --------------------------------------------------------
     def _discover(self, root: Path) -> list[Path]:
