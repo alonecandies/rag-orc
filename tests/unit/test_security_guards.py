@@ -120,6 +120,26 @@ def test_sql_guard_rejects_an_empty_projection(sql_guard: SQLGuard) -> None:
         assert exc.value.rule == "empty_projection", sql
 
 
+def test_sql_guard_rejects_a_set_operation_whose_operand_is_not_a_query(
+    sql_guard: SQLGuard,
+) -> None:
+    """`1 UNION SELECT 1` parses as Union(Literal, Select) — a read node holding
+    a non-query — so the statement-type allowlist waved it through and the guard
+    emitted SQL Postgres rejects as a syntax error. The output round-trip misses
+    it because sqlglot re-parses its own rendering; sqlglot is the more permissive
+    of the two parsers, which is why shape checks cannot be replaced by one."""
+    with pytest.raises(GuardrailViolation) as exc:
+        sql_guard.validate("1 UNION SELECT 1")
+    assert exc.value.rule == "set_operand"
+
+    # Legitimate set operations must keep working, including a parenthesised leg.
+    for sql in (
+        "SELECT id FROM orders UNION SELECT 1",
+        "(SELECT id FROM orders) UNION ALL SELECT 1",
+    ):
+        assert sql_guard.validate(sql).sql
+
+
 def test_sql_guard_output_is_always_re_parseable(sql_guard: SQLGuard) -> None:
     """The guard's promise covers what it returns, not only what it was given."""
     for sql in (

@@ -207,6 +207,7 @@ class SQLGuard:
         # carries `.args`). Everything downstream is checked against that.
         tree = self._check_statement_type(statements[0])
         self._check_projection(tree)
+        self._check_set_operands(tree)
         self._check_forbidden_nodes(tree)
         self._check_functions(tree)
         tables = self._check_tables(tree)
@@ -291,6 +292,33 @@ class SQLGuard:
                     rule="unicode_control",
                     codepoint=hex(ord(ch)),
                 )
+
+    @staticmethod
+    def _check_set_operands(tree: exp.Expression) -> None:
+        """Both sides of a UNION/INTERSECT/EXCEPT must themselves be reads.
+
+        sqlglot parses ``1 UNION SELECT 1`` as ``Union(Literal, Select)`` and the
+        statement-type allowlist sees a ``Union``, which is a read node, so the
+        guard used to emit ``1 UNION SELECT 1 LIMIT 100``. Postgres rejects that
+        as a syntax error — a set operation's operands must be SELECT or VALUES —
+        so, as with an empty projection, the guard was handing the driver text it
+        cannot run.
+
+        The output round-trip does not catch this one: sqlglot re-parses its own
+        rendering happily, being the more permissive of the two parsers. That is
+        the general lesson — a round-trip proves the rewrite is self-consistent,
+        not that the target accepts it — so shape checks like this one still have
+        to be written explicitly. Found by the property tests.
+        """
+        operands = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery, exp.Values)
+        for node in tree.find_all(exp.Union, exp.Intersect, exp.Except):
+            for side in (node.this, node.expression):
+                if side is not None and not isinstance(side, operands):
+                    raise GuardrailViolation(
+                        f"{type(node).__name__.upper()} operand is "
+                        f"{type(side).__name__}, not a query",
+                        rule="set_operand",
+                    )
 
     @staticmethod
     def _check_projection(tree: exp.Expression) -> None:

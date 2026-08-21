@@ -56,9 +56,12 @@ it rewrites (clamping or injecting `LIMIT`), and a rewrite is a new statement. I
 re-parses its own output and refuses if that fails, because `SELECT` with an empty
 projection becomes `SELECT LIMIT 100`, which no database accepts. Without the
 check that reaches the driver as a syntax error, arriving past the point where the
-self-correction loop can retry it. The property tests
-(`tests/unit/test_guard_properties.py`) assert the same invariant on generated
-input: everything the guard hands back re-parses to a read, at every depth.
+self-correction loop can retry it. A round-trip proves the rewrite is self-consistent, not that Postgres accepts
+it — sqlglot is the more permissive parser, and it happily re-reads its own
+rendering of `1 UNION SELECT 1`, which Postgres rejects. So shape checks are
+still written explicitly: an empty projection and a set operation whose operand
+is not a query are both refused by rule rather than caught by the round-trip.
+The property tests (`tests/unit/test_guard_properties.py`) found both.
 
 ## Why redaction filters values, not just keys
 
