@@ -743,3 +743,111 @@ def test_logging_follows_stderr_when_it_is_replaced() -> None:
     assert bound_second._file is second, (  # type: ignore[attr-defined]
         "the factory froze the stream: a later swap leaves logging on a dead handle"
     )
+
+
+# ---------------------------------------------------------------------------
+# A fan-out that fails must not leave siblings running
+# ---------------------------------------------------------------------------
+async def test_bounded_gather_cancels_its_siblings_when_one_fails() -> None:
+    """Plain `gather(return_exceptions=False)` re-raises the first exception and
+    leaves the other tasks running, unawaited and unowned.
+
+    The ingest's two chunk writes go to Qdrant and Postgres, and the Postgres rows
+    are the marker that says a document is ingested. A Qdrant failure that let the
+    Postgres write commit anyway left chunk rows with no vectors, which the next
+    run skips as already done — the corpus is missing and the ingest says it is
+    fine. Cancelling rolls that transaction back instead.
+    """
+    import asyncio
+
+    from ragorc.core.concurrency import bounded_gather
+
+    committed: list[str] = []
+
+    async def slow_write() -> str:
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            raise
+        committed.append("postgres")
+        return "postgres"
+
+    async def fast_failure() -> str:
+        await asyncio.sleep(0)
+        raise RuntimeError("qdrant is down")
+
+    with pytest.raises(RuntimeError, match="qdrant is down"):
+        await bounded_gather([slow_write(), fast_failure()], limit=2)
+
+    # The failure must be the *original* exception, not an ExceptionGroup: every
+    # caller here handles store errors by type.
+    assert committed == [], "the sibling write must be cancelled, not left to commit"
+    # And it must be finished, not merely cancelled: returning while a task is
+    # still unwinding is the same detached-work problem one step later.
+    assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+
+async def test_bounded_gather_under_a_limit_also_cancels_siblings() -> None:
+    """The semaphore path is a different branch and had the same hole."""
+    import asyncio
+
+    from ragorc.core.concurrency import bounded_gather
+
+    finished: list[int] = []
+
+    async def work(i: int) -> int:
+        if i == 0:
+            await asyncio.sleep(0)
+            raise RuntimeError("first one fails")
+        await asyncio.sleep(0.2)
+        finished.append(i)
+        return i
+
+    with pytest.raises(RuntimeError, match="first one fails"):
+        await bounded_gather([work(i) for i in range(6)], limit=2)
+
+    assert finished == [], f"no sibling may run to completion after a failure: {finished}"
+
+
+async def test_a_cancelled_fan_out_leaves_no_unawaited_coroutine(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """A coroutine still queued behind the semaphore when the fan-out is cancelled
+    was never awaited, and Python warns about that when it is collected — in some
+    later test, with nothing pointing back here."""
+    import asyncio
+    import gc
+
+    from ragorc.core.concurrency import bounded_gather
+
+    async def work(i: int) -> int:
+        if i == 0:
+            await asyncio.sleep(0)
+            raise RuntimeError("first one fails")
+        await asyncio.sleep(0.2)
+        return i
+
+    with pytest.raises(RuntimeError):
+        await bounded_gather([work(i) for i in range(8)], limit=2)
+    gc.collect()
+
+    never_awaited = [w for w in recwarn if "never awaited" in str(w.message)]
+    assert not never_awaited, [str(w.message) for w in never_awaited]
+
+
+async def test_bounded_gather_still_collects_exceptions_when_asked() -> None:
+    """`return_exceptions=True` callers depend on every result arriving, including
+    the failures — the cancellation must not apply to them."""
+    from ragorc.core.concurrency import bounded_gather
+
+    async def ok() -> str:
+        return "ok"
+
+    async def bad() -> str:
+        raise ValueError("boom")
+
+    results = await bounded_gather([ok(), bad(), ok()], limit=2, return_exceptions=True)
+
+    assert results[0] == "ok"
+    assert isinstance(results[1], ValueError)
+    assert results[2] == "ok"

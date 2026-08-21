@@ -116,26 +116,60 @@ async def bounded_gather(
 
     Coroutines are wrapped so the semaphore is acquired *inside* the task —
     acquiring before scheduling would serialize creation and defeat the point.
+
+    **A failure cancels its siblings and waits for them.** Plain ``gather`` with
+    ``return_exceptions=False`` re-raises the first exception and leaves the other
+    tasks running, unawaited and unowned: the caller has already unwound while
+    work it no longer knows about carries on. Where the siblings are writes to
+    different stores that is not merely untidy, it is the wrong outcome — the
+    ingest's two chunk writes go to Qdrant and Postgres, and the Postgres rows are
+    the marker that says a document is ingested. A Qdrant failure that let the
+    Postgres write commit anyway produced chunk rows with no vectors, which the
+    next run then *skips* as already done: the corpus is missing, the ingest says
+    it is fine, and no query can trace the gap back to here. Cancelling instead
+    rolls that transaction back.
+
+    The first exception is re-raised unchanged. ``TaskGroup`` would give the same
+    cancellation and wrap it in an ``ExceptionGroup``, which every caller here
+    would have to unwrap to find the store error it already handles by type.
     """
     coros = list(coros)
     if not coros:
         return []
-    if limit <= 0 or limit >= len(coros):
+
+    sem = asyncio.Semaphore(limit) if 0 < limit < len(coros) else None
+
+    async def _run(coro: Coroutine[Any, Any, T]) -> T:
+        if sem is None:
+            return await coro
+        try:
+            await sem.acquire()
+        except BaseException:
+            # Cancelled while still queued behind the semaphore, so the wrapped
+            # coroutine never started. Closing it is what keeps the cancellation
+            # quiet: a coroutine that is never awaited warns when it is collected,
+            # at a point in some later test with no connection to this one.
+            coro.close()
+            raise
+        try:
+            return await coro
+        finally:
+            sem.release()
+
+    tasks = [asyncio.ensure_future(_run(c)) for c in coros]
+    try:
         # `gather` is typed by a fixed set of positional overloads, up to five
         # awaitables; a list splat falls off the end of them and degrades to
         # `list[Any]`. The element type is `T` by construction — the ignore stands
         # in for an overload typeshed cannot write, not for an unchecked cast.
-        return await asyncio.gather(*coros, return_exceptions=return_exceptions)  # type: ignore[return-value]
-
-    sem = asyncio.Semaphore(limit)
-
-    async def _run(coro: Coroutine[Any, Any, T]) -> T:
-        async with sem:
-            return await coro
-
-    return await asyncio.gather(  # type: ignore[return-value]  # see above
-        *(_run(c) for c in coros), return_exceptions=return_exceptions
-    )
+        return await asyncio.gather(*tasks, return_exceptions=return_exceptions)  # type: ignore[return-value]
+    except BaseException:
+        # Includes the cancellation of *this* coroutine: a caller giving up must
+        # not leave the fan-out running either.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def safe_gather(
