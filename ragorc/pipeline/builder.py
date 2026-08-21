@@ -78,7 +78,6 @@ import structlog
 
 from ragorc.cache.semantic import scope_key
 from ragorc.cache.tiered import build_cache
-from ragorc.core.concurrency import install_uvloop
 from ragorc.core.errors import ConfigError, StoreUnavailable
 from ragorc.core.models import (
     Answer,
@@ -363,9 +362,14 @@ class RAGPipeline:
         resolved = _resolve_settings(settings, overrides)
         obs = resolved.observability
         configure_logging(obs.log_level, obs.log_json, resolved.security.redact_secrets_in_logs)
-        # uvloop is 2-4x the stdlib loop's throughput for this workload and costs one
-        # call. It is a no-op when a loop policy is already installed or on Windows.
-        install_uvloop()
+        # uvloop is deliberately *not* installed here. This is an `async def`, so a
+        # loop is already running, and a policy cannot replace a running loop:
+        # `install_uvloop` detects exactly that, returns False and warns
+        # `uvloop_not_in_use` — so the call could never do anything but tell the
+        # operator it had not worked. It belongs at the process entry point, before
+        # the loop starts, which is where the CLI and the server already call it
+        # (`ragorc/cli.py`, `ragorc/server/app.py`); an embedding application does
+        # the same in its own `main`, as `install_uvloop`'s docstring shows.
         pipeline = cls(resolved, **components)
         if components:
             log.info("pipeline_components_injected", names=sorted(components))
