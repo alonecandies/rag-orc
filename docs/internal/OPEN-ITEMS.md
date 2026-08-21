@@ -39,30 +39,22 @@ time.
 Unlike ingest it does hold the corpus in memory, because extraction is per chunk
 but resolution, detection and the write are global. `--limit` bounds a trial run.
 
-## 3. Seven tests survive their own mutation
+## 3. Closed: the doubles now model the stores
 
-Found by an adversarial pass over the coverage suites added in `b3c1690`. All are
-cases where a test double is more accommodating than the real store, so the
-assertion cannot fail:
+Seven tests survived their own mutation. Four are fixed and two were misdiagnosed:
 
-* `test_graph_retrieval.py` — `with_vectors=True` can be dropped from the chunk
-  read and all tests stay green, because the fake ignores the keyword. Against a
-  real Qdrant that silently deletes the 0.35 similarity term.
-* `test_graph_retrieval.py` — DRIFT `_merge` can keep the seed-side object instead
-  of the graph-annotated one; the tests assert ids and scores but never the merged
-  body, so the discarded verbalized-relationship prefix goes unnoticed.
-* `test_graph_retrieval.py` — `_propagate`'s own hop bound can be raised (`hops+1`,
-  or 99) because the fake store already returns a hop-bounded subgraph. Only the
-  store call site is pinned.
-* `test_multihop.py` — `test_a_passage_claiming_sufficiency_cannot_end_the_loop`
-  passes with prompt isolation removed: the scripted LLM's verdict is fixed, so an
-  injected passage has no causal channel to the decision. The safety claim in its
-  docstring is untestable with that double.
-* `test_multihop.py` — `test_each_hop_searches_for_what_the_previous_hop_found_missing`
-  has no unique kill; its assertion is a subset of two other tests.
-
-The fakes need to model the behaviour the assertion depends on: honour
-`with_vectors`, and let a scripted LLM's verdict depend on its prompt.
+* `FakeVectorStore.get` accepted `with_vectors` and ignored it, so production that
+  stopped asking for vectors got them anyway. It returns vectorless chunks now, and
+  dropping `with_vectors=True` from the graph chunk read kills two tests.
+* The multi-hop injection test ran on a `ScriptedLLM`, whose verdict ignores the
+  prompt, so it passed with the isolation removed. It now uses a model that would
+  comply if the instruction reached it in the clear and respects
+  `<untrusted_document>` delimiters otherwise. Removing `isolate=True` turns it red.
+* Chasing the DRIFT merge finding turned up the cause: `GraphLocalRetriever._annotate`
+  mutated the chunk it was handed, so both merge halves held one object. It copies now.
+* Misdiagnosed: over-propagation in `_propagate` cannot reach anything the store's
+  hop bound did not return, so that mutation surviving is correct behaviour. And one
+  multi-hop test is merely redundant with two others, which is not a defect.
 
 ## 4. One undertested behaviour in multi-hop
 
