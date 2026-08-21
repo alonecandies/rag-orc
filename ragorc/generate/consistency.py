@@ -77,9 +77,13 @@ class SelfConsistencyChecker:
         self, prompt: str, *, system: str | None = None, model: str | None = None
     ) -> ConsistencyResult:
         n = max(self.settings.generation.self_consistency_samples, 1)
+        # `max_answer_tokens` on every sample. This is the one answer path that
+        # multiplies — N samples per question — so running it at the global
+        # `llm.max_tokens` made the most expensive path the only uncapped one.
+        max_tokens = self.settings.generation.max_answer_tokens
         if n == 1:
             text, usage = await self.llm.complete(
-                prompt, system=system, model=model, stage="answer"
+                prompt, system=system, model=model, max_tokens=max_tokens, stage="answer"
             )
             return ConsistencyResult(answer=text, samples=[text], usage=usage)
 
@@ -92,6 +96,7 @@ class SelfConsistencyChecker:
                     system=system,
                     model=model,
                     temperature=self.temperature,
+                    max_tokens=max_tokens,
                     stage="answer_sample",
                 )
                 for _ in range(n)

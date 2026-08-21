@@ -471,3 +471,50 @@ async def test_rrr_degrades_when_the_rewriter_fails(gen_settings: Settings) -> N
     result = await RRR(Failing(), gen_settings).run(Query(text="original question"), retrieve)
     assert result.query.text == "original question", "must fall back to the original query"
     assert result.succeeded
+
+
+# ---------------------------------------------------------------------------
+# Every answer path honours the answer-length budget
+# ---------------------------------------------------------------------------
+async def test_every_answer_path_applies_max_answer_tokens(gen_settings: Settings) -> None:
+    """Only the plain-text path passed `generation.max_answer_tokens`.
+
+    The JSON-citation path and self-consistency ran at the global
+    `llm.max_tokens`, and self-consistency is the path that *multiplies* — N
+    samples per question — so the most expensive one was the uncapped one. It also
+    breaks a coupling the settings maintain: `Settings.model_post_init` sizes
+    `reserved_output_tokens` from `max_answer_tokens`, so the packer builds a
+    prompt against a budget the generation then ignores.
+    """
+    cap = 321
+    settings = gen_settings.model_copy(deep=True)
+    settings.generation.max_answer_tokens = cap
+    settings.llm.max_tokens = 8192
+    evidence = RetrievalResult(chunks=[chunk("c1", POLICY)])
+
+    async def caps_for(**generation: object) -> list[object]:
+        scoped = settings.model_copy(deep=True)
+        for key, value in generation.items():
+            setattr(scoped.generation, key, value)
+        llm = StubLLM(
+            text="Refunds are processed within 14 days [1].",
+            responses={"GroundednessGrade": GroundednessGrade(grounded=True, score=0.95)},
+        )
+        await AnswerGenerator(llm, scoped).generate(Query(text="how long?"), evidence)
+        return [
+            call.get("max_tokens")
+            for call in llm.calls
+            if call.get("stage") in {"answer", "answer_sample"}
+        ]
+
+    plain = await caps_for(citation_style="inline")
+    json_cited = await caps_for(citation_style="json")
+    consistent = await caps_for(self_consistency_samples=3)
+
+    assert plain and all(c == cap for c in plain), plain
+    assert json_cited and all(c == cap for c in json_cited), (
+        f"the JSON-citation path must carry the cap too, saw {json_cited}"
+    )
+    assert consistent and all(c == cap for c in consistent), (
+        f"every self-consistency sample must carry the cap, saw {consistent}"
+    )

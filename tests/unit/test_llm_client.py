@@ -89,3 +89,47 @@ async def test_a_finished_stream_returns_its_permit() -> None:
             assert "".join([delta async for delta in llm.stream("go")]) == "abcdef"
     finally:
         await llm.aclose()
+
+
+async def test_a_structured_repair_keeps_the_caller_s_token_cap() -> None:
+    """`max_tokens` was read with `kwargs.pop` *inside* the retry loop.
+
+    So the first attempt got the caller's cap and every repair after it got
+    `None`, falling back to the global `llm.max_tokens` — the repair, which is the
+    attempt most likely to run long, was the only attempt running uncapped. It
+    also makes the cap unenforceable: a caller who sets it to keep a structured
+    extraction small cannot rely on it surviving one malformed response.
+    """
+    from pydantic import BaseModel
+
+    class Verdict(BaseModel):
+        ok: bool
+
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        # First response is unparseable, forcing exactly one repair round trip.
+        content = "not json at all" if len(bodies) == 1 else json.dumps({"ok": True})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content}}],
+                "model": "test/model",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    settings = LLMSettings(api_key="sk-test", max_tokens=4096)
+    llm = OpenRouterLLM(settings=settings)
+    llm._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://provider.invalid"
+    )
+
+    result, _usage = await llm.structured("give a verdict", Verdict, max_tokens=64)
+
+    assert result.ok is True
+    assert len(bodies) >= 2, "the test needs a repair round trip to say anything"
+    caps = [b.get("max_tokens") for b in bodies]
+    assert caps == [64] * len(bodies), f"every attempt must carry the caller's cap, saw {caps}"

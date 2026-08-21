@@ -477,6 +477,11 @@ class OpenRouterLLM:
         total = Usage(model=model)
         raw = ""
         last_error = ""
+        # Popped once, outside the loop. Inside it, `kwargs.pop` consumed the
+        # caller's cap on the first attempt and every repair after it silently
+        # fell back to the global `llm.max_tokens` — the repair, which is the
+        # attempt most likely to run long, was the one attempt running uncapped.
+        structured_max_tokens = kwargs.pop("max_tokens", None)
         for attempt in range(max_repairs + 2):
             body = self._body(
                 self._messages(
@@ -486,7 +491,7 @@ class OpenRouterLLM:
                 ),
                 model=model,
                 temperature=temperature if temperature is not None else 0.0,
-                max_tokens=kwargs.pop("max_tokens", None),
+                max_tokens=structured_max_tokens,
                 stop=None,
                 stream=False,
                 response_format=response_format,

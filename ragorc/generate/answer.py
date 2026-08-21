@@ -153,6 +153,12 @@ class AnswerGenerator:
                 AnswerWithCitations,
                 system=get_prompt("answer_with_citations").system,
                 model=model,
+                # The same cap the plain path applies. Without it this path ran at
+                # the global `llm.max_tokens`, and the context packer had already
+                # reserved output room from `max_answer_tokens`
+                # (`Settings.model_post_init`) — so the budget the prompt was built
+                # against and the budget the answer was generated under disagreed.
+                max_tokens=gen.max_answer_tokens,
                 stage="answer",
             )
             usages.append(usage)
