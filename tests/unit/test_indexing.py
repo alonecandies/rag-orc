@@ -1404,3 +1404,77 @@ async def test_a_flush_that_fails_is_reported_not_swallowed() -> None:
     assert report.documents_indexed == 1, "a failed confirmation is not a failed ingest"
     assert report.points_in_store is None, "unknown must not read as zero"
     assert any("could not confirm" in w for w in report.warnings), report.warnings
+
+
+async def test_bulk_load_is_entered_once_for_the_whole_run_not_once_per_window() -> None:
+    """Bulk-load mode turns HNSW construction off, and its *exit* builds every
+    graph once over segments whose final size is known — the single biggest ingest
+    speedup available.
+
+    It was entered inside `_run`, which is called once per document window, so a
+    directory ingest toggled indexing off and back on once per `document_window`
+    documents and every exit rebuilt the graph over everything written so far and
+    then waited for green. That is precisely the repeated rebuilding the mode
+    exists to prevent, put on a schedule.
+    """
+    import contextlib
+
+    from tests.fakes import FakeDocumentStore, FakeVectorStore
+
+    class _BulkLoading(FakeVectorStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entries = 0
+
+        @contextlib.asynccontextmanager
+        async def bulk_load(self) -> Any:
+            self.entries += 1
+            yield
+
+        async def flush(self, *, timeout_s: float = 300.0) -> int:
+            return len(self.chunks)
+
+    store = _BulkLoading()
+    pipeline = _fk_pipeline(FakeDocumentStore())
+    pipeline.vector = store
+    # Three windows' worth of documents, each window over the bulk-load floor.
+    pipeline.settings.indexing.document_window = 70
+    body = "Refunds are processed within five business days. " * 12
+    documents = [Document(id=f"d{i}", content=f"Document {i}. {body}") for i in range(210)]
+
+    report = await pipeline.ingest(documents)
+
+    assert report.documents_indexed == 210, report.warnings
+    assert store.entries == 1, (
+        f"one bulk-load window for the run, not one per document window (saw {store.entries})"
+    )
+
+
+async def test_a_small_ingest_does_not_pay_for_bulk_load_mode() -> None:
+    """Turning indexing off costs two round trips and a wait-for-green on exit,
+    which is not worth paying to insert a handful of points."""
+    import contextlib
+
+    from ragorc.index.pipeline import BULK_LOAD_MIN_DOCUMENTS
+    from tests.fakes import FakeDocumentStore, FakeVectorStore
+
+    class _BulkLoading(FakeVectorStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entries = 0
+
+        @contextlib.asynccontextmanager
+        async def bulk_load(self) -> Any:
+            self.entries += 1
+            yield
+
+    store = _BulkLoading()
+    pipeline = _fk_pipeline(FakeDocumentStore())
+    pipeline.vector = store
+    body = "Refunds are processed within five business days. " * 12
+    few = [Document(id=f"d{i}", content=f"Document {i}. {body}") for i in range(4)]
+    assert len(few) < BULK_LOAD_MIN_DOCUMENTS
+
+    await pipeline.ingest(few)
+
+    assert store.entries == 0

@@ -520,20 +520,32 @@ class IngestPipeline:
 
         with timed("ingest"):
             strategy: ChunkingStrategy | None = None
-            async for documents in self._document_windows(target, report):
-                report.documents_in += len(documents)
-                accepted = await self._validate(documents, report)
-                if not accepted:
-                    continue
-                # Resolved on the first window that has work, and reused: the
-                # strategy is a property of the configuration and the embedder, not
-                # of a window, and re-resolving it would re-measure the model's
-                # dimension once per window.
-                if strategy is None:
-                    strategy = await self._prepare(report)
-                    report.strategy = strategy.value
-                todo, changed = await self._select_changed(accepted, report, force=force)
-                if todo:
+            # One bulk-load window for the whole run, entered on the first batch
+            # big enough to earn it. It used to be entered and exited inside
+            # `_run`, which is called once per *document window* — so a directory
+            # ingest turned HNSW construction off and back on once per 512
+            # documents, and every exit rebuilt the graph over everything written
+            # so far and then waited for green. That is the repeated rebuilding
+            # bulk-load mode exists to prevent, performed on a schedule.
+            async with contextlib.AsyncExitStack() as bulk_stack:
+                bulk_loading = False
+                async for documents in self._document_windows(target, report):
+                    report.documents_in += len(documents)
+                    accepted = await self._validate(documents, report)
+                    if not accepted:
+                        continue
+                    # Resolved on the first window that has work, and reused: the
+                    # strategy is a property of the configuration and the embedder,
+                    # not of a window, and re-resolving it would re-measure the
+                    # model's dimension once per window.
+                    if strategy is None:
+                        strategy = await self._prepare(report)
+                        report.strategy = strategy.value
+                    todo, changed = await self._select_changed(accepted, report, force=force)
+                    if not todo:
+                        continue
+                    if not bulk_loading and report.documents_in >= BULK_LOAD_MIN_DOCUMENTS:
+                        bulk_loading = await self._enter_bulk_load(bulk_stack)
                     await self._run(todo, changed, strategy, report)
 
             if report.documents_in and not report.chunks_created:
@@ -547,6 +559,8 @@ class IngestPipeline:
                 log.warning("ingest_all_rejected", **report.summary())
                 return report
 
+            # Outside the bulk-load stack, so the read-back sees an index that has
+            # been restored and finished building rather than one still suspended.
             await self._flush_vectors(report)
 
         report.total_ms = _elapsed_ms(run_started)
@@ -1079,35 +1093,31 @@ class IngestPipeline:
         batch = max(1, self.config.batch_size)
         pending: list[Chunk] = []
 
-        async with contextlib.AsyncExitStack() as stack:
-            if len(documents) >= BULK_LOAD_MIN_DOCUMENTS:
-                bulk = getattr(self.vector, "bulk_load", None)
-                if callable(bulk):
-                    await stack.enter_async_context(bulk())
+        # Bulk-load mode is owned by `ingest`, which is the only scope that spans
+        # the whole corpus; entering it here made it once-per-document-window.
+        for group in _windows(list(documents), window):
+            ready, chunks = await self._process_window(group, strategy, report)
+            if not ready:
+                continue
 
-            for group in _windows(list(documents), window):
-                ready, chunks = await self._process_window(group, strategy, report)
-                if not ready:
-                    continue
+            # The stale purge happens now — after the replacement chunks exist
+            # — so a document whose extraction just started failing keeps the
+            # vectors it already had instead of disappearing from the index.
+            stale = [doc for doc in ready if doc.id in changed]
+            if stale:
+                await self._purge(stale, report)
+            await self._write_documents(ready, report)
+            # After the rows and after the cascade: the two conditions the
+            # deferred docstore writes were violating (see `_DeferredDocstore`).
+            await self._flush_deferred(report)
 
-                # The stale purge happens now — after the replacement chunks exist
-                # — so a document whose extraction just started failing keeps the
-                # vectors it already had instead of disappearing from the index.
-                stale = [doc for doc in ready if doc.id in changed]
-                if stale:
-                    await self._purge(stale, report)
-                await self._write_documents(ready, report)
-                # After the rows and after the cascade: the two conditions the
-                # deferred docstore writes were violating (see `_DeferredDocstore`).
-                await self._flush_deferred(report)
+            pending.extend(chunks)
+            while len(pending) >= batch:
+                await self._write_chunks(pending[:batch], report)
+                del pending[:batch]
 
-                pending.extend(chunks)
-                while len(pending) >= batch:
-                    await self._write_chunks(pending[:batch], report)
-                    del pending[:batch]
-
-            if pending:
-                await self._write_chunks(pending, report)
+        if pending:
+            await self._write_chunks(pending, report)
 
     async def _process_window(
         self,
@@ -1233,6 +1243,20 @@ class IngestPipeline:
         )
         index = await indexer.build(document)
         return list(index.children), list(index.parents)
+
+    async def _enter_bulk_load(self, stack: contextlib.AsyncExitStack) -> bool:
+        """Turn HNSW construction off for the rest of the run, if the store can.
+
+        Returns whether it took, so the caller stops asking. Entered lazily rather
+        than up front because a streamed directory does not know its own size until
+        it has been walked, and turning indexing off for a ten-document ingest
+        costs two round trips and a green wait to save nothing.
+        """
+        bulk = getattr(self.vector, "bulk_load", None)
+        if not callable(bulk):
+            return False
+        await stack.enter_async_context(bulk())
+        return True
 
     async def _flush_vectors(self, report: IngestReport) -> None:
         """Make the vector writes durable and searchable before reporting success.
