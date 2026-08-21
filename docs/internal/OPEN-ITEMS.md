@@ -63,7 +63,18 @@ assertion cannot fail:
 The fakes need to model the behaviour the assertion depends on: honour
 `with_vectors`, and let a scripted LLM's verdict depend on its prompt.
 
-## 4. Two undertested behaviours in multi-hop
+## 4. One undertested behaviour in multi-hop
+
+`_hop_query` is applied at hop 0, so a caller-supplied `dense`/`sparse`/`multi`
+vector on the incoming `Query` is dropped on the first retrieval too. Whether that
+is intended is unclear — it may be deliberate, since the hop query is a different
+question from the caller's.
+
+`_check_sufficiency` losing all gathered evidence on an unparseable response is
+fixed: it now stops with what the hops found, which is what every other stage in
+the module does.
+
+## 5. Claims from earlier audits that did not survive checking
 
 Reported by the coverage pass, not asserted as intent because neither is clearly
 intended:
@@ -73,7 +84,18 @@ intended:
 * `_check_sufficiency` has no `try`/`except`, so an unparseable structured response
   loses all evidence gathered so far. Every other stage in the codebase degrades.
 
-## 5. Deliberately unused, kept on purpose
+Recorded so they are not re-investigated a third time:
+
+* "Enabling CRAG silently turns off reranking" — `builder.py:1090-1091` appends
+  `nodes.rerank` whichever retrieval node was chosen, so reranking runs either way.
+* "`filters` is silently dropped on the graph path" — `retrieve/graph.py:961`
+  reads `kwargs["filters"]` then `query.filters`. Overstated; one call site does
+  honour it.
+* "`enable_late_interaction=true` makes every ingest fail" — not reproducible now.
+  The late-chunking substitution that produced it was removed earlier, so this is
+  most likely already fixed. Unverified against a live multivector collection.
+
+## 6. Deliberately unused, kept on purpose
 
 * `scope_sql_where` / `scope_cypher_where` are exported with no in-library caller.
   `security.generated_query_isolation` recommends PostgreSQL RLS instead —

@@ -234,7 +234,28 @@ class IterativeRetriever:
                     # No point paying for a judgement the loop cannot act on.
                     break
 
-                check, usage = await self._check_sufficiency(query, gathered, history)
+                try:
+                    check, usage = await self._check_sufficiency(query, gathered, history)
+                except Exception as exc:  # noqa: BLE001 - keep what the hops found
+                    # The sufficiency call is a judgement *about* evidence already
+                    # gathered, so losing it must not lose the evidence. Every
+                    # other stage in this module degrades that way and this one
+                    # did not: an unparseable structured response or a transient
+                    # LLM failure discarded every hop.
+                    #
+                    # Stopping rather than continuing is deliberate. A model that
+                    # cannot answer this once will not answer it on the next hop
+                    # either, and continuing would spend the whole hop budget to
+                    # arrive at the same evidence.
+                    log.warning(
+                        "multihop_sufficiency_failed",
+                        hop=hop,
+                        gathered=len(gathered),
+                        error=str(exc)[:200],
+                        action="stopping with the evidence already found",
+                    )
+                    stopped = "check_failed"
+                    break
                 self.usage = self.usage + usage
 
                 if check.sufficient and cfg.multihop_stop_on_sufficient:

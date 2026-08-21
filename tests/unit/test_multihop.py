@@ -943,3 +943,42 @@ async def test_the_iterative_route_reports_the_loop_bill_as_its_own() -> None:
 
     assert retriever.usage.calls == 1
     assert retriever.usage.cost_usd == pytest.approx(0.0025)
+
+
+async def test_a_failed_sufficiency_check_keeps_the_evidence_already_found() -> None:
+    """The check is a judgement *about* evidence, so losing it must not lose the
+    evidence. Every other stage in this module degrades that way; this one raised
+    straight out of `retrieve`, so an unparseable structured response or one
+    transient LLM failure discarded every hop that had already succeeded."""
+    from ragorc.core.models import Chunk, Query, ScoredChunk
+    from ragorc.core.settings import Settings
+    from ragorc.retrieve.multihop import IterativeRetriever
+
+    class _Base:
+        name = "base"
+
+        async def retrieve(self, query, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            return [
+                ScoredChunk(
+                    chunk=Chunk(id="c1", content="Refunds take five days.", document_id="d1"),
+                    score=0.9,
+                )
+            ]
+
+    class _BrokenJudge:
+        async def structured(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            raise ValueError("model returned something unparseable")
+
+        async def complete(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            return "", None
+
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        retrieval={"multihop_max_iterations": 4},
+    )
+    retriever = IterativeRetriever(_BrokenJudge(), _Base(), settings=settings)
+    out = await retriever.retrieve(Query(text="how long do refunds take?"), top_k=3)
+
+    assert [scored.chunk.id for scored in out] == ["c1"], (
+        "the hop that succeeded must survive the judgement that failed"
+    )
