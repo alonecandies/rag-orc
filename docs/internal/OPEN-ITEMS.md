@@ -9,26 +9,25 @@ Nothing here is a secret or a live vulnerability. The security findings from
 earlier audits are fixed and covered by tests in `tests/unit/test_security_guards.py`
 and `tests/unit/test_guard_properties.py`.
 
-## 1. Parent-document indexing is not an ingest stage
+## 1. Closed: multi-representation indexing is wired
 
-`indexing.summary_index_enabled` and `dense_x_enabled` now run through
-`MultiRepresentationIndexer`. Write ownership was the open question and it is
-settled: the stage builds and embeds its derived units and the pipeline writes
-them, because `_process_document` already writes whatever a stage returns and an
-indexer that also upserted would write the same ids twice. The docstore write
-stays with the indexer, since that one is not a duplicate — `expand_parents` reads
-those sources back at query time.
+`summary_index_enabled` and `dense_x_enabled` run as enrichment stages through
+`MultiRepresentationIndexer`. Write ownership is settled: the stage builds and
+embeds its derived units and the pipeline writes them, because
+`_process_document` already writes whatever a stage returns. The docstore write
+stays with the indexer, since `expand_parents` reads those sources back at query
+time.
 
-Still open: `indexing.parent_document_enabled` logs that it must be driven
-directly. `ParentDocumentIndexer` performs its own two-level split, which makes it
-a chunking *mode* rather than an enrichment; running it here would index every
-document twice. It belongs at the splitter, which is a change to the write path
-rather than to this stage.
+`parent_document_enabled` is handled at the splitter rather than as an enrichment,
+because it splits the document twice and the child is the retrieval unit — running
+it beside the normal split would index every document twice.
+`IngestPipeline._split` replaces the split with it and routes the parents to the
+docstore alone.
 
-Also worth knowing: derived units carry the dense vector their indexer computed
-and no sparse or ColBERT vector, because those are added before the enrichment
-stage runs. On a hybrid collection they are findable by vector search and not by
-BM25.
+Derived units carry the dense vector their indexer computed and no sparse or
+ColBERT vector, because those are added before the enrichment stage runs. On a
+hybrid collection they are findable by vector search and not by BM25 — the one
+remaining rough edge here.
 
 ## 2. Closed: corpus-wide graph construction has a command
 

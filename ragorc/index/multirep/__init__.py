@@ -94,9 +94,9 @@ class MultiRepresentationIndexer:
     -------------------
     `ParentDocumentIndexer` performs its own two-level split, which makes it a
     chunking *mode* rather than an enrichment: running it here would index every
-    document twice, once as the pipeline's chunks and once as its own children.
-    `indexing.parent_document_enabled` therefore reports that it must be driven
-    directly rather than quietly doing half of it. See docs/internal/OPEN-ITEMS.md.
+    document twice, once as the pipeline's chunks and once as its own children. So
+    `indexing.parent_document_enabled` is handled by `IngestPipeline._split`, which
+    replaces the normal split with it and routes the parents to the docstore alone.
 
     Derived units carry the dense vector their indexer computed and no sparse or
     ColBERT vector, because those are added before this stage runs. On a hybrid
@@ -140,14 +140,8 @@ class MultiRepresentationIndexer:
             current, usage = await propositions.index(current, docstore=relational_store)
             usages.append(usage)
 
-        if config.parent_document_enabled:
-            log.info(
-                "parent_document_not_an_ingest_stage",
-                document_id=document.id,
-                hint=(
-                    "ParentDocumentIndexer re-splits the document, so running it here "
-                    "would index it twice; drive it directly — see docs/modules/index.md"
-                ),
-            )
+        # parent_document_enabled is handled at the splitter, not here: it splits
+        # the document twice and the child is the retrieval unit, which makes it a
+        # chunking mode rather than an enrichment. See IngestPipeline._split.
 
         return current, Usage.sum(usages) if usages else Usage()

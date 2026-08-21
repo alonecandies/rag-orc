@@ -1139,7 +1139,7 @@ class IngestPipeline:
         self, document: Document, strategy: ChunkingStrategy, report: IngestReport
     ) -> list[Chunk]:
         started = time.perf_counter()
-        chunks = await self._splitter_for().split(document)
+        chunks, docstore_only = await self._split(document)
         chunks = self.validator.validate_chunks(chunks)
         if self.config.dedupe_chunks:
             chunks = _dedupe_exact(chunks)
@@ -1151,6 +1151,12 @@ class IngestPipeline:
         await self._add_sparse(chunks, report)
         await self._add_colbert(chunks, report)
         await self._enrich(document, chunks, report)
+        if docstore_only:
+            # Parents are written here and nowhere else: nothing searches them, so
+            # a vector on them is a vector no query will ever reach, and the
+            # default 2048/256 sizes would store the corpus eight to ten times over
+            # in the payload. `expand_parents` reads them back after ranking.
+            await self._write_docstore_only(docstore_only, report)
         log.debug(
             "document_indexed",
             document_id=document.id,
@@ -1159,6 +1165,39 @@ class IngestPipeline:
             ms=round(_elapsed_ms(started), 1),
         )
         return chunks
+
+    async def _split(self, document: Document) -> tuple[list[Chunk], list[Chunk]]:
+        """Split a document into what gets indexed and what only gets persisted.
+
+        Normally the second list is empty. Under ``indexing.parent_document_enabled``
+        it holds the parents: parent-document indexing is a *chunking mode*, not an
+        enrichment, because it splits the document twice — parents with no overlap,
+        then children inside each parent — and the child is the retrieval unit while
+        the parent is the generation unit. Running it as an enrichment stage
+        alongside the normal split would index every document twice.
+        """
+        if not self.config.parent_document_enabled:
+            return list(await self._splitter_for().split(document)), []
+
+        from ragorc.index.multirep import ParentDocumentIndexer
+
+        indexer = ParentDocumentIndexer(
+            embedder=self._dense(), validator=self.validator, settings=self.settings
+        )
+        index = await indexer.build(document)
+        return list(index.children), list(index.parents)
+
+    async def _write_docstore_only(self, chunks: Sequence[Chunk], report: IngestReport) -> None:
+        """Persist chunks nothing will search."""
+        if self.relational is None:
+            report.warnings.append(
+                "parent_document_enabled needs a relational store to hold the parents; "
+                "children were indexed but expansion at query time will find nothing"
+            )
+            return
+        started = time.perf_counter()
+        await self.relational.upsert_chunks(list(chunks))
+        report.timings_ms["parents"] = report.timings_ms.get("parents", 0.0) + _elapsed_ms(started)
 
     async def _embed_dense(
         self,
