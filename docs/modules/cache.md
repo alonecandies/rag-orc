@@ -89,3 +89,15 @@ cross-tenant data leak with a latency improvement.
 `cache.cache_embeddings` | content-hash keyed vectors |
 `cache.cache_rerank` | cross-encoder scores, keyed on (query, document) |
 `cache.cache_schema` | Postgres/Neo4j introspection for the Text-to-SQL prompt |
+
+## Why the semantic cache is keyed on more than the question
+
+Tenant scoping was there from the start — a cache keyed only on question text
+leaks one tenant's answer to another. `filters` and `top_k` are the same problem
+one level down: filters decide which passages are admissible, `top_k` decides how
+many are used, and a caller who filters to a subset is often doing so because that
+subset is what they are entitled to see. Two requests with the same text and
+different scopes are not the same request, and `scope_key()` is what keeps them
+apart. It is matched exactly, unlike the question itself — a near-miss on the
+question is the point of a semantic cache; a near-miss on the scope is a wrong
+answer.

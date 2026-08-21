@@ -89,6 +89,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import structlog
 
+from ragorc.cache.semantic import scope_key
 from ragorc.core.concurrency import gather_dict, install_uvloop
 from ragorc.core.errors import (
     BudgetExceeded,
@@ -659,8 +660,8 @@ class _LinearEngine:
         ):
             yield delta
 
-    async def ingest(self, target: Any) -> Any:
-        return await self.ingest_pipeline.ingest(target)
+    async def ingest(self, target: Any, *, force: bool = False) -> Any:
+        return await self.ingest_pipeline.ingest(target, force=force)
 
     # -- stages ------------------------------------------------------------
     async def _route(self, query: Query) -> tuple[RouteDecision, Usage]:
@@ -1139,7 +1140,11 @@ class RagService:
     async def _cache_get(self, query: Query, *, request_id: str) -> QueryResponse | None:
         if self.semantic is None:
             return None
-        hit = await self.semantic.get(query.text, tenant_id=query.tenant_id)
+        hit = await self.semantic.get(
+            query.text,
+            tenant_id=query.tenant_id,
+            scope=scope_key(query.filters, query.top_k),
+        )
         if hit is None:
             return None
         try:
@@ -1167,7 +1172,10 @@ class RagService:
         # place for the rule: an abstention is a statement about the index at one
         # moment, and replaying it later hides content that has since been added.
         await self.semantic.set(
-            query.text, response.model_dump(mode="json"), tenant_id=query.tenant_id
+            query.text,
+            response.model_dump(mode="json"),
+            tenant_id=query.tenant_id,
+            scope=scope_key(query.filters, query.top_k),
         )
 
     # -- ingest ------------------------------------------------------------

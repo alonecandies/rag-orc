@@ -76,6 +76,7 @@ from typing import Any, cast
 import orjson
 import structlog
 
+from ragorc.cache.semantic import scope_key
 from ragorc.cache.tiered import build_cache
 from ragorc.core.concurrency import install_uvloop
 from ragorc.core.errors import ConfigError, StoreUnavailable
@@ -998,7 +999,7 @@ class RAGPipeline:
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
 
-            hit = await self._cache_get(question, tenant)
+            hit = await self._cache_get(question, tenant, top_k)
             if hit is not None:
                 return hit
 
@@ -1014,7 +1015,7 @@ class RAGPipeline:
             answer = self._finish(
                 final, name=name, request_id=request_id, trace=trace, ledger=ledger
             )
-            await self._cache_set(question, tenant, answer, final)
+            await self._cache_set(question, tenant, answer, final, top_k)
             return answer
 
     async def stream(
@@ -1203,11 +1204,16 @@ class RAGPipeline:
     # ------------------------------------------------------------------
     # Semantic cache
     # ------------------------------------------------------------------
-    async def _cache_get(self, question: str, tenant: str | None) -> Answer | None:
+    async def _cache_get(
+        self, question: str, tenant: str | None, top_k: int | None = None
+    ) -> Answer | None:
         cache = self.semantic_cache
         if cache is None:
             return None
-        hit = await cache.get(question, tenant_id=tenant)
+        # `top_k` is part of the identity: it changes how much evidence the
+        # answer was built from. This path takes no filters, so the scope is
+        # top_k alone; the HTTP path passes both.
+        hit = await cache.get(question, tenant_id=tenant, scope=scope_key(None, top_k))
         if hit is None:
             return None
         answer = _answer_from_payload(hit.answer)
@@ -1223,7 +1229,12 @@ class RAGPipeline:
         return answer
 
     async def _cache_set(
-        self, question: str, tenant: str | None, answer: Answer, state: RAGState
+        self,
+        question: str,
+        tenant: str | None,
+        answer: Answer,
+        state: RAGState,
+        top_k: int | None = None,
     ) -> None:
         """Populate the cache, with two refusals.
 
@@ -1242,7 +1253,12 @@ class RAGPipeline:
         if state.get("errors"):
             log.info("semantic_cache_skipped", reason="degraded_answer")
             return
-        await cache.set(question, _answer_to_payload(answer), tenant_id=tenant)
+        await cache.set(
+            question,
+            _answer_to_payload(answer),
+            tenant_id=tenant,
+            scope=scope_key(None, top_k),
+        )
 
     # ------------------------------------------------------------------
     # Introspection

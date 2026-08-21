@@ -36,6 +36,22 @@ log = structlog.get_logger(__name__)
 __all__ = ["SemanticCache", "SemanticHit"]
 
 
+def scope_key(filters: Any | None = None, top_k: int | None = None) -> str:
+    """A stable identity for the retrieval scope a question was answered under.
+
+    Two requests with the same text are not the same request. `filters` narrows
+    which passages are admissible and `top_k` changes how many are used, so an
+    answer produced under one scope is not the answer to the same question asked
+    under another — and filters are how a caller restricts themselves to a subset
+    they are entitled to see. Keying only on text and tenant served the first
+    caller's answer to the second.
+
+    Sorted before hashing so key order in a filter dict cannot split the cache.
+    """
+    normalized = orjson.dumps(filters or {}, option=orjson.OPT_SORT_KEYS).decode()
+    return content_hash("semscope", normalized, str(top_k or ""), size=16)
+
+
 class SemanticHit:
     __slots__ = ("answer", "question", "score", "stored_at")
 
@@ -85,7 +101,9 @@ class SemanticCache:
             self._ready = True
         return self._client
 
-    async def get(self, question: str, *, tenant_id: str | None = None) -> SemanticHit | None:
+    async def get(
+        self, question: str, *, tenant_id: str | None = None, scope: str | None = None
+    ) -> SemanticHit | None:
         cfg = self.settings.cache
         if not (cfg.enabled and cfg.semantic_enabled):
             return None
@@ -100,6 +118,13 @@ class SemanticCache:
                 # question text would leak one tenant's answer to another.
                 conditions.append(
                     models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
+                )
+            if scope:
+                # Matched exactly, like tenant_id: a near-miss on the question is
+                # the point of a semantic cache, a near-miss on the scope is a
+                # wrong answer.
+                conditions.append(
+                    models.FieldCondition(key="scope", match=models.MatchValue(value=scope))
                 )
             cutoff = time.time() - cfg.semantic_ttl_s
             conditions.append(models.FieldCondition(key="ts", range=models.Range(gte=cutoff)))
@@ -146,6 +171,7 @@ class SemanticCache:
         answer: dict[str, Any],
         *,
         tenant_id: str | None = None,
+        scope: str | None = None,
     ) -> None:
         cfg = self.settings.cache
         if not (cfg.enabled and cfg.semantic_enabled):
@@ -159,7 +185,7 @@ class SemanticCache:
             vector = await self.embedder.embed_query(question)
             from qdrant_client import models
 
-            point_id = content_hash("semcache", tenant_id or "", question, size=16)
+            point_id = content_hash("semcache", tenant_id or "", scope or "", question, size=16)
             await client.upsert(
                 collection_name=self.collection,
                 points=[
@@ -171,6 +197,7 @@ class SemanticCache:
                             "answer": orjson.dumps(answer).decode(),
                             "ts": time.time(),
                             **({"tenant_id": tenant_id} if tenant_id else {}),
+                            **({"scope": scope} if scope else {}),
                         },
                     )
                 ],

@@ -679,3 +679,28 @@ def test_the_sentence_compressor_can_now_be_selected() -> None:
     name, making it the one README-documented option no configuration could
     reach."""
     assert Settings(retrieval={"compressor": "sentence"}).retrieval.compressor == "sentence"
+
+
+# ---------------------------------------------------------------------------
+# Semantic cache identity
+# ---------------------------------------------------------------------------
+def test_the_cache_scope_separates_requests_that_are_not_the_same_request() -> None:
+    """Two requests with the same text are not the same request.
+
+    `filters` narrows which passages are admissible and `top_k` changes how many
+    are used, so an answer produced under one scope is not the answer to the same
+    question under another. The lookup keyed on text and tenant only, so a caller
+    who filtered to `{"dept": "legal"}` could be served the answer computed for
+    `{"dept": "hr"}` — and filters are how a caller restricts themselves to a
+    subset they are entitled to see.
+    """
+    from ragorc.cache.semantic import scope_key
+
+    legal = scope_key({"dept": "legal"}, 5)
+    assert legal != scope_key({"dept": "hr"}, 5), "different filters, different scope"
+    assert legal != scope_key({"dept": "legal"}, 10), "different top_k, different scope"
+    assert legal == scope_key({"dept": "legal"}, 5), "the same scope must be stable"
+    # Key order in a dict must not split the cache, or the hit rate silently
+    # depends on how the caller happened to build the filter.
+    assert scope_key({"a": 1, "b": 2}) == scope_key({"b": 2, "a": 1})
+    assert scope_key(None, None) == scope_key({}, None), "no filter is an empty filter"
