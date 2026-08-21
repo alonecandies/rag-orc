@@ -639,3 +639,76 @@ async def test_ingest_counts_documents_that_produced_no_chunks(
     # ingest of the other document really did succeed.
     assert report.documents_failed == 0
     assert report.chunks_created >= 1
+
+
+# ---------------------------------------------------------------------------
+# An ingest stage the operator asked for and did not get
+# ---------------------------------------------------------------------------
+def _stub_pipeline(**settings_kwargs):  # noqa: ANN003, ANN202
+    from ragorc.index.pipeline import IngestPipeline
+    from tests.fakes import StubEmbedder, StubLLM
+
+    settings_kwargs.setdefault("security", {"enforce_tenant_isolation": False})
+    return IngestPipeline(
+        llm=StubLLM(), dense_embedder=StubEmbedder(), settings=Settings(**settings_kwargs)
+    )
+
+
+def test_an_enabled_stage_that_cannot_load_is_reported_not_just_logged() -> None:
+    """The failure mode that hid two unreachable features.
+
+    `indexing.summary_index_enabled` resolves a plugin by factory name. When no
+    such factory exists the stage is dropped, and until now that was a log line
+    the caller never saw: the ingest returned success with `llm_calls=0` and an
+    empty warnings list, so nothing distinguished "summarised every chunk" from
+    "silently did not run".
+    """
+    from ragorc.index.pipeline import IngestReport
+
+    pipeline = _stub_pipeline(indexing={"summary_index_enabled": True})
+    report = IngestReport()
+    built = pipeline._build_stages(report)
+
+    assert "multirep" not in [plugin.label for plugin, _ in built]
+    assert any("multirep" in w and "unavailable" in w for w in report.warnings), report.warnings
+    # The hint must name the real cause. "pip install ragorc[...]" would send the
+    # operator to fix an install that is not the problem.
+    assert any("exists in ragorc.index.multirep" in w for w in report.warnings)
+
+
+def test_graph_enabled_asks_for_a_second_pass_instead_of_failing_to_build() -> None:
+    """Graph construction is corpus-wide; a streaming ingest holds one document.
+
+    It used to be listed as a per-document enrichment stage, where it could never
+    work: `GraphBuilder` needs a graph store nothing passed it, exposes only
+    `build()`, and returns a build report rather than chunks. Every run logged a
+    TypeError and continued. The flag now produces an instruction.
+    """
+    from ragorc.index.pipeline import _OPTIONAL_STAGES, IngestReport
+
+    assert "graph" not in [p.label for p in _OPTIONAL_STAGES], (
+        "graph cannot be a per-document stage: it owns its writes and returns a report"
+    )
+
+    pipeline = _stub_pipeline(graph={"enabled": True})
+    report = IngestReport()
+    built = pipeline._build_stages(report)
+
+    assert built == [], "nothing should be built for a corpus-wide pass"
+    assert any("second pass" in w for w in report.warnings), report.warnings
+    assert any("GraphBuilder" in w for w in report.warnings), "the warning must name the API"
+    assert not any("could not be built" in w for w in report.warnings), (
+        "this is a different shape of work, not a build failure"
+    )
+
+
+def test_stages_that_do_work_still_build_and_report_nothing() -> None:
+    """The check must not cry wolf: raptor is present and constructible."""
+    from ragorc.index.pipeline import IngestReport
+
+    pipeline = _stub_pipeline(indexing={"raptor_enabled": True})
+    report = IngestReport()
+    built = pipeline._build_stages(report)
+
+    assert [plugin.label for plugin, _ in built] == ["raptor"]
+    assert report.warnings == []

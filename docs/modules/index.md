@@ -8,6 +8,30 @@ restartable and correct.
 Related: [ADR-0002 — late chunking](../adr/0002-late-chunking.md) ·
 [docs/performance.md](../performance.md).
 
+## Why graph construction is not an ingest stage
+
+Entity resolution and community detection are only meaningful over the whole
+corpus, and `IngestPipeline` deliberately holds one document's chunks at a time —
+materialising a 4M-chunk corpus to cluster it is what the backpressure exists to
+prevent. `GraphBuilder` also owns its own writes and returns a build report
+rather than chunks, so there is no shape in which it could be a per-document
+enrichment.
+
+It used to be listed as one anyway, and silently failed to construct on every
+run because nothing passed it a graph store. `graph.enabled` now records what it
+needs on `IngestReport.warnings` instead:
+
+```python
+report = await pipeline.ingest("./docs")
+# report.warnings names the second pass when graph.enabled is set
+
+builder = GraphBuilder(llm, graph_store, settings=settings)
+await builder.build(chunks)      # see examples/04_graphrag.py
+```
+
+The same reasoning applies to a corpus-wide RAPTOR tree; the per-document trees a
+streaming ingest can build are what the `raptor` stage produces.
+
 ## Key classes
 
 ```python

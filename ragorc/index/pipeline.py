@@ -321,12 +321,21 @@ _OPTIONAL_STAGES: tuple[_Plugin, ...] = (
         factories=("RaptorIndexer", "RaptorBuilder", "build_raptor"),
         extra="raptor",
     ),
-    _Plugin(
-        label="graph",
-        modules=("ragorc.index.graph",),
-        factories=("GraphIndexer", "GraphBuilder", "build_graph_index"),
-        extra="graphrag",
-    ),
+)
+
+#: Corpus-wide passes, which a streaming ingest cannot host. Listed here so
+#: ``graph.enabled`` produces an instruction instead of silence: entity
+#: resolution and community detection are only meaningful over the whole corpus,
+#: and this pipeline deliberately holds one document's chunks at a time (see
+#: :meth:`IngestPipeline._enrich`). ``GraphBuilder`` also owns its own writes and
+#: returns a build report rather than chunks, so there is no shape in which it
+#: could be an enrichment stage — it was previously listed as one and silently
+#: failed to construct on every run, because nothing passed it a graph store.
+_GRAPH_CORPUS_HINT = (
+    "graph.enabled requires a corpus-wide second pass, which a streaming ingest "
+    "cannot perform: build it after ingest with "
+    "GraphBuilder(llm, graph_store, settings=settings).build(chunks) — see "
+    "examples/04_graphrag.py and docs/modules/index.md"
 )
 
 
@@ -495,7 +504,7 @@ class IngestPipeline:
                 log.warning("ingest_all_rejected", **report.summary())
                 return report
 
-            strategy = await self._prepare()
+            strategy = await self._prepare(report)
             report.strategy = strategy.value
 
             todo, changed = await self._select_changed(accepted, report)
@@ -666,7 +675,7 @@ class IngestPipeline:
     # ------------------------------------------------------------------
     # Preparation: strategy, components, stores
     # ------------------------------------------------------------------
-    async def _prepare(self) -> ChunkingStrategy:
+    async def _prepare(self, report: IngestReport | None = None) -> ChunkingStrategy:
         """Resolve the strategy once, then build everything it determines."""
         if self._strategy is not None:
             return self._strategy
@@ -693,7 +702,7 @@ class IngestPipeline:
         query_side: Any = chunker if strategy is ChunkingStrategy.LATE else self._dense()
         dimension = await self._pin_dimension(query_side, measure=strategy is ChunkingStrategy.LATE)
 
-        self._stages = self._build_stages()
+        self._stages = self._build_stages(report)
         await self._ensure_stores(query_side, dimension)
 
         self._strategy = strategy
@@ -851,18 +860,33 @@ class IngestPipeline:
             )
             return None
 
-    def _build_stages(self) -> list[tuple[_Plugin, Any]]:
-        """Locate the optional stages whose settings flags are on."""
+    def _build_stages(self, report: IngestReport | None = None) -> list[tuple[_Plugin, Any]]:
+        """Locate the optional stages whose settings flags are on.
+
+        A stage the caller asked for and did not get is recorded on the report,
+        not just logged. Both failures below were invisible for exactly that
+        reason: an operator who set ``indexing.summary_index_enabled`` saw a
+        successful ingest with ``llm_calls=0`` and no indication that the stage
+        they configured had been dropped at build time.
+        """
         wanted = [plugin for plugin in _OPTIONAL_STAGES if self._stage_enabled(plugin.label)]
         built: list[tuple[_Plugin, Any]] = []
         for plugin in wanted:
             factory = _load_plugin(plugin)
             if factory is None:
-                log.warning(
-                    "index_stage_unavailable",
-                    stage=plugin.label,
-                    hint=f"pip install 'ragorc[{plugin.extra}]'" if plugin.extra else "not present",
+                # An extra names an install; no extra means the factory is simply
+                # absent from this build, which is a packaging bug rather than
+                # something the operator can fix by installing anything.
+                hint = (
+                    f"pip install 'ragorc[{plugin.extra}]'"
+                    if plugin.extra
+                    else f"none of {plugin.factories} exists in {plugin.modules[0]}"
                 )
+                log.warning("index_stage_unavailable", stage=plugin.label, hint=hint)
+                if report is not None:
+                    report.warnings.append(
+                        f"{plugin.label} stage is enabled but unavailable: {hint}"
+                    )
                 continue
             try:
                 built.append(
@@ -883,6 +907,17 @@ class IngestPipeline:
                     error=str(exc)[:200],
                     error_type=type(exc).__name__,
                 )
+                if report is not None:
+                    report.warnings.append(
+                        f"{plugin.label} stage is enabled but could not be built: {exc}"
+                    )
+        if self.settings.graph.enabled:
+            # Not a failure — a different shape of work. Saying so beats an
+            # ingest that reports success while the graph the operator asked for
+            # does not exist.
+            log.info("graph_requires_second_pass", hint=_GRAPH_CORPUS_HINT)
+            if report is not None:
+                report.warnings.append(_GRAPH_CORPUS_HINT)
         return built
 
     def _stage_enabled(self, label: str) -> bool:
@@ -894,7 +929,7 @@ class IngestPipeline:
             )
         if label == "raptor":
             return self.config.raptor_enabled
-        return self.settings.graph.enabled
+        return False
 
     # ------------------------------------------------------------------
     # The streaming run
