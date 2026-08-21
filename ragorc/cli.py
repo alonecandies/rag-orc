@@ -1190,7 +1190,13 @@ def bench(
     settings = _settings(RAGORC_TENANT_ID=tenant)
     prompts = list(questions or [])
     if queries is not None:
-        prompts.extend(line.strip() for line in queries.read_text().splitlines() if line.strip())
+        # `#` starts a comment, as it does in the eval dataset loader. Without
+        # this the file's own header is benchmarked as a question.
+        prompts.extend(
+            stripped
+            for line in queries.read_text().splitlines()
+            if (stripped := line.strip()) and not stripped.startswith("#")
+        )
     if not prompts:
         _fail(
             "nothing to benchmark",

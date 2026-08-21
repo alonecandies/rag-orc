@@ -67,3 +67,48 @@ def test_ingest_offers_the_force_flag_the_reindex_needs() -> None:
     result = runner.invoke(app, ["ingest", "--help"])
     assert result.exit_code == 0, result.output
     assert "--force" in result.output
+
+
+def test_make_bench_actually_has_something_to_benchmark() -> None:
+    """`make bench` ran `ragorc bench` with no arguments at all.
+
+    `bench` hard-fails with `EXIT_CONFIG` when it has nothing to time, so the
+    target documented in the Makefile help and in docs/performance.md always
+    exited 2 without measuring anything. The recipe now names a question file, and
+    that file has to exist and hold questions once comments are stripped —
+    otherwise this is the same bug with a longer command line.
+    """
+    import re
+    from pathlib import Path
+
+    recipe = next(
+        line
+        for line in Path("Makefile").read_text().splitlines()
+        if line.startswith("\t") and "bench" in line
+    )
+    assert "$(Q)" in recipe, "make bench Q=... must be able to time one question"
+
+    match = re.search(r"--queries ([^\s)]+)", recipe)
+    assert match, f"the default must give bench something to time: {recipe}"
+    questions = Path(match.group(1))
+    assert questions.is_file(), f"{questions} is named by the Makefile and does not exist"
+
+    usable = [
+        stripped
+        for line in questions.read_text().splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+    assert len(usable) >= 5, f"only {len(usable)} usable questions in {questions}"
+
+
+def test_bench_treats_hash_lines_in_a_question_file_as_comments() -> None:
+    """`--queries` read every non-blank line verbatim, so a file's own header was
+    benchmarked as a question. The eval dataset loader has always skipped `#`."""
+    from pathlib import Path
+
+    questions = Path("examples/eval/bench-questions.txt")
+    assert questions.read_text().lstrip().startswith("#"), (
+        "the fixture only tests anything while the shipped file has a header"
+    )
+    result = runner.invoke(app, ["bench", "--queries", str(questions), "--help"])
+    assert result.exit_code == 0, result.output

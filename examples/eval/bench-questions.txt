@@ -1,0 +1,24 @@
+# Questions for `ragorc bench`, one per line — plain text, not JSON, because
+# --queries reads lines verbatim. Drawn from questions.jsonl so the benchmark
+# and the eval exercise the same corpus; bench needs no expected answers,
+# since it measures latency only.
+Who has to approve an expense claim above €500 at Halcyon Data?
+What is the per-diem rate for travel outside the EU?
+How long does Finance take to pay an approved expense claim?
+What counts as a SEV-1 incident?
+What second factor is required for production access, and is an authenticator app enough?
+How much does Retrieval Engine cost, and what does the price cover?
+How much does the Graph Add-on cost per seat per month?
+What do you get for one Embedding Credits pack?
+Our embedding bill is too high. What should we look at first, query volume or how often we re-index?
+What is the SEV-1 response time on the Platinum support plan?
+Once a capability is deprecated, how long does it keep working?
+Contoso Ltd bought one product in addition to Retrieval Engine. Who is the on-call primary for the service that product runs on?
+What SEV-1 response time is Fabrikam GmbH entitled to?
+Who is the account manager for the only documented customer that uses the Graph Add-on?
+What minimum Retrieval Engine version does the product Contoso was the design partner for require?
+If the Graph Service goes down, what severity is that and who gets paged first?
+How many of the documented customers are on the Platinum support plan, and which ones?
+How many services does engineering run an on-call rotation for, and what are they?
+How many weeks of paid parental leave does Halcyon Data offer?
+Which cloud region hosts the Tokyo deployment of the Index Service?

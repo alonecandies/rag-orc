@@ -109,8 +109,8 @@ eval: ## Run the evaluation suite
 	$(CLI) eval examples/eval/questions.jsonl
 
 .PHONY: bench
-bench: ## Benchmark retrieval strategies
-	$(CLI) bench
+bench: ## Benchmark retrieval strategies (or one question: make bench Q="...")
+	$(CLI) bench $(if $(Q),"$(Q)",--queries examples/eval/bench-questions.txt)
 
 # ---------------------------------------------------------------------------
 .PHONY: diagrams
