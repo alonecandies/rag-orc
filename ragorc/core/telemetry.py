@@ -75,7 +75,14 @@ def configure_logging(level: str = "INFO", json_logs: bool = True, redact: bool 
         wrapper_class=structlog.make_filtering_bound_logger(
             getattr(logging, level.upper(), logging.INFO)
         ),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        # A factory, not `PrintLoggerFactory(file=sys.stderr)`. That binds the
+        # stream object at configure time, and anything that later swaps
+        # `sys.stderr` — pytest's capture, typer's CliRunner, a daemonizer — leaves
+        # every subsequent log line writing into a closed handle and raising
+        # `ValueError: I/O operation on closed file` from inside the logger. Looking
+        # `sys.stderr` up per logger keeps logging pointed at whatever stderr is
+        # now, which is the only answer that stays true.
+        logger_factory=lambda *args: structlog.PrintLogger(file=sys.stderr),
         cache_logger_on_first_use=True,
     )
 

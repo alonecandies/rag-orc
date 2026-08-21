@@ -21,13 +21,23 @@ It used to be listed as one anyway, and silently failed to construct on every
 run because nothing passed it a graph store. `graph.enabled` now records what it
 needs on `IngestReport.warnings` instead:
 
-```python
-report = await pipeline.ingest("./docs")
-# report.warnings names the second pass when graph.enabled is set
-
-builder = GraphBuilder(llm, graph_store, settings=settings)
-await builder.build(chunks)      # see examples/04_graphrag.py
+```bash
+ragorc ingest ./docs            # report.warnings names the second pass
+ragorc graph build              # reads the chunks back and builds the graph
 ```
+
+Or in process, which is what the command does:
+
+```python
+builder = GraphBuilder(llm, graph_store, settings=settings)
+await builder.build(chunks)     # see examples/04_graphrag.py
+```
+
+`ragorc graph build` reads the chunks back out of the collection rather than
+re-reading your sources, so it costs no loading and no embedding — only the
+extraction calls. It exits non-zero when chunks were read and no entity came out
+of them, because an exhausted API key and a corpus with no entities produce
+identical counts.
 
 The same reasoning applies to a corpus-wide RAPTOR tree; the per-document trees a
 streaming ingest can build are what the `raptor` stage produces.

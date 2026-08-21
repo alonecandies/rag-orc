@@ -318,6 +318,112 @@ def main(
 # ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
+graph_app = typer.Typer(no_args_is_help=True, help="Build and inspect the entity graph.")
+app.add_typer(graph_app, name="graph")
+
+
+@graph_app.command("build")
+def graph_build(
+    collection: str | None = typer.Option(
+        None, "--collection", "-c", help="Qdrant collection to read chunks from."
+    ),
+    tenant: str | None = typer.Option(None, "--tenant", "-t", help="Restrict to one tenant."),
+    limit: int | None = typer.Option(
+        None, "--limit", min=1, help="Stop after this many chunks. For a trial run."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+) -> None:
+    """Build the entity graph over an already-indexed corpus.
+
+    This is a second pass on purpose, and it is why `graph.enabled` does not build
+    the graph during ingest. Entity resolution and community detection are only
+    meaningful over the whole corpus, while ingest deliberately holds one window of
+    documents at a time — a graph built per window would resolve entities against a
+    fraction of their mentions and detect communities inside an arbitrary slice.
+
+    So: ingest first, then run this. It reads the chunks back from the collection
+    rather than re-reading your source documents, so it costs no loading or
+    embedding, only the extraction calls.
+
+    Unlike ingest, this does hold the corpus: extraction is per chunk, but
+    resolution, community detection and the write are global, which is what makes
+    the result a graph rather than a pile of per-window graphs. `--limit` bounds a
+    trial run.
+    """
+    settings = _settings(RAGORC_QDRANT__COLLECTION=collection)
+
+    async def run() -> Any:
+        from ragorc.index.graph.build import GraphBuilder
+
+        async with _service(settings) as service:
+            engine = service.linear
+            store = engine.graph_store()
+            await store.ensure_schema()
+
+            chunks: list[Any] = []
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=err,
+            ) as progress:
+                task = progress.add_task("reading chunks", total=limit)
+                async for chunk in engine.vector.scroll(tenant_id=tenant, limit=limit):
+                    chunks.append(chunk)
+                    progress.update(task, advance=1)
+
+            if not chunks:
+                _fail(
+                    "Nothing to build from",
+                    f"collection {settings.qdrant.collection!r} returned no chunks",
+                    "run `ragorc ingest` first, or check --collection and --tenant",
+                    2,
+                )
+
+            builder = GraphBuilder(engine.llm, store, settings=settings)
+            return await builder.build(chunks)
+
+    report = _run(run)
+    if as_json:
+        console.print_json(data=report.summary())
+        return
+    failed = int(report.stages.get("extract", {}).get("chunks_failed", 0) or 0)
+    table = Table(title="graph build", box=None)
+    table.add_column("stage")
+    table.add_column("count", justify="right")
+    for label, value in (
+        ("chunks read", report.chunks_in),
+        ("chunks used", report.chunks_used),
+        ("chunks failed", failed),
+        ("entities", report.entities),
+        ("entities merged", report.merged_entities),
+        ("relations", report.relations),
+        ("relations dropped", report.dangling_relations),
+        ("communities", report.communities),
+        ("entities written", report.entities_written),
+        ("relations written", report.relations_written),
+    ):
+        table.add_row(label, f"{value:,}")
+    console.print(table)
+    console.print(
+        f"[dim]cost ${report.usage.cost_usd:.4f} across {report.usage.calls} call(s)[/dim]"
+    )
+
+    # A clean table over an empty graph is the wrong thing to print. Extraction
+    # failing on every chunk — an exhausted key, a model that stopped answering —
+    # otherwise reads as "your corpus has no entities in it".
+    if report.chunks_used and not report.entities:
+        _fail(
+            "No entities extracted",
+            f"{report.chunks_used} chunk(s) were read and none produced an entity"
+            + (f"; extraction failed on {failed} of them" if failed else ""),
+            "check the log above for the per-chunk error — an exhausted API key and "
+            "a corpus with no entities look identical in the counts",
+            3,
+        )
+
+
 @app.command()
 def init(
     collection: str | None = typer.Option(

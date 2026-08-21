@@ -30,13 +30,15 @@ and no sparse or ColBERT vector, because those are added before the enrichment
 stage runs. On a hybrid collection they are findable by vector search and not by
 BM25.
 
-## 2. Corpus-wide graph construction is a manual second pass
+## 2. Closed: corpus-wide graph construction has a command
 
-`graph.enabled` records what to call on `IngestReport.warnings` and does not build
-the graph itself. Entity resolution and community detection are only meaningful
-over the whole corpus, and the ingest pipeline deliberately holds one window of
-documents at a time. `examples/04_graphrag.py` shows the second pass. A
-`ragorc graph build` command would make it a first-class step.
+`ragorc graph build` runs the second pass, reading chunks back from the collection.
+It remains a second pass on purpose — resolution and community detection are only
+meaningful over the whole corpus, and ingest holds one window of documents at a
+time.
+
+Unlike ingest it does hold the corpus in memory, because extraction is per chunk
+but resolution, detection and the write are global. `--limit` bounds a trial run.
 
 ## 3. Seven tests survive their own mutation
 

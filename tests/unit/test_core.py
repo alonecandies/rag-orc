@@ -704,3 +704,42 @@ def test_the_cache_scope_separates_requests_that_are_not_the_same_request() -> N
     # depends on how the caller happened to build the filter.
     assert scope_key({"a": 1, "b": 2}) == scope_key({"b": 2, "a": 1})
     assert scope_key(None, None) == scope_key({}, None), "no filter is an empty filter"
+
+
+def test_logging_follows_stderr_when_it_is_replaced() -> None:
+    """The logger must resolve `sys.stderr` per logger, not capture it once.
+
+    `PrintLoggerFactory(file=sys.stderr)` binds the object at configure time, so
+    anything that later swaps the stream — pytest's capture, typer's `CliRunner`,
+    a daemonizer — leaves every subsequent log line writing into a closed handle
+    and raising `ValueError: I/O operation on closed file` from inside the logger.
+    Invoking the CLI once in a test session was enough to break 200 later tests.
+
+    Asserted on the factory rather than by swapping the real `sys.stderr`, which
+    fights pytest's own capture: what matters is that the file is looked up when a
+    logger is made, not frozen when logging was configured.
+    """
+    import io
+    import sys
+
+    import structlog
+
+    from ragorc.core.telemetry import configure_logging
+
+    configure_logging("INFO", False, True)
+    factory = structlog.get_config()["logger_factory"]
+
+    original = sys.stderr
+    first, second = io.StringIO(), io.StringIO()
+    try:
+        sys.stderr = first
+        bound_first = factory()
+        sys.stderr = second
+        bound_second = factory()
+    finally:
+        sys.stderr = original
+
+    assert bound_first._file is first  # type: ignore[attr-defined]
+    assert bound_second._file is second, (  # type: ignore[attr-defined]
+        "the factory froze the stream: a later swap leaves logging on a dead handle"
+    )
