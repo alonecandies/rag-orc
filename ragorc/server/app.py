@@ -1109,6 +1109,7 @@ class RagService:
             max_cost_usd=cost.max_cost_per_query_usd if cost.track_costs else None,
             max_calls=cost.max_llm_calls_per_query,
             max_tokens=cost.max_tokens_per_query,
+            trace=self.settings.observability.trace_enabled,
         ) as (_trace, ledger):
             yield ledger
 

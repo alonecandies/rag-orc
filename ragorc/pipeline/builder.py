@@ -67,8 +67,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
 
 import orjson
@@ -94,7 +96,7 @@ from ragorc.core.protocols import (
 )
 from ragorc.core.registry import resolve
 from ragorc.core.settings import Settings, get_settings
-from ragorc.core.telemetry import configure_logging, new_request_context
+from ragorc.core.telemetry import configure_logging, current_trace, new_request_context
 from ragorc.generate.answer import AnswerGenerator
 from ragorc.generate.self_rag import SelfRAG
 from ragorc.llm.cache import LLMCache
@@ -385,7 +387,29 @@ class RAGPipeline:
         if callable(warmup):
             with contextlib.suppress(Exception):
                 await warmup()
-        if self.settings.cost.refresh_prices:
+        # A local table takes precedence over the network: a deployment that pins
+        # its prices wants the pinned numbers, and it also wants a cost estimate
+        # without an outbound call at startup. `cost.price_table_path` was
+        # documented and read by nothing, so pinning silently did nothing.
+        if self.settings.cost.price_table_path:
+            configured = self.settings.cost.price_table_path
+
+            def _read() -> Any:
+                # Expansion and the read both happen in the thread: they are
+                # syscalls, and splitting them puts one of them on the loop.
+                return json.loads(Path(configured).expanduser().read_text())
+
+            path = configured
+            try:
+                loaded = await asyncio.to_thread(_read)
+                self.model_router.prices = {
+                    str(model): {str(k): float(v) for k, v in entry.items()}
+                    for model, entry in loaded.items()
+                }
+                log.info("price_table_loaded", path=str(path), models=len(loaded))
+            except Exception as exc:  # noqa: BLE001 - estimation only, never fatal
+                log.warning("price_table_unreadable", path=str(path), error=str(exc)[:200])
+        elif self.settings.cost.refresh_prices:
             fetch = getattr(self.llm, "fetch_model_prices", None)
             if callable(fetch):
                 try:
@@ -969,6 +993,7 @@ class RAGPipeline:
             max_cost_usd=cost.max_cost_per_query_usd if cost.track_costs else None,
             max_calls=cost.max_llm_calls_per_query,
             max_tokens=cost.max_tokens_per_query,
+            trace=self.settings.observability.trace_enabled,
         ) as (trace, ledger):
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
@@ -1029,6 +1054,7 @@ class RAGPipeline:
             max_cost_usd=cost.max_cost_per_query_usd if cost.track_costs else None,
             max_calls=cost.max_llm_calls_per_query,
             max_tokens=cost.max_tokens_per_query,
+            trace=self.settings.observability.trace_enabled,
         ):
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
@@ -1158,6 +1184,20 @@ class RAGPipeline:
             cost_usd=round(answer.usage.cost_usd, 6),
             errors=len(state.get("errors") or ()),
         )
+        slow_ms = self.settings.observability.slow_query_ms
+        elapsed_ms = sum(step.duration_ms for step in current_trace())
+        if slow_ms and elapsed_ms > slow_ms:
+            # A separate line at WARNING, because that is what an operator alerts
+            # on. The threshold was configurable and compared against nothing, so
+            # a deployment could not say what "slow" meant for it.
+            log.warning(
+                "query_slow",
+                request_id=request_id,
+                duration_ms=round(elapsed_ms, 1),
+                threshold_ms=slow_ms,
+                pipeline=name,
+                calls=answer.usage.calls,
+            )
         return answer
 
     # ------------------------------------------------------------------
@@ -1295,10 +1335,6 @@ class RAGPipeline:
                 closers.append(store)
         if self._ingest is not None:
             closers.append(self._ingest)
-        # The embedders and the reranker were missing from this list, so a
-        # pipeline on a hosted embedding provider leaked one connection pool per
-        # instance — invisible in a script that exits, fatal in a long-lived
-        # service that rebuilds pipelines per tenant.
         # The embedders and the reranker were missing from this list, so a
         # pipeline on a hosted embedding provider leaked one connection pool per
         # instance — invisible in a script that exits, fatal in a long-lived

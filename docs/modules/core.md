@@ -43,7 +43,7 @@ class Retriever(Protocol):
 
 `LLM`, `DenseEmbedder`, `SparseEmbedder`, `LateInteractionEmbedder`, `Reranker`,
 `VectorStore`, `RelationalStore`, `GraphStore`, `Cache`, `Loader`, `Splitter`,
-`QueryTranslator`, `Router`, `QueryConstructor`, `Retriever`, `Compressor`,
+`BatchStructuredLLM · QueryTranslator`, `Router`, `QueryConstructor`, `Retriever`, `Compressor`,
 `Grader`, `ContextPacker`, `Generator`.
 
 ## Settings, registry, ids, tokens

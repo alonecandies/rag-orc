@@ -264,20 +264,29 @@ def new_request_context(
     max_cost_usd: float | None = None,
     max_calls: int | None = None,
     max_tokens: int | None = None,
+    trace: bool = True,
 ) -> Iterator[tuple[list[StepTrace], CostLedger]]:
     """Install a fresh trace and ledger for one request.
 
     Uses contextvars, so concurrent requests in the same event loop keep
     separate traces and budgets without passing either through every signature.
+
+    ``trace=False`` collects no steps. That is a privacy control rather than a
+    performance one: a step trace records what each stage did with the retrieved
+    passages, it is attached to every ``Answer``, and ``observability.log_prompts``
+    is off by default for exactly the same reason. The switch meant to turn it off
+    — ``observability.trace_enabled`` — was read by nothing, so there was no way
+    to decline.
     """
-    trace: list[StepTrace] = []
+    steps: list[StepTrace] = []
+    trace_list: list[StepTrace] | None = steps if trace else None
     ledger = CostLedger(max_cost_usd=max_cost_usd, max_calls=max_calls, max_tokens=max_tokens)
-    trace_token = _trace_var.set(trace)
+    trace_token = _trace_var.set(trace_list)
     ledger_token = _ledger_var.set(ledger)
     if request_id:
         structlog.contextvars.bind_contextvars(request_id=request_id)
     try:
-        yield trace, ledger
+        yield steps, ledger
     finally:
         _trace_var.reset(trace_token)
         _ledger_var.reset(ledger_token)

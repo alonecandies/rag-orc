@@ -338,7 +338,6 @@ class CacheSettings(BaseModel):
 
     cache_llm: bool = True
     cache_embeddings: bool = True
-    cache_retrieval: bool = True
     cache_rerank: bool = True
     cache_schema: bool = True
 
@@ -563,7 +562,6 @@ class GraphSettings(BaseModel):
     local_search_top_entities: int = 10
     local_search_top_chunks: int = 10
     global_search_top_communities: int = 8
-    global_search_map_reduce: bool = True
 
     multihop_enabled: bool = True
     multihop_max_iterations: int = 3
@@ -624,11 +622,15 @@ class RetrievalSettings(BaseModel):
     reorder_lost_in_middle: bool = True
     """Models attend most to the beginning and end of context. Placing the
     strongest evidence at both ends measurably improves answer accuracy."""
-    filter_contradictions: bool = False
 
     # --- compression -----------------------------------------------------
     compression_enabled: bool = False
-    compressor: Literal["extract", "embedding_filter", "both", "none"] = "embedding_filter"
+    compressor: Literal["extract", "embedding_filter", "sentence", "both", "none"] = (
+        "embedding_filter"
+    )
+    """``sentence`` selects :class:`~ragorc.retrieve.compress.SentenceLevelCompressor`,
+    which `build_compressor` has always supported and this Literal used to reject —
+    the one option documented in the README that no configuration could reach."""
     compression_ratio: float = 0.5
 
     # --- CRAG ------------------------------------------------------------
@@ -710,8 +712,6 @@ class ObservabilitySettings(BaseModel):
     log_level: str = "INFO"
     log_json: bool = True
     trace_enabled: bool = True
-    otel_endpoint: str = ""
-    prometheus_port: int | None = None
     log_prompts: bool = False
     """Off by default: prompts contain retrieved customer data."""
     slow_query_ms: float = 5000.0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pathlib
 
 import numpy as np
@@ -28,6 +29,7 @@ from ragorc.core.models import (
     dedupe_scored,
 )
 from ragorc.core.registry import available, register, resolve
+from ragorc.core.settings import Settings
 from ragorc.core.telemetry import (
     CostLedger,
     _redact_secrets,
@@ -596,3 +598,84 @@ def test_log_redactor_scrubs_values_not_only_secret_keys() -> None:
     assert "abcdef0123456789" not in event["body"]
     assert event["api_key"].endswith("***"), "the key-name rule must still apply"
     assert event["event"] == "provider_error"
+
+
+# ---------------------------------------------------------------------------
+# Settings that used to be inert
+# ---------------------------------------------------------------------------
+def test_trace_can_be_switched_off() -> None:
+    """`observability.trace_enabled` was read by nothing.
+
+    That is a privacy control, not a performance one: a step trace records what
+    each stage did with the retrieved passages, it is attached to every `Answer`,
+    and `log_prompts` is off by default for exactly the same reason. There was no
+    way to decline.
+    """
+    from ragorc.core.telemetry import current_trace, new_request_context, trace_step
+
+    with new_request_context(trace=True) as (steps, _):
+        trace_step("retrieve", 12.0, passage="a customer's private text")
+        assert len(current_trace()) == 1
+    assert len(steps) == 1
+
+    with new_request_context(trace=False) as (steps, _):
+        trace_step("retrieve", 12.0, passage="a customer's private text")
+        assert current_trace() == [], "nothing must be collected when tracing is off"
+    assert steps == []
+
+
+async def test_the_retry_policy_comes_from_settings() -> None:
+    """`llm.max_retries` was a documented knob attached to nothing: the policy was
+    a decorator evaluated at import, so it was frozen before any configuration
+    existed."""
+    import httpx
+
+    from ragorc.core.settings import LLMSettings
+    from ragorc.llm.openrouter import OpenRouterLLM
+
+    calls = {"n": 0}
+
+    def _always_503(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="upstream busy")
+
+    for configured in (1, 3):
+        calls["n"] = 0
+        llm = OpenRouterLLM(
+            settings=LLMSettings(
+                api_key="sk-test",
+                max_retries=configured,
+                retry_base_delay_s=0.001,
+                retry_max_delay_s=0.002,
+            )
+        )
+        llm._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(_always_503), base_url="http://provider.invalid"
+        )
+        with contextlib.suppress(Exception):
+            await llm.complete("hi")
+        await llm.aclose()
+        assert calls["n"] == configured, f"max_retries={configured} made {calls['n']} attempts"
+
+
+def test_the_inert_settings_are_gone_rather_than_pretending() -> None:
+    """A flag that reads as configuration and changes nothing is worse than no
+    flag: it is a promise the code does not keep. These had no reader anywhere,
+    and the machinery behind them does not exist, so they were removed rather
+    than left as decoration."""
+    settings = Settings()
+    for section, field in (
+        ("retrieval", "filter_contradictions"),
+        ("cache", "cache_retrieval"),
+        ("graph", "global_search_map_reduce"),
+        ("observability", "otel_endpoint"),
+        ("observability", "prometheus_port"),
+    ):
+        assert not hasattr(getattr(settings, section), field), f"{section}.{field} came back"
+
+
+def test_the_sentence_compressor_can_now_be_selected() -> None:
+    """`build_compressor` always supported it; the settings Literal rejected the
+    name, making it the one README-documented option no configuration could
+    reach."""
+    assert Settings(retrieval={"compressor": "sentence"}).retrieval.compressor == "sentence"

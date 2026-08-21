@@ -589,6 +589,7 @@ class SyntheticQuestionGenerator:
             max_cost_usd=cost.max_cost_per_query_usd,
             max_calls=cost.max_llm_calls_per_query,
             max_tokens=cost.max_tokens_per_query,
+            trace=self.settings.observability.trace_enabled,
         ):
             generated, usage = await self.llm.structured(
                 prompt.render(passage=passage, n=self.questions_per_chunk),

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -256,7 +256,6 @@ class NoiseReport:
     near_duplicates: int = 0
     below_threshold: int = 0
     diversity_dropped: int = 0
-    contradictions: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def removed(self) -> int:

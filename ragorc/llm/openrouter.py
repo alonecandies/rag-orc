@@ -243,8 +243,23 @@ class OpenRouterLLM:
         return redact_identifiers(text[:limit])
 
     # -- core call ---------------------------------------------------------
-    @retry_async(max_attempts=4, retry_on=(TransientError,))
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Post one completion, retrying transient failures.
+
+        The retry policy comes from settings. It used to be a decorator evaluated
+        at import — `@retry_async(max_attempts=4, ...)` — which froze the policy
+        before any configuration existed, so `llm.max_retries`,
+        `retry_base_delay_s` and `retry_max_delay_s` were three documented knobs
+        that could not move anything.
+        """
+        return await retry_async(
+            max_attempts=max(1, self.settings.max_retries),
+            base_delay=self.settings.retry_base_delay_s,
+            max_delay=self.settings.retry_max_delay_s,
+            retry_on=(TransientError,),
+        )(self._post_once)(body)
+
+    async def _post_once(self, body: dict[str, Any]) -> dict[str, Any]:
         await self._limiter.acquire()
         async with self._semaphore:
             loop = asyncio.get_running_loop()

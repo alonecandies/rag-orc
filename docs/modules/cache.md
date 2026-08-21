@@ -87,6 +87,5 @@ cross-tenant data leak with a latency improvement.
 `cache.semantic_collection` · `semantic_ttl_s` | a small Qdrant collection, TTL by payload filter |
 `cache.cache_llm` | completions and structured output |
 `cache.cache_embeddings` | content-hash keyed vectors |
-`cache.cache_retrieval` | retrieval result sets |
 `cache.cache_rerank` | cross-encoder scores, keyed on (query, document) |
 `cache.cache_schema` | Postgres/Neo4j introspection for the Text-to-SQL prompt |
