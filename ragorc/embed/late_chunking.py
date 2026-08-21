@@ -96,6 +96,7 @@ from ragorc.core.concurrency import bounded_gather
 from ragorc.core.errors import EmbeddingError
 from ragorc.core.models import ChunkingStrategy, FloatArray
 from ragorc.core.settings import Settings, get_settings
+from ragorc.embed._runtime import register_shutdown_hook
 from ragorc.embed.base import l2_normalize, run_in_thread
 
 log = structlog.get_logger(__name__)
@@ -112,6 +113,24 @@ _SPECIAL_TOKEN_SLACK = 4
 
 _TORCH_MODELS: dict[tuple[str, str], tuple[Any, Any, int]] = {}
 _TORCH_LOCK = threading.Lock()
+
+
+def clear_model_cache() -> int:
+    """Drop every cached torch model. Returns how many were released.
+
+    Registered as a shutdown hook for the reason in :mod:`ragorc.embed._runtime`:
+    a process that exits with native model sessions still alive can abort during
+    static destruction rather than exiting cleanly. That module promised to
+    release "the cached models"; until this existed it released FastEmbed's and
+    left these, so a late-chunking deployment got none of the mitigation.
+    """
+    with _TORCH_LOCK:
+        count = len(_TORCH_MODELS)
+        _TORCH_MODELS.clear()
+    return count
+
+
+register_shutdown_hook(clear_model_cache)
 
 
 class _TokenBackend(Protocol):

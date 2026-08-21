@@ -61,7 +61,7 @@ __all__ = ["configure_onnx_runtime", "register_shutdown_hook"]
 _TELEMETRY_ENV = "ORT_DISABLE_TELEMETRY"
 
 _configured = False
-_hook_registered = False
+_hooks_registered: set[Any] = set()
 
 
 def configure_onnx_runtime() -> None:
@@ -108,21 +108,27 @@ def configure_onnx_runtime() -> None:
 
 
 def register_shutdown_hook(release: Any) -> None:
-    """Register ``release`` to drop ONNX sessions at interpreter exit. Idempotent.
+    """Register ``release`` to drop cached model sessions at interpreter exit.
 
-    ``release`` is expected to be :func:`ragorc.embed.fastembed_provider.clear_model_cache`;
-    it is passed in rather than imported to keep this module free of a circular
-    dependency on its caller.
+    Idempotent **per callable**, not globally. It used to be guarded by a single
+    module-level flag, which made it idempotent in the wrong sense: the first
+    caller registered and every later one was silently dropped. Three modules in
+    this package cache native sessions — FastEmbed's ONNX models, the
+    late-chunking torch models and the sentence-transformers models — and only
+    whichever imported first was ever released, while the module docstring above
+    promised all of them.
+
+    ``release`` is passed in rather than imported to keep this module free of a
+    circular dependency on its callers.
 
     The handler is deliberately silent about failures. It runs during shutdown,
     when logging handlers may already be closed, and an exception raised from an
     ``atexit`` callback is printed to stderr as an unhandled error — producing
     exactly the noisy, alarming exit this module exists to prevent.
     """
-    global _hook_registered
-    if _hook_registered:
+    if release in _hooks_registered:
         return
-    _hook_registered = True
+    _hooks_registered.add(release)
 
     def _release() -> None:
         with contextlib.suppress(Exception):

@@ -326,3 +326,74 @@ async def test_late_chunking_never_substitutes_another_model() -> None:
         "different embedding space"
     )
     assert "colbert" not in source.model_name.lower()
+
+
+# ---------------------------------------------------------------------------
+# Every native model cache is released before static destruction
+# ---------------------------------------------------------------------------
+def test_every_model_cache_registers_a_shutdown_hook() -> None:
+    """`ragorc.embed._runtime` exists because a process that exits with native
+    model sessions still alive can abort during static destruction — SIGABRT after
+    the work completed, which reads as a failure to CI and to the operator.
+
+    Its mitigation is an `atexit` handler that drops "the cached models". Three
+    modules in this package cache them, and `register_shutdown_hook` was guarded
+    by one module-level boolean — so it was idempotent in the wrong sense: the
+    first importer registered and the rest were silently dropped. A deployment on
+    late chunking or sentence-transformers got none of the mitigation it is
+    documented to have.
+    """
+    import importlib
+
+    from ragorc.embed import _runtime
+
+    modules = [
+        "ragorc.embed.fastembed_provider",
+        "ragorc.embed.late_chunking",
+        "ragorc.embed.sentence_transformers_provider",
+    ]
+    releases = []
+    for name in modules:
+        module = importlib.import_module(name)
+        release = getattr(module, "clear_model_cache", None)
+        assert callable(release), f"{name} caches native models and cannot release them"
+        assert release in _runtime._hooks_registered, (
+            f"{name}.clear_model_cache is never registered, so its sessions outlive the "
+            "interpreter and race the C++ runtime's static destructors"
+        )
+        releases.append(release)
+
+    assert len(set(releases)) == 3, "each module must register its own cache, not share one"
+
+
+def test_registering_a_second_hook_is_not_swallowed() -> None:
+    """The regression that hid the gap above: a global flag made the *second* and
+    later registrations no-ops rather than making each one idempotent."""
+    import atexit
+
+    from ragorc.embed import _runtime
+
+    calls: list[str] = []
+
+    def first() -> None:
+        calls.append("first")
+
+    def second() -> None:
+        calls.append("second")
+
+    registered: list[object] = []
+    original = atexit.register
+    try:
+        atexit.register = lambda fn, *a, **k: (registered.append(fn), fn)[1]  # type: ignore[assignment]
+        _runtime.register_shutdown_hook(first)
+        _runtime.register_shutdown_hook(second)
+        _runtime.register_shutdown_hook(first)  # idempotent per callable
+    finally:
+        atexit.register = original  # type: ignore[assignment]
+        _runtime._hooks_registered.discard(first)
+        _runtime._hooks_registered.discard(second)
+
+    assert len(registered) == 2, "both distinct hooks must register; neither twice"
+    for hook in registered:
+        hook()  # type: ignore[operator]
+    assert calls == ["first", "second"]

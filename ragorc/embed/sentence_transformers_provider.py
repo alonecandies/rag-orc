@@ -41,6 +41,7 @@ from ragorc.core.errors import EmbeddingError
 from ragorc.core.models import FloatArray
 from ragorc.core.registry import register
 from ragorc.core.settings import Settings, get_settings
+from ragorc.embed._runtime import register_shutdown_hook
 from ragorc.embed.base import BaseEmbedder, run_in_thread
 from ragorc.embed.cache import EmbeddingCache
 
@@ -50,6 +51,23 @@ __all__ = ["STCrossEncoderReranker", "STEmbedder", "detect_device"]
 
 _MODELS: dict[tuple[str, str, str], Any] = {}
 _LOAD_LOCK = threading.Lock()
+
+
+def clear_model_cache() -> int:
+    """Drop every cached model. Returns how many were released.
+
+    Registered as a shutdown hook for the reason in :mod:`ragorc.embed._runtime`:
+    a process that exits with native model sessions still alive can abort during
+    static destruction. Until this existed only FastEmbed's cache was released,
+    so a deployment on this provider got none of the mitigation.
+    """
+    with _LOAD_LOCK:
+        count = len(_MODELS)
+        _MODELS.clear()
+    return count
+
+
+register_shutdown_hook(clear_model_cache)
 
 _IMPORT_HINT = "sentence-transformers and torch are required: pip install 'ragorc[local]'"
 
