@@ -1353,6 +1353,26 @@ async def load(
     if path is not None and path.is_dir():
         return await DirectoryLoader(**common, **kwargs).load(path)
     if path is not None and path.is_file():
+        # The ceiling applies to a named file too, not only to files found by
+        # walking a directory. `DirectoryLoader` skipped oversize files while this
+        # branch read them whole into memory, so the limit was avoidable by naming
+        # the file — and the validator rejects it afterwards regardless, making the
+        # read pure waste. Raised rather than skipped: the caller named this path,
+        # and a silent skip is an ingest that reports success having indexed
+        # nothing.
+        # Popped, not read: `max_bytes` is a DirectoryLoader parameter, and
+        # forwarding it to a single-file loader is a TypeError. It was already one
+        # before this check existed, which is a trap either way — the same call
+        # works on a directory and fails on a file.
+        ceiling = int(kwargs.pop("max_bytes", None) or MAX_FILE_BYTES)
+        size = path.stat().st_size
+        if size > ceiling:
+            raise ValidationFailed(
+                "file exceeds the loader size ceiling",
+                path=str(path),
+                bytes=size,
+                limit_bytes=ceiling,
+            )
         return await loader_for(path.suffix)(**common, **kwargs).load(path)
 
     if isinstance(source, (str, bytes, bytearray)):

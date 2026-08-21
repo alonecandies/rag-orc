@@ -165,7 +165,35 @@ database whether or not the model cooperated.
 Single-tenant deployments are unaffected: with `enforce_tenant_isolation=false`
 there is nothing to enforce and nothing is refused.
 
-## 4. PII
+## 4. Server-side paths are opt-in, and the opt-in is an environment variable
+
+Two endpoints accept a path for the *service* to open: `POST /ingest` (`paths[]`)
+and `POST /eval` (`dataset`). Both compose badly with the read-back channel —
+`/query` returns chunk text verbatim in `QueryResponse.chunks[]`, and an eval
+response quotes the dataset — so an unconfined path is an arbitrary local file
+read with a way to get the bytes back out, reachable by anyone who can open the
+port (`server.api_keys` is empty by default).
+
+Both are confined to `RAGORC_INGEST_ROOTS`, an OS-path-separated list:
+
+```bash
+export RAGORC_INGEST_ROOTS=/srv/corpus:/srv/datasets
+```
+
+**An empty allowlist refuses every server-side path** rather than allowing every
+path, and unset is the default every deployment gets. Inline `text` and multipart
+uploads carry their own bytes and are unaffected, which is why refusing costs the
+common deployment nothing.
+
+It is an environment variable rather than a setting on purpose: it belongs with
+`ReadOnlyPaths=` in a unit file, not in the RAG configuration tree. A confinement
+boundary a request body could reach — settings are echoed by `/health`, and
+`Settings` is constructible from any dict — is not a boundary.
+
+Both paths are also size-bounded, because both are read whole into a process that
+is serving queries at the same time.
+
+## 5. PII
 
 Regex detection with checksum validation where the format allows it — a 16-digit
 string is only a card number if it passes Luhn, and an IBAN only if mod-97 holds.
@@ -176,7 +204,7 @@ Detectors: EMAIL, PHONE, CREDIT_CARD (Luhn), SSN, IBAN (mod-97), IP, AWS keys,
 private keys, JWTs. Actions: `redact`, `hash` (stable, so entities stay joinable
 after redaction), `flag`.
 
-## 5. Secrets and logs
+## 6. Secrets and logs
 
 - All credentials are `SecretStr`; `Settings.summary()` is redaction-safe.
 - The log processor redacts any key containing `api_key`, `password`, `token`,

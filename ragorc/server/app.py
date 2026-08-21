@@ -1431,6 +1431,11 @@ def _inline_document(request: IngestRequest, tenant: str | None) -> Document:
     )
 
 
+_MAX_EVAL_DATASET_BYTES = 64 * 1024 * 1024
+"""Ceiling on a server-side eval dataset. Generous — a dataset with reference
+answers is legitimately megabytes — but finite, because the file is read whole
+into a process that is also serving queries."""
+
 _INGEST_ROOTS_ENV = "RAGORC_INGEST_ROOTS"
 """Env var holding the directories an HTTP caller may ingest from.
 
@@ -1562,13 +1567,30 @@ async def load_eval_items(request: EvalRequest) -> list[EvalItem]:
     location = request.dataset
 
     def _read() -> tuple[Path, bytes]:
-        # Expansion, existence and the read all happen in the thread. Every one of
-        # them is a syscall — on a network filesystem, a slow one — and doing them
-        # one at a time from the loop would stall it three times to answer one
-        # question, with a race between the check and the read for free.
-        path = Path(location).expanduser()
+        # Expansion, confinement, existence and the read all happen in the thread.
+        # Every one of them is a syscall — on a network filesystem, a slow one —
+        # and doing them one at a time from the loop would stall it three times to
+        # answer one question, with a race between the check and the read for free.
+        #
+        # Confined to the same roots as POST /ingest, and for the same reason:
+        # `dataset` is a caller-supplied server-side path, and an eval response
+        # quotes the dataset's contents back. Without this it was an arbitrary
+        # local file read with a read-back channel — the exact hole /ingest was
+        # fixed for, reachable through a different door. An empty allowlist
+        # refuses every path rather than allowing every path.
+        (path,) = _resolve_paths([location], roots=_ingest_roots())
         if not path.is_file():
-            raise ValidationFailed("eval dataset not found", path=str(path))
+            raise ValidationFailed("eval dataset is not a file", path=str(path))
+        size = path.stat().st_size
+        if size > _MAX_EVAL_DATASET_BYTES:
+            # Bounded for the same reason request bodies are: this is read whole
+            # into memory in a process that is also serving queries.
+            raise ValidationFailed(
+                "eval dataset is too large",
+                path=str(path),
+                bytes=size,
+                limit_bytes=_MAX_EVAL_DATASET_BYTES,
+            )
         return path, path.read_bytes()
 
     path, raw = await asyncio.to_thread(_read)
@@ -2429,19 +2451,36 @@ def _request_id(request: Any) -> str:
     return getattr(request.state, "request_id", "") or _new_request_id()
 
 
+async def _read_bounded(request: Any, limit: int) -> bytes:
+    """Read a request body, stopping as soon as it passes ``limit``.
+
+    ``await request.body()`` materializes first and checks second. For a chunked
+    request that is the whole exposure: it declares no ``Content-Length``, so the
+    middleware's early check never fires, and the only remaining limit was applied
+    to a body already resident in memory. Accumulating from the stream keeps the
+    rejection ahead of the allocation, which is the point of having a limit.
+    """
+    parts: list[bytes] = []
+    total = 0
+    async for part in request.stream():
+        total += len(part)
+        if total > limit:
+            raise ValidationFailed(
+                "request body exceeds server.max_body_bytes",
+                limit_bytes=limit,
+                received_bytes=total,
+            )
+        parts.append(part)
+    return b"".join(parts)
+
+
 async def _json_body(request: Any, model: type[Any], settings: Settings) -> Any:
     """Parse and validate a JSON body that the route could not declare.
 
-    The length is re-checked after reading: ``Content-Length`` is a claim, and a
-    chunked request does not make one at all.
+    Read under a bound rather than read then measured: ``Content-Length`` is a
+    claim, and a chunked request does not make one at all.
     """
-    raw = await request.body()
-    if len(raw) > settings.server.max_body_bytes:
-        raise ValidationFailed(
-            "request body exceeds server.max_body_bytes",
-            limit_bytes=settings.server.max_body_bytes,
-            received_bytes=len(raw),
-        )
+    raw = await _read_bounded(request, settings.server.max_body_bytes)
     try:
         payload = orjson.loads(raw or b"{}")
     except orjson.JSONDecodeError as exc:

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -292,3 +292,94 @@ async def test_provider_body_is_redacted_where_it_is_captured() -> None:
     )
     assert "deadbeefcafe1234" not in detail
     assert "user_EXAMPLEaccountEXAMPLE00000" not in detail
+
+
+# ---------------------------------------------------------------------------
+# The other two doors into the filesystem and into memory
+# ---------------------------------------------------------------------------
+async def test_eval_dataset_is_confined_to_the_same_roots_as_ingest(
+    settings: Settings, corpus: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/eval`'s `dataset` is a caller-supplied server-side path too.
+
+    It was read with `Path(location).expanduser()` and no confinement at all,
+    while an eval response quotes the dataset's contents back — the same
+    arbitrary-read-with-a-read-back-channel that `/ingest` was fixed for, through
+    a different door.
+    """
+    from ragorc.server.app import load_eval_items
+
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"question": "q", "expected_answer": "a"}\n')
+    inside = corpus / "dataset.jsonl"
+    inside.write_text('{"question": "q", "expected_answer": "a"}\n')
+
+    class _Req:
+        def __init__(self, dataset: str) -> None:
+            self.dataset = dataset
+            self.items: list[Any] = []
+
+    monkeypatch.setenv(_INGEST_ROOTS_ENV, str(corpus))
+    assert len(await load_eval_items(_Req(str(inside)))) == 1, "a confined path must still work"
+
+    with pytest.raises(ValidationFailed) as exc:
+        await load_eval_items(_Req(str(outside)))
+    assert "outside" in str(exc.value).lower() or "root" in str(exc.value).lower()
+
+    monkeypatch.delenv(_INGEST_ROOTS_ENV, raising=False)
+    with pytest.raises(ValidationFailed):
+        await load_eval_items(_Req(str(inside)))
+
+
+async def test_an_oversized_eval_dataset_is_refused_before_it_is_read(
+    corpus: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is read whole into a process that is also serving queries."""
+    from ragorc.server import app as app_module
+
+    big = corpus / "big.jsonl"
+    big.write_text('{"question": "q", "expected_answer": "a"}\n' * 200)
+    monkeypatch.setenv(_INGEST_ROOTS_ENV, str(corpus))
+    monkeypatch.setattr(app_module, "_MAX_EVAL_DATASET_BYTES", 64)
+
+    class _Req:
+        dataset = str(big)
+        items: ClassVar[list[Any]] = []
+
+    with pytest.raises(ValidationFailed) as exc:
+        await app_module.load_eval_items(_Req())
+    assert "too large" in str(exc.value)
+
+
+async def test_a_chunked_body_is_rejected_before_it_is_all_in_memory() -> None:
+    """`Content-Length` is a claim, and a chunked request makes none.
+
+    The middleware's early check keys off that header, so it never fires here,
+    and the only remaining limit ran on a body already materialized by
+    `await request.body()`. The read now stops at the ceiling instead.
+    """
+    from ragorc.server.app import _read_bounded
+
+    sent: list[int] = []
+
+    class _Streaming:
+        async def stream(self):  # noqa: ANN202
+            for _ in range(100):
+                sent.append(1)
+                yield b"x" * 1024
+
+    with pytest.raises(ValidationFailed) as exc:
+        await _read_bounded(_Streaming(), 4096)
+    assert exc.value.detail.get("limit_bytes") == 4096
+    assert len(sent) < 100, f"stopped after {len(sent)} chunks, not the whole body"
+
+
+async def test_a_body_within_the_bound_is_returned_whole() -> None:
+    from ragorc.server.app import _read_bounded
+
+    class _Streaming:
+        async def stream(self):  # noqa: ANN202
+            yield b'{"a":'
+            yield b"1}"
+
+    assert await _read_bounded(_Streaming(), 4096) == b'{"a":1}'
