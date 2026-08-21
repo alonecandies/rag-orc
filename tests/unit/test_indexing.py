@@ -1118,3 +1118,55 @@ async def test_a_chunk_that_already_has_a_matrix_is_not_re_embedded() -> None:
     late.batches = 0
     await pipeline._add_colbert([done, todo], IngestReport())
     assert late.batches == 0, "nothing left to do must cost nothing"
+
+
+# ---------------------------------------------------------------------------
+# Derived units are searched the same way leaf chunks are
+# ---------------------------------------------------------------------------
+async def test_derived_units_carry_every_vector_the_collection_declares() -> None:
+    """A summary unit replaces its source as the retrieval target, so it has to be
+    reachable by every leg the collection declares.
+
+    Sparse and ColBERT ran before the enrichment stage that creates these units,
+    so they carried the dense vector their indexer computed and nothing else: on a
+    hybrid collection they were findable by vector search and invisible to BM25 —
+    silently half-indexed, which is worse than absent because the recall gap has
+    no symptom.
+    """
+    from ragorc.core.models import ChunkingStrategy, Document
+    from ragorc.index.pipeline import IngestPipeline, IngestReport
+    from tests.fakes import FakeVectorStore, StubEmbedder, StubLLM, StubSparseEmbedder
+
+    class _Docstore:
+        async def upsert_chunks(self, chunks: Any) -> None: ...
+
+    pipeline = IngestPipeline(
+        llm=StubLLM(),
+        dense_embedder=StubEmbedder(dimension=32),
+        sparse_embedder=StubSparseEmbedder(),
+        vector_store=FakeVectorStore(),
+        relational_store=_Docstore(),
+        settings=Settings(
+            security={"enforce_tenant_isolation": False},
+            cache={"enabled": False},
+            embedding={"dense_dimension": 32},
+            indexing={
+                "splitter": "recursive",
+                "skip_unchanged": False,
+                "summary_index_enabled": True,
+            },
+            retrieval={"use_sparse": True},
+        ),
+    )
+    pipeline._stages = pipeline._build_stages(IngestReport())
+    assert pipeline._stages, "the multirep stage must be loadable for this to test anything"
+
+    document = Document(id="d1", content="Refunds are processed within five business days. " * 60)
+    chunks = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport())
+
+    derived = [c for c in chunks if c.metadata.get("representation") == "summary"]
+    assert derived, "the stage must have produced summary units to assert on"
+    assert all(c.dense is not None for c in derived), "the indexer computes this one"
+    assert all(c.sparse is not None and len(c.sparse) for c in derived), (
+        "a derived unit invisible to BM25 is half-indexed on a hybrid collection"
+    )

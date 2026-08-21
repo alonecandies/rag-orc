@@ -1161,10 +1161,17 @@ class IngestPipeline:
         if not chunks:
             return []
 
+        # Dense first because two enrichment stages read it: RAPTOR clusters on the
+        # leaf vectors, and the summary indexer needs its sources embedded. Sparse
+        # and ColBERT after, because no stage reads either one and running them
+        # last is what gets them onto the units a stage *adds*. Before, a summary
+        # or proposition unit carried only the dense vector its own indexer
+        # computed, so on a hybrid collection it was findable by vector search and
+        # invisible to BM25 — half-indexed, with no symptom to notice.
         await self._embed_dense(document, chunks, strategy, report)
+        await self._enrich(document, chunks, report)
         await self._add_sparse(chunks, report)
         await self._add_colbert(chunks, report)
-        await self._enrich(document, chunks, report)
         if docstore_only:
             # Parents are written here and nowhere else: nothing searches them, so
             # a vector on them is a vector no query will ever reach, and the
