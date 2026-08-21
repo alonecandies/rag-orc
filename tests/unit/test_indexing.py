@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import pytest
@@ -654,22 +655,34 @@ def _stub_pipeline(**settings_kwargs):  # noqa: ANN003, ANN202
     )
 
 
-def test_an_enabled_stage_that_cannot_load_is_reported_not_just_logged() -> None:
+def test_an_enabled_stage_that_cannot_load_is_reported_not_just_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The failure mode that hid two unreachable features.
 
-    `indexing.summary_index_enabled` resolves a plugin by factory name. When no
-    such factory exists the stage is dropped, and until now that was a log line
-    the caller never saw: the ingest returned success with `llm_calls=0` and an
-    empty warnings list, so nothing distinguished "summarised every chunk" from
-    "silently did not run".
+    A stage is resolved by factory name, and when no such factory exists it is
+    dropped — which used to be a log line the caller never saw: the ingest
+    returned success with `llm_calls=0` and an empty warnings list, so nothing
+    distinguished "summarised every chunk" from "silently did not run".
+
+    Driven with a deliberately unresolvable stage rather than a real one, so the
+    test keeps testing the reporting after the real stages are fixed.
     """
-    from ragorc.index.pipeline import IngestReport
+    from ragorc.index import pipeline as pipeline_module
+    from ragorc.index.pipeline import IngestReport, _Plugin
+
+    ghost = _Plugin(
+        label="multirep",
+        modules=("ragorc.index.multirep",),
+        factories=("NoSuchFactory", "AlsoMissing"),
+    )
+    monkeypatch.setattr(pipeline_module, "_OPTIONAL_STAGES", (ghost,))
 
     pipeline = _stub_pipeline(indexing={"summary_index_enabled": True})
     report = IngestReport()
     built = pipeline._build_stages(report)
 
-    assert "multirep" not in [plugin.label for plugin, _ in built]
+    assert built == []
     assert any("multirep" in w and "unavailable" in w for w in report.warnings), report.warnings
     # The hint must name the real cause. "pip install ragorc[...]" would send the
     # operator to fix an install that is not the problem.
@@ -767,3 +780,104 @@ async def test_an_empty_directory_still_reports_nothing_to_do(tmp_path) -> None:
     report = await _stub_pipeline().ingest(tmp_path)
     assert report.documents_in == 0
     assert report.strategy == "auto", "the strategy is never resolved when there is no work"
+
+
+# ---------------------------------------------------------------------------
+# Multi-representation indexing as an ingest stage
+# ---------------------------------------------------------------------------
+async def test_multirep_returns_its_units_and_writes_none_of_them() -> None:
+    """Write ownership is the whole design question, and it has one answer.
+
+    `_process_document` embeds the leaf chunks, calls the stage, and then writes
+    whatever comes back. An indexer that also upserted would write the same ids
+    twice and race the pipeline's own vectors, so the façade withholds
+    `vector_store` — the indexers build and embed, and the pipeline writes.
+    """
+    from ragorc.core.models import Chunk, Document
+    from ragorc.index.multirep import MultiRepresentationIndexer
+    from tests.fakes import StubEmbedder, StubLLM
+
+    class _Recording:
+        """Records both write channels so the test can tell them apart."""
+
+        def __init__(self) -> None:
+            self.vector_upserts: list[Any] = []
+            self.docstore_writes: list[Any] = []
+
+        async def upsert(self, chunks: Any) -> None:
+            self.vector_upserts.append(list(chunks))
+
+        async def upsert_chunks(self, chunks: Any) -> None:
+            self.docstore_writes.append(list(chunks))
+
+    store = _Recording()
+    document = Document(id="d1", content="Refunds take five days. " * 40)
+    chunks = [
+        Chunk(
+            id=f"c{i}",
+            content="Refunds are processed within five business days. " * 40,
+            document_id="d1",
+        )
+        for i in range(3)
+    ]
+
+    stage = MultiRepresentationIndexer(
+        StubLLM(),
+        embedder=StubEmbedder(),
+        settings=Settings(
+            indexing={"summary_index_enabled": True},
+            security={"enforce_tenant_isolation": False},
+        ),
+    )
+    produced, usage = await stage.enrich(document, chunks, relational_store=store)
+
+    assert produced, "the stage must hand back the units it built"
+    assert usage.calls, "summarising costs model calls and they must be billed"
+    assert store.vector_upserts == [], "a vector write here duplicates the pipeline's"
+    # The docstore write is not a duplicate: the derived unit replaces its source
+    # in the vector store, and expand_parents reads that source back at query
+    # time. Without it, retrieval returns units whose sources do not exist.
+    assert store.docstore_writes, "the sources must still be persisted for expansion"
+
+
+async def test_multirep_is_a_no_op_when_no_flag_is_set() -> None:
+    """It is registered unconditionally, so it must cost nothing when unused."""
+    from ragorc.core.models import Chunk, Document
+    from ragorc.index.multirep import MultiRepresentationIndexer
+    from tests.fakes import StubEmbedder, StubLLM
+
+    llm = StubLLM()
+    chunks = [Chunk(id="c1", content="text", document_id="d1")]
+    stage = MultiRepresentationIndexer(
+        llm,
+        embedder=StubEmbedder(),
+        settings=Settings(security={"enforce_tenant_isolation": False}),
+    )
+    produced, usage = await stage.enrich(Document(id="d1", content="text"), chunks)
+
+    assert [c.id for c in produced] == ["c1"], "the chunks must pass through untouched"
+    assert usage.calls == 0
+    assert llm.calls == []
+
+
+async def test_parent_document_says_so_rather_than_half_running() -> None:
+    """It re-splits the document, so running it as an enrichment would index every
+    document twice — once as the pipeline's chunks, once as its own children."""
+    from ragorc.core.models import Chunk, Document
+    from ragorc.index.multirep import MultiRepresentationIndexer
+    from tests.fakes import StubEmbedder, StubLLM
+
+    llm = StubLLM()
+    chunks = [Chunk(id="c1", content="text", document_id="d1")]
+    stage = MultiRepresentationIndexer(
+        llm,
+        embedder=StubEmbedder(),
+        settings=Settings(
+            indexing={"parent_document_enabled": True},
+            security={"enforce_tenant_isolation": False},
+        ),
+    )
+    produced, usage = await stage.enrich(Document(id="d1", content="text"), chunks)
+
+    assert [c.id for c in produced] == ["c1"], "nothing is re-chunked here"
+    assert usage.calls == 0, "and nothing is spent pretending to"

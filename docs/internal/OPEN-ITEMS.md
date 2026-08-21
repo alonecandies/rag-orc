@@ -9,26 +9,26 @@ Nothing here is a secret or a live vulnerability. The security findings from
 earlier audits are fixed and covered by tests in `tests/unit/test_security_guards.py`
 and `tests/unit/test_guard_properties.py`.
 
-## 1. Multi-representation indexing is not wired into ingest
+## 1. Parent-document indexing is not an ingest stage
 
-`indexing.summary_index_enabled` and `dense_x_enabled` do nothing through
-`IngestPipeline`. `_OPTIONAL_STAGES` resolves the `multirep` stage by three factory
-names that do not exist, so the stage is dropped — now with a report warning that
-says so, rather than silently.
+`indexing.summary_index_enabled` and `dense_x_enabled` now run through
+`MultiRepresentationIndexer`. Write ownership was the open question and it is
+settled: the stage builds and embeds its derived units and the pipeline writes
+them, because `_process_document` already writes whatever a stage returns and an
+indexer that also upserted would write the same ids twice. The docstore write
+stays with the indexer, since that one is not a duplicate — `expand_parents` reads
+those sources back at query time.
 
-The implementations exist, are unit-tested, and work when driven directly. What is
-missing is a decision, not a rename:
+Still open: `indexing.parent_document_enabled` logs that it must be driven
+directly. `ParentDocumentIndexer` performs its own two-level split, which makes it
+a chunking *mode* rather than an enrichment; running it here would index every
+document twice. It belongs at the splitter, which is a change to the write path
+rather than to this stage.
 
-* `SummaryIndexer.index` and `PropositionIndexer.index` already embed their derived
-  units *and* upsert them, plus write the source chunks to the docstore. Routing
-  them through `_enrich`, which then writes whatever the stage returns, double-writes.
-  Either the stage stops writing and returns, or `_enrich` stops writing what a
-  stage returned. Both are defensible; they are not compatible.
-* `ParentDocumentIndexer` performs its own two-level split. It is a chunking
-  *mode*, not an enrichment, and wiring it as one would index every document twice.
-  It belongs at the splitter, which is a larger change to the write path.
-
-Until then, drive them directly — see `docs/modules/index.md`.
+Also worth knowing: derived units carry the dense vector their indexer computed
+and no sparse or ColBERT vector, because those are added before the enrichment
+stage runs. On a hybrid collection they are findable by vector search and not by
+BM25.
 
 ## 2. Corpus-wide graph construction is a manual second pass
 
