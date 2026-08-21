@@ -159,3 +159,30 @@ def test_the_package_ships_its_type_information() -> None:
     assert wheel["packages"] == ["ragorc"]
     for key in ("exclude", "only-include", "artifacts"):
         assert key not in wheel, f"{key} rule could drop py.typed from the wheel"
+
+
+def test_the_example_env_never_weakens_a_security_default() -> None:
+    """`.env.example` is meant to be copied to `.env`, so a value in it is the
+    value a deployment gets. It shipped `ENFORCE_TENANT_ISOLATION=false` directly
+    beneath a comment explaining that the setting fails closed — handing every
+    copy an open one, and silently disabling the generated-SQL refusal that keys
+    off it."""
+    root = pathlib.Path(__file__).resolve().parents[2]
+    lines = (root / ".env.example").read_text().splitlines()
+    active = [
+        line.split("=", 1)
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#") and "=" in line
+    ]
+
+    from ragorc.core.settings import SecuritySettings
+
+    defaults = SecuritySettings()
+    weakened = []
+    for key, value in active:
+        field = key.strip().removeprefix("RAGORC_SECURITY__").lower()
+        if key.strip().startswith("RAGORC_SECURITY__") and hasattr(defaults, field):
+            shipped = value.strip().lower() in {"true", "1", "yes"}
+            if getattr(defaults, field) is True and not shipped:
+                weakened.append(field)
+    assert not weakened, f".env.example turns off security defaults: {weakened}"
