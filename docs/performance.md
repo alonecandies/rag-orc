@@ -210,8 +210,14 @@ correctly; a library caller has to.
 ## Benchmarking retrieval strategies
 
 ```bash
-make bench          # compares dense / sparse / hybrid / +rerank / +compress
+make bench                      # times dense / sparse / hybrid / +rerank / +compress
+make bench Q="one question"     # or time a single question
+make eval                       # recall@k and nDCG, against labelled answers
 ```
 
-Measure recall@k and nDCG on *your* corpus before committing to a configuration.
-Every default here is a reasonable prior, not a substitute for measurement.
+The two measure different things and neither substitutes for the other. `bench`
+is **latency only** and makes no synthesis call, so it is free and safe to run in
+a loop while tuning. Quality needs labels, which is `eval`.
+
+Measure both on *your* corpus before committing to a configuration. Every default
+here is a reasonable prior, not a substitute for measurement.

@@ -19,9 +19,16 @@ In-process TTL-LRU | ~200 ns | one worker | exact content hash |
 Redis (optional) | ~200 µs | whole fleet | exact content hash |
 Semantic (Qdrant) | ~2 ms | whole fleet | **embedding proximity** |
 
-What gets cached: LLM completions and structured outputs, embeddings, rerank
-scores, retrieval results, and DB schema introspection — each individually
-switchable.
+What gets cached, each behind its own switch: LLM completions and structured
+outputs (`cache_llm`), embeddings (`cache_embeddings`), rerank scores
+(`cache_rerank`) and DB schema introspection (`cache_schema`).
+
+Retrieval results are **not** cached, and there is no switch for them. The
+semantic tier caches the *answer* to a question, which skips retrieval along with
+everything else; caching a result set on its own would key on a query whose
+filters, tenant and top-k all change what is correct to return, for a saving the
+answer cache already collects. This entry previously listed retrieval results as
+cached, which was never true.
 
 Three rules that keep it correct:
 

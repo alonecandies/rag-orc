@@ -24,12 +24,26 @@ Three named tiers, and every stage declares which it needs via the `Task` enum:
 |---|---|---|
 `fast` | `llm.fast_model` | routing, all grading, rewriting, decomposition, self-query, compression, claim verification, sufficiency checks, HyDE |
 `balanced` | `llm.model` | the answer, summarization, proposition extraction, graph extraction, community reports, RankGPT |
-`strong` | `llm.strong_model` | escalation only, when a cheap answer's confidence is below `cost.cascade_confidence_threshold` |
+`strong` | `llm.strong_model` | escalation only — today that is the Text-to-SQL guard repair and nothing else (see below) |
 
 Summarization sits in `balanced` despite being high-volume, because a summary
 *becomes the retrieval target* — a bad summary is permanently bad, in a way a bad
 one-off grade is not. Graph extraction is `balanced` for the same reason:
 extraction quality determines whether traversal finds anything at all.
+
+### Status of the confidence gate
+
+The confidence-gated escalation this ADR describes is **decided but not wired**.
+`ModelRouter.should_escalate` exists and reads `cost.cascade_enabled` and
+`cost.cascade_confidence_threshold`, and nothing calls it: the only
+`escalate=True` in the library is `construct/text_to_sql.py`'s guard repair,
+which is unconditional rather than confidence-gated. So both settings are
+currently inert, and no answer is re-asked on `strong_model`.
+
+Wiring it is a cost decision, not a mechanical one — `cascade_enabled` defaults
+to `true`, so implementing the gate starts spending on `strong_model` for every
+answer that scores below the threshold. It is recorded in
+`docs/internal/OPEN-ITEMS.md` rather than quietly switched on.
 
 Supporting mechanisms:
 

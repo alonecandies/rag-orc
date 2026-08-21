@@ -61,7 +61,9 @@ class LLMSettings(BaseModel):
     fast_model: str = "google/gemini-2.5-flash-lite"
     """Classifiers, routers, graders, rewriters. High volume, low difficulty."""
     strong_model: str = "anthropic/claude-opus-4.5"
-    """Escalation target when the cascade's confidence check fails."""
+    """Escalation target. Reached today only by the Text-to-SQL guard repair,
+    which escalates unconditionally; the confidence gate below is not wired
+    (ADR-0005, "Status of the confidence gate")."""
 
     temperature: float = 0.0
     """Zero by default: RAG answers should be reproducible, and every
@@ -708,8 +710,13 @@ class CostSettings(BaseModel):
     max_tokens_per_query: int | None = 200_000
     cascade_enabled: bool = True
     cascade_confidence_threshold: float = 0.75
-    """Below this, re-ask with ``strong_model``. Above it, keep the cheap
-    answer — most queries never need the expensive model."""
+    """Intended: below this, re-ask with ``strong_model``; above it, keep the
+    cheap answer.
+
+    **Currently inert.** ``ModelRouter.should_escalate`` implements the decision
+    and no caller invokes it, so setting either of these changes nothing. Kept
+    rather than deleted because the mechanism is written and the decision stands
+    (ADR-0005); turning it on is a spending change, so it is not done silently."""
     price_table_path: str = ""
     refresh_prices: bool = True
     """Pull live per-model prices from OpenRouter's ``/models`` endpoint so

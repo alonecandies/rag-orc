@@ -12,8 +12,20 @@ Regex detection with validation where the format allows it: a 16-digit string is
 only a card number if it passes Luhn, and checking costs nothing. Validation is
 what keeps the false-positive rate low enough to run redaction by default.
 
-For production-grade NER-backed detection, install Presidio and set
-``provider="presidio"``; the regex engine remains the dependency-free default.
+What this does not do
+---------------------
+There is no NER-backed detector and no provider switch. :class:`PIIRedactor`
+takes ``settings`` and nothing else, and the entity list it walks is
+``security.pii_entities`` against the regex table below. The docstring here used
+to tell operators to "install Presidio and set ``provider='presidio'``" — a
+parameter that has never existed, in a module whose whole job is to be trusted.
+
+The limits that follow are the regex engine's, not a configuration choice:
+detection is format-driven, so an entity with no distinguishing shape — a person's
+name, a street address, a free-text account reference — is not found at all.
+Treat this as a net for the formats it names, not as a guarantee that redacted
+text is clean. A deployment needing NER should run the text through its own
+detector before handing it to this library.
 """
 
 from __future__ import annotations

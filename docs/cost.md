@@ -130,7 +130,6 @@ Semantic router (embeddings, not LLM) | the prompt-selection call, always |
 Entity matching via graph fulltext index | an extraction call per query |
 `multihop_stop_on_sufficient` | 1-2 full retrieve+reason rounds |
 `indexing.skip_unchanged` | the entire embedding cost of a re-ingest |
-Cascade confidence gate | the strong-model call on most queries |
 `EmbeddingFilterCompressor` as default | one LLM call per chunk |
 
 ## Ingest cost
