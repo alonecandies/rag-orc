@@ -872,6 +872,11 @@ async def test_parent_document_replaces_the_split_and_persists_the_parents(
     the vector store, parents to the docstore alone, because nothing searches a
     parent and the default 2048/256 sizes would store the corpus eight to ten
     times over in the payload.
+
+    The parents are *queued* during processing and written by the flush, because
+    `chunks.document_id` is a foreign key to a row `_run` writes a step later —
+    see `_DeferredDocstore`. That is asserted here too: it is the ordering, not
+    just the content, that the real schema enforces.
     """
     from ragorc.core.models import Document
 
@@ -894,10 +899,18 @@ async def test_parent_document_replaces_the_split_and_persists_the_parents(
     from ragorc.core.models import ChunkingStrategy
     from ragorc.index.pipeline import IngestReport
 
-    children = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport())
+    report = IngestReport()
+    children = await pipeline._process_document(document, ChunkingStrategy.EARLY, report)
 
     assert children, "the children are what gets indexed"
     assert all(c.parent_id for c in children), "every child must point at its parent"
+    assert persisted == [], (
+        "nothing may reach the chunks table while the document row does not exist"
+    )
+    assert pipeline._deferred, "the parents must be queued for the flush"
+
+    await pipeline._flush_deferred(report)
+
     assert persisted, "the parents must be persisted for query-time expansion"
     parent_ids = {p.id for batch in persisted for p in batch}
     assert {c.parent_id for c in children} <= parent_ids, (
@@ -906,6 +919,7 @@ async def test_parent_document_replaces_the_split_and_persists_the_parents(
     assert all(p.dense is None for batch in persisted for p in batch), (
         "a parent carries no vector: nothing ever searches one"
     )
+    assert pipeline._deferred == [], "a flushed buffer must not write the same rows twice"
 
 
 # ---------------------------------------------------------------------------
@@ -1170,3 +1184,101 @@ async def test_derived_units_carry_every_vector_the_collection_declares() -> Non
     assert all(c.sparse is not None and len(c.sparse) for c in derived), (
         "a derived unit invisible to BM25 is half-indexed on a hybrid collection"
     )
+
+
+# ---------------------------------------------------------------------------
+# Nothing may reach the chunks table before its document row
+# ---------------------------------------------------------------------------
+def _fk_pipeline(store: Any, **indexing: Any) -> Any:
+    from ragorc.index.pipeline import IngestPipeline
+    from tests.fakes import FakeVectorStore, StubEmbedder, StubLLM
+
+    return IngestPipeline(
+        llm=StubLLM(),
+        dense_embedder=StubEmbedder(dimension=32),
+        vector_store=FakeVectorStore(),
+        relational_store=store,
+        settings=Settings(
+            security={"enforce_tenant_isolation": False},
+            cache={"enabled": False},
+            embedding={"dense_dimension": 32},
+            indexing={"splitter": "recursive", "skip_unchanged": False, **indexing},
+            retrieval={"use_sparse": False},
+        ),
+    )
+
+
+async def test_parents_are_not_written_before_the_document_row_exists() -> None:
+    """The docstore write ran inside `_process_document`, and the document row is
+    written a step later in `_run`.
+
+    So on a fresh corpus every parent insert referenced a row that did not exist:
+    `ForeignKeyViolation`, caught as a per-document failure, and a 10k-document
+    ingest returned `indexed: 0, failed: 10000` after paying for every embedding.
+    No unit test saw it because the doubles had no foreign key.
+    """
+    from tests.fakes import FakeDocumentStore
+
+    store = FakeDocumentStore()
+    pipeline = _fk_pipeline(store, parent_document_enabled=True)
+    document = Document(
+        id="handbook",
+        content="\n\n".join(f"Section {i}. " + "Refund policy detail. " * 40 for i in range(3)),
+    )
+
+    report = await pipeline.ingest([document])
+
+    assert report.documents_failed == 0, report.warnings
+    assert report.documents_indexed == 1
+    assert store.documents, "the document row must exist"
+    parents = [c for c in store.chunks.values() if c.dense is None]
+    assert parents, "the parents must survive in the docstore for expansion to find them"
+
+
+async def test_the_stale_purge_does_not_cascade_away_the_parents_just_written() -> None:
+    """Second half of the same ordering bug, on a corpus that already exists.
+
+    The purge deliberately runs *after* the replacement chunks are built, so a
+    document whose extraction just started failing keeps the vectors it had. But
+    `delete_document` cascades to every chunk with that `document_id`, and the
+    parents had already been written during processing — so re-ingesting a changed
+    document deleted its parents and left the children pointing at nothing.
+    """
+    from tests.fakes import FakeDocumentStore
+
+    store = FakeDocumentStore()
+    pipeline = _fk_pipeline(store, parent_document_enabled=True, skip_unchanged=True)
+    body = "\n\n".join(f"Section {i}. " + "Refund policy detail. " * 40 for i in range(3))
+
+    first = await pipeline.ingest([Document(id="handbook", content=body)])
+    assert first.documents_indexed == 1, first.warnings
+
+    edited = await pipeline.ingest([Document(id="handbook", content=body + "\n\nAddendum. " * 30)])
+
+    assert edited.documents_indexed == 1, edited.warnings
+    parents = [c for c in store.chunks.values() if c.dense is None]
+    assert parents, "the purge cascade must not outlive the parents it precedes"
+    children = [c for c in store.chunks.values() if c.parent_id]
+    parent_ids = {p.id for p in parents}
+    assert children, "the fixture must produce children to have anything to check"
+    assert {c.parent_id for c in children} <= parent_ids, (
+        "every child must still resolve to a parent that exists"
+    )
+
+
+async def test_summary_sources_are_not_written_before_the_document_row() -> None:
+    """The multirep stage persists the sources it replaces, from inside `_enrich`
+    — also before the document row. The violation was swallowed one level up as
+    "stage disabled for the rest of this run", so `summary_index_enabled` turned
+    itself off on the first document and the run still reported success."""
+    from tests.fakes import FakeDocumentStore
+
+    store = FakeDocumentStore()
+    pipeline = _fk_pipeline(store, summary_index_enabled=True)
+    document = Document(id="d1", content="Refunds are processed within five business days. " * 60)
+
+    report = await pipeline.ingest([document])
+
+    assert report.documents_failed == 0, report.warnings
+    assert not any("disabled" in w for w in report.warnings), report.warnings
+    assert store.chunks, "the summarised sources must be persisted for expansion"

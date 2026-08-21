@@ -12,6 +12,9 @@ tests need to assert on:
   finding produce real graph results — a mock returning a canned path cannot
   catch an off-by-one in hop counting.
 * ``FakeCache`` counts hits and misses, so caching claims are testable.
+* ``FakeDocumentStore`` enforces the chunks-to-documents foreign key and its
+  cascade, so a test can tell a correct ingest write *order* from an incorrect
+  one — which a double that accepts anything cannot.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from itertools import pairwise
 from typing import Any
 
 import numpy as np
+from psycopg.errors import ForeignKeyViolation
 
 from ragorc.core.models import (
     Chunk,
@@ -365,3 +369,82 @@ class FakeCache:
         for k in keys:
             del self.store[k]
         return len(keys)
+
+
+class FakeDocumentStore:
+    """The two ingest tables, including the constraint between them.
+
+    ``chunks.document_id REFERENCES documents (id) ON DELETE CASCADE`` is the
+    reason the ingest pipeline has a write *order* at all, so a double that
+    accepts chunks for documents it has never seen cannot tell a correct order
+    from an incorrect one. That is how writes the real schema rejects outright —
+    and a purge that cascaded away rows written moments earlier — passed the whole
+    unit suite.
+
+    A falsy ``document_id`` stores a NULL FK and is not checked, matching
+    ``PostgresStore.upsert_chunks``: a RAPTOR summary and a synthetic proposition
+    have no owning document row.
+    """
+
+    def __init__(self, *, checksums: dict[str, str] | None = None) -> None:
+        self.documents: dict[str, Any] = {}
+        self.chunks: dict[str, Any] = {}
+        self.calls: list[str] = []
+        self._seeded_checksums = dict(checksums or {})
+        self.schema_ensured = 0
+
+    async def ensure_schema(self) -> None:
+        self.schema_ensured += 1
+
+    async def upsert_documents(self, documents: Sequence[Any]) -> int:
+        self.calls.append("upsert_documents")
+        for doc in documents:
+            self.documents[doc.id] = doc
+        return len(documents)
+
+    async def upsert_chunks(self, chunks: Sequence[Any]) -> int:
+        self.calls.append("upsert_chunks")
+        for chunk in chunks:
+            owner = getattr(chunk, "document_id", None)
+            if owner and owner not in self.documents:
+                raise ForeignKeyViolation(
+                    f'insert or update on table "chunks" violates foreign key '
+                    f'constraint "chunks_document_id_fkey": key (document_id)=({owner}) '
+                    f'is not present in table "documents"'
+                )
+            self.chunks[chunk.id] = chunk
+        return len(chunks)
+
+    async def delete_document(self, document_id: str) -> int:
+        """Delete the row and cascade to its chunks, as the FK declares."""
+        self.calls.append("delete_document")
+        self.documents.pop(document_id, None)
+        cascaded = [
+            cid for cid, c in self.chunks.items() if getattr(c, "document_id", None) == document_id
+        ]
+        for cid in cascaded:
+            del self.chunks[cid]
+        return len(cascaded)
+
+    async def execute_readonly(
+        self, sql: str, params: Sequence[Any] | None = None, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Answers the checksum probe from what has actually been written.
+
+        The probe joins documents to chunks on purpose — a document counts as
+        ingested only once it has chunks — so this mirrors the join rather than
+        returning every seeded row.
+        """
+        self.calls.append("execute_readonly")
+        with_chunks = {getattr(c, "document_id", None) for c in self.chunks.values()}
+        out: list[dict[str, Any]] = []
+        for doc_id, doc in self.documents.items():
+            if doc_id not in with_chunks:
+                continue
+            checksum = getattr(doc, "checksum", None) or self._seeded_checksums.get(doc_id)
+            if checksum:
+                out.append({"id": doc_id, "checksum": checksum})
+        return out[:limit]
+
+    async def close(self) -> None:
+        return None

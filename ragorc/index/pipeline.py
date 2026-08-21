@@ -484,6 +484,7 @@ class IngestPipeline:
         self._strategy: ChunkingStrategy | None = None
         self._enricher: Any | None = None
         self._colbert_indexer: Any | None = None
+        self._deferred: list[Chunk] = []
         self._stages: list[tuple[_Plugin, Any]] = []
         self._embedding_cache: Any | None = None
         self._owns_stores = False
@@ -1079,6 +1080,9 @@ class IngestPipeline:
                 if stale:
                     await self._purge(stale, report)
                 await self._write_documents(ready, report)
+                # After the rows and after the cascade: the two conditions the
+                # deferred docstore writes were violating (see `_DeferredDocstore`).
+                await self._flush_deferred(report)
 
                 pending.extend(chunks)
                 while len(pending) >= batch:
@@ -1168,16 +1172,21 @@ class IngestPipeline:
         # or proposition unit carried only the dense vector its own indexer
         # computed, so on a hybrid collection it was findable by vector search and
         # invisible to BM25 — half-indexed, with no symptom to notice.
+        # Buffered per document, merged only on success: this is the unit of
+        # failure isolation, so a document that dies here must not leave rows
+        # queued for the flush.
+        deferred = _DeferredDocstore()
         await self._embed_dense(document, chunks, strategy, report)
-        await self._enrich(document, chunks, report)
+        await self._enrich(document, chunks, report, docstore=deferred)
         await self._add_sparse(chunks, report)
         await self._add_colbert(chunks, report)
         if docstore_only:
-            # Parents are written here and nowhere else: nothing searches them, so
-            # a vector on them is a vector no query will ever reach, and the
-            # default 2048/256 sizes would store the corpus eight to ten times over
-            # in the payload. `expand_parents` reads them back after ranking.
-            await self._write_docstore_only(docstore_only, report)
+            # Parents are persisted and never indexed: nothing searches them, so a
+            # vector on them is a vector no query will ever reach, and the default
+            # 2048/256 sizes would store the corpus eight to ten times over in the
+            # payload. `expand_parents` reads them back after ranking.
+            await deferred.upsert_chunks(docstore_only)
+        self._deferred.extend(deferred.take())
         log.debug(
             "document_indexed",
             document_id=document.id,
@@ -1208,17 +1217,28 @@ class IngestPipeline:
         index = await indexer.build(document)
         return list(index.children), list(index.parents)
 
-    async def _write_docstore_only(self, chunks: Sequence[Chunk], report: IngestReport) -> None:
-        """Persist chunks nothing will search."""
+    async def _flush_deferred(self, report: IngestReport) -> None:
+        """Write the chunks nothing will search, now that their rows exist.
+
+        Called from `_run` after `_write_documents` and after the stale purge, the
+        only point at which both are true: the foreign key is satisfied and no
+        cascade is still coming.
+        """
+        if not self._deferred:
+            return
+        pending, self._deferred = self._deferred, []
         if self.relational is None:
             report.warnings.append(
-                "parent_document_enabled needs a relational store to hold the parents; "
-                "children were indexed but expansion at query time will find nothing"
+                "parent_document_enabled and the multi-representation stages need a "
+                "relational store to hold what they persist; the derived units were "
+                "indexed but expansion at query time will find nothing"
             )
             return
         started = time.perf_counter()
-        await self.relational.upsert_chunks(list(chunks))
-        report.timings_ms["parents"] = report.timings_ms.get("parents", 0.0) + _elapsed_ms(started)
+        await self.relational.upsert_chunks(pending)
+        report.timings_ms["docstore"] = report.timings_ms.get("docstore", 0.0) + _elapsed_ms(
+            started
+        )
 
     async def _embed_dense(
         self,
@@ -1332,7 +1352,14 @@ class IngestPipeline:
             "embed_colbert", 0.0
         ) + _elapsed_ms(started)
 
-    async def _enrich(self, document: Document, chunks: list[Chunk], report: IngestReport) -> None:
+    async def _enrich(
+        self,
+        document: Document,
+        chunks: list[Chunk],
+        report: IngestReport,
+        *,
+        docstore: Any | None = None,
+    ) -> None:
         """Run the optional stages in order, each behind its settings flag.
 
         A stage runs over one document's chunks because that is all the streaming
@@ -1358,7 +1385,9 @@ class IngestPipeline:
                     document=document,
                     chunks=chunks,
                     vector_store=self.vector,
-                    relational_store=self.relational,
+                    # The buffer, not the store: a stage's docstore write lands
+                    # after this document's row exists (see `_DeferredDocstore`).
+                    relational_store=docstore if docstore is not None else self.relational,
                 )
             except Exception as exc:
                 log.warning(
@@ -1458,6 +1487,42 @@ class IngestPipeline:
 # ---------------------------------------------------------------------------
 # Chunk-list plumbing
 # ---------------------------------------------------------------------------
+class _DeferredDocstore:
+    """Collects docstore writes so the *pipeline* decides when they land.
+
+    Two stages persist chunks nothing ever searches: parent-document indexing
+    writes the parents, and the multi-representation stage writes the sources its
+    derived units replaced. Both did it while the document was being processed,
+    which is one step before that document's row is written and two before the
+    stale purge — and ``chunks.document_id`` is a foreign key to that row with
+    ``ON DELETE CASCADE``. So on a fresh corpus the insert was rejected outright,
+    and on a document being re-ingested it succeeded and was then cascaded away by
+    the purge, leaving children pointing at parents that no longer existed.
+
+    Buffering changes only the timing. Write *ownership* stays where it belongs —
+    the stage still decides what deserves persisting, because it is the only party
+    that knows — while the pipeline supplies the one thing the stage cannot know:
+    when the row these rows reference exists.
+
+    Only ``upsert_chunks`` is buffered, because it is the only method either stage
+    calls; ``expand_parents`` reads these back at query time, long after the run.
+    """
+
+    __slots__ = ("pending",)
+
+    def __init__(self) -> None:
+        self.pending: list[Chunk] = []
+
+    async def upsert_chunks(self, chunks: Sequence[Chunk]) -> int:
+        self.pending.extend(chunks)
+        return len(self.pending)
+
+    def take(self) -> list[Chunk]:
+        """Hand over what has accumulated and reset, so a flush cannot double-write."""
+        held, self.pending = self.pending, []
+        return held
+
+
 def _replace(chunks: list[Chunk], produced: Sequence[Chunk]) -> None:
     """Swap a stage's output into the caller's list in place.
 

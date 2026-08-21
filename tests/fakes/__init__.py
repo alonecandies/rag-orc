@@ -24,10 +24,17 @@ from tests.fakes.embedder import (
     StubSparseEmbedder,
 )
 from tests.fakes.llm import ScriptedLLM, StubLLM
-from tests.fakes.stores import FakeCache, FakeGraphStore, FakeRelationalStore, FakeVectorStore
+from tests.fakes.stores import (
+    FakeCache,
+    FakeDocumentStore,
+    FakeGraphStore,
+    FakeRelationalStore,
+    FakeVectorStore,
+)
 
 __all__ = [
     "FakeCache",
+    "FakeDocumentStore",
     "FakeGraphStore",
     "FakeRelationalStore",
     "FakeVectorStore",
