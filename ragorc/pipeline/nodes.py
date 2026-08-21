@@ -454,7 +454,9 @@ class PipelineNodes:
         top_k = state.get("top_k")
         try:
             with timed("retrieve"):
-                result = await self._retrieve_with(self.retriever, query, route=route, top_k=top_k)
+                result, rrr_usage = await self._retrieve_with(
+                    self.retriever, query, route=route, top_k=top_k
+                )
         except _FATAL:
             raise
         except Exception as exc:  # noqa: BLE001 - an empty result the graph can act on
@@ -464,7 +466,7 @@ class PipelineNodes:
             "retrieval": result,
             "candidates": list(result.chunks),
             "per_store": dict(result.per_store),
-            "usages": _published_usage(self.retriever),
+            "usages": _published_usage(self.retriever) + rrr_usage,
         }
         # A leg that failed inside the retriever is a degradation, and it only
         # counts as one if it is on the state: ``errors`` is what the answer's
@@ -1218,7 +1220,7 @@ class PipelineNodes:
         iteration = int(state.get("retrieve_iterations") or 0) + 1
         try:
             with timed("hop", iteration=iteration):
-                result = await self._retrieve_with(
+                result, rrr_usage = await self._retrieve_with(
                     self.retriever,
                     hop_query,
                     route=_route_or_default(state),
@@ -1237,7 +1239,7 @@ class PipelineNodes:
             "retrieve_iterations": iteration,
             "candidates": list(result.chunks),
             "per_store": {f"hop_{iteration}": list(result.chunks)},
-            "usages": _published_usage(self.retriever),
+            "usages": _published_usage(self.retriever) + rrr_usage,
         }
 
     # ------------------------------------------------------------------
@@ -1372,23 +1374,49 @@ class PipelineNodes:
         *,
         route: RouteDecision | None,
         top_k: int | None,
-    ) -> RetrievalResult:
+    ) -> tuple[RetrievalResult, list[Usage]]:
         """Call a retriever and always come back with a :class:`RetrievalResult`.
 
         ``retrieve_detailed`` is preferred where it exists (the hybrid and
         multi-store retrievers) because it carries the per-store diagnostics; once
         fusion has flattened several scores into one number, "which store
         contributed this, how long did it take, what failed" is unrecoverable.
+
+        ``generation.rrr_enabled`` wraps the call in Rewrite-Retrieve-Read. It is
+        applied here rather than in one node because every retrieval path in the
+        graph layer funnels through this method — the flag previously did nothing
+        on any of them, being read only by the HTTP service's linear fallback
+        engine, while ``describe()`` reported RRR as an enabled feature.
         """
-        detailed = getattr(retriever, "retrieve_detailed", None)
-        if detailed is not None:
-            return await detailed(query, route=route, top_k=top_k)
-        chunks = await retriever.retrieve(query, top_k=top_k, route=route)
-        return RetrievalResult(
-            chunks=list(chunks),
-            per_store={getattr(retriever, "name", "retriever"): list(chunks)},
-            total_candidates=len(chunks),
+
+        async def _call(current: Query) -> RetrievalResult:
+            detailed = getattr(retriever, "retrieve_detailed", None)
+            if detailed is not None:
+                return await detailed(current, route=route, top_k=top_k)
+            chunks = await retriever.retrieve(current, top_k=top_k, route=route)
+            return RetrievalResult(
+                chunks=list(chunks),
+                per_store={getattr(retriever, "name", "retriever"): list(chunks)},
+                total_candidates=len(chunks),
+            )
+
+        if not self.settings.generation.rrr_enabled:
+            return await _call(query), []
+
+        from ragorc.generate.rrr import RRR
+
+        # The bill is returned rather than published on a collaborator: RRR is not
+        # a component, so `_published_usage` has nothing to read it off, and a
+        # rewrite whose cost never reaches the ledger is the kind of spend that
+        # only shows up on the invoice.
+        outcome = await RRR(self.llm, self.settings, router=self.model_router).run(query, _call)
+        log.debug(
+            "rrr_applied",
+            rewrites=len(outcome.rewrites),
+            succeeded=outcome.succeeded,
+            chunks=len(outcome.retrieval.chunks),
         )
+        return outcome.retrieval, [outcome.usage] if outcome.usage.calls else []
 
     @staticmethod
     def _respell(query: Query, text: str, *, reason: str) -> Query:

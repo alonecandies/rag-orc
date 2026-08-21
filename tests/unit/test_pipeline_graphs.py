@@ -411,3 +411,60 @@ async def test_fused_result_carries_the_fan_outs_errors(
 
     assert out["retrieval"].errors == {"relational": "StoreUnavailable: postgres is down"}
     assert out["retrieval"].chunks, "a failed leg must not cost the healthy leg its chunks"
+
+
+# ---------------------------------------------------------------------------
+# Rewrite-Retrieve-Read on the graph path
+# ---------------------------------------------------------------------------
+async def test_rrr_rewrites_before_retrieving_when_enabled(
+    llm: StubLLM, settings: Settings
+) -> None:
+    """`generation.rrr_enabled` did nothing on every graph path.
+
+    RRR was constructed in exactly one place — the HTTP service's *linear
+    fallback* engine, reached only when the orchestrator is absent — while
+    `describe()` reported RRR as an enabled feature. So the flag documented as
+    "rewrite the question for search before retrieving" was, on the supported
+    path, a no-op that still advertised itself.
+    """
+    asked: list[str] = []
+
+    class _Recording(StubRetriever):
+        async def retrieve_detailed(self, query: Query, **kwargs: object) -> RetrievalResult:
+            asked.append(query.text)
+            return await super().retrieve_detailed(query, **kwargs)
+
+    on = Settings(**{**settings.model_dump(), "generation": {"rrr_enabled": True}})
+    nodes = PipelineNodes(
+        llm=llm, generator=AnswerGenerator(llm, on), retriever=_Recording(), settings=on
+    )
+    result, usages = await nodes._retrieve_with(
+        nodes.retriever,
+        Query(text="i've been waiting ages, when do i get my money back?"),
+        route=None,
+        top_k=3,
+    )
+    assert result.chunks, "retrieval must still return its hits"
+    assert asked, "the retriever must have been called"
+    assert usages and usages[0].calls, "the rewrite's cost must reach the ledger"
+
+
+async def test_rrr_costs_nothing_when_disabled(llm: StubLLM, settings: Settings) -> None:
+    """Off by default, and off means no model call and the original question."""
+    question = "when do i get my money back?"
+    asked: list[str] = []
+
+    class _Recording(StubRetriever):
+        async def retrieve_detailed(self, query: Query, **kwargs: object) -> RetrievalResult:
+            asked.append(query.text)
+            return await super().retrieve_detailed(query, **kwargs)
+
+    off = Settings(**{**settings.model_dump(), "generation": {"rrr_enabled": False}})
+    nodes = PipelineNodes(
+        llm=llm, generator=AnswerGenerator(llm, off), retriever=_Recording(), settings=off
+    )
+    _, usages = await nodes._retrieve_with(
+        nodes.retriever, Query(text=question), route=None, top_k=3
+    )
+    assert asked == [question], "the question must reach the retriever unrewritten"
+    assert usages == [], "a disabled feature must not bill anything"

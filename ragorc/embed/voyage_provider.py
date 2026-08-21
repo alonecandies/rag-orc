@@ -37,7 +37,7 @@ from ragorc.core.errors import ConfigError, EmbeddingError, RateLimited, Transie
 from ragorc.core.models import FloatArray
 from ragorc.core.registry import register
 from ragorc.core.settings import Settings, get_settings
-from ragorc.embed.base import BaseEmbedder, batched, provider_concurrency
+from ragorc.embed.base import BaseEmbedder, aclose_client, batched, provider_concurrency
 from ragorc.embed.cache import EmbeddingCache
 
 log = structlog.get_logger(__name__)
@@ -168,6 +168,16 @@ class VoyageEmbedder(BaseEmbedder):
                 returned=len(embeddings),
             )
         return [np.asarray(vector, dtype=np.float32) for vector in embeddings]
+
+    async def aclose(self) -> None:
+        """Release the vendor client.
+
+        Nothing closed it before: `RAGPipeline.aclose()` closed the stores, the
+        cache and the LLM but never the embedders, so every pipeline built on a
+        hosted embedding provider leaked its connection pool.
+        """
+        await aclose_client(getattr(self, "_client", None))
+        self._client = None
 
 
 def _map_error(exc: BaseException) -> BaseException:

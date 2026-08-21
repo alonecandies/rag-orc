@@ -119,3 +119,96 @@ def test_stores_are_constructed_lazily(settings: Settings) -> None:
     # Accessors exist but must not have been invoked during construction.
     assert callable(pipeline.relational_store)
     assert callable(pipeline.graph_store)
+
+
+async def test_aclose_releases_the_embedders_and_the_reranker(settings: Settings) -> None:
+    """`aclose()` closed the stores, the cache and the LLM but not these.
+
+    Every hosted embedding and rerank provider owns an HTTP client, so a pipeline
+    built on one leaked a connection pool per instance. Invisible in a script that
+    exits; fatal in a long-lived service that builds a pipeline per tenant.
+    """
+    closed: list[str] = []
+
+    class _Closeable:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def aclose(self) -> None:
+            closed.append(self.name)
+
+    pipeline = RAGPipeline(settings=settings)
+    pipeline._dense = _Closeable("dense")  # type: ignore[assignment]
+    pipeline._sparse = _Closeable("sparse")  # type: ignore[assignment]
+    pipeline._late = _Closeable("late")  # type: ignore[assignment]
+    pipeline._reranker = _Closeable("reranker")
+    await pipeline.aclose()
+
+    assert sorted(closed) == ["dense", "late", "reranker", "sparse"]
+
+
+async def test_aclose_survives_a_component_that_will_not_close(settings: Settings) -> None:
+    """One stubborn socket must not keep the others open: the caller is on their
+    way out, and a leaked pool outlives the process that could have reported it."""
+    closed: list[str] = []
+
+    class _Broken:
+        async def aclose(self) -> None:
+            raise RuntimeError("refuses to close")
+
+    class _Fine:
+        async def aclose(self) -> None:
+            closed.append("fine")
+
+    pipeline = RAGPipeline(settings=settings)
+    pipeline._dense = _Broken()  # type: ignore[assignment]
+    pipeline._reranker = _Fine()
+    await pipeline.aclose()
+
+    assert closed == ["fine"]
+
+
+async def test_aclose_is_idempotent(settings: Settings) -> None:
+    calls: list[int] = []
+
+    class _Counting:
+        async def aclose(self) -> None:
+            calls.append(1)
+
+    pipeline = RAGPipeline(settings=settings)
+    pipeline._reranker = _Counting()
+    await pipeline.aclose()
+    await pipeline.aclose()
+    assert calls == [1]
+
+
+def test_self_query_can_be_injected(settings: Settings) -> None:
+    """The stage was documented as switchable and had no switch.
+
+    `RAGPipeline.constructor` builds a `SelfQueryConstructor` with an empty
+    attribute schema — a deliberate no-op, since a model asked to invent field
+    names produces filters that match nothing — and its docstring told the reader
+    to "inject it". There was no parameter to inject through, so the only way in
+    was to bypass the facade entirely.
+    """
+    sentinel = object()
+    assert RAGPipeline(settings=settings, constructor=sentinel).constructor is sentinel
+
+
+async def test_create_treats_constructor_as_a_component_not_a_settings_path(
+    settings: Settings,
+) -> None:
+    """`create()` splits its kwargs into components and settings overrides by
+    reading `__init__`'s signature. A component missing from that signature is
+    read as a dotted settings path instead, which fails in a way that names the
+    setting rather than the component."""
+    from ragorc.pipeline.builder import _COMPONENT_PARAMS
+
+    assert "constructor" in _COMPONENT_PARAMS
+
+    sentinel = object()
+    pipeline = await RAGPipeline.create(settings=settings, constructor=sentinel)
+    try:
+        assert pipeline.constructor is sentinel
+    finally:
+        await pipeline.aclose()

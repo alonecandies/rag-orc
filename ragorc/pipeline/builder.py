@@ -284,6 +284,7 @@ class RAGPipeline:
         generator: AnswerGenerator | None = None,
         retriever: Any | None = None,
         reranker: Any | None = None,
+        constructor: Any | None = None,
         translators: Sequence[str] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
@@ -316,7 +317,13 @@ class RAGPipeline:
         self._self_rag: SelfRAG | None = None
         self._web: Any | None = None
         self._router: Any | None = None
-        self._constructor: Any | None = None
+        # Injected, not just lazily built: the property below constructs a
+        # SelfQueryConstructor with an empty attribute schema, which is a
+        # deliberate no-op, and its docstring told the reader to "inject it" when
+        # there was no parameter to inject through. `_COMPONENT_PARAMS` is derived
+        # from this signature, so adding it here also makes `create(constructor=…)`
+        # work rather than being read as a settings path.
+        self._constructor: Any | None = constructor
         self._ingest: Any | None = None
         self._node_bundles: dict[bool, PipelineNodes] = {}
         self._compiled: dict[str, Any] = {}
@@ -589,9 +596,17 @@ class RAGPipeline:
 
         Built with no attribute schema, which makes it a deliberate no-op: with no
         schema there is nothing to filter on, and asking a model to invent field names
-        produces filters that match nothing — a silent empty result set. Pass
-        ``attributes=`` to :class:`~ragorc.construct.self_query.SelfQueryConstructor`
-        and inject it to turn the stage on.
+        produces filters that match nothing — a silent empty result set.
+
+        To turn the stage on, describe your metadata and inject the constructor::
+
+            from ragorc.construct.self_query import SelfQueryConstructor
+
+            rag = await RAGPipeline.create(
+                constructor=SelfQueryConstructor(llm, attributes=my_attributes)
+            )
+
+        ``constructor=`` also works on ``RAGPipeline(...)`` directly.
         """
         if self._constructor is None:
             from ragorc.construct.self_query import SelfQueryConstructor
@@ -1280,6 +1295,15 @@ class RAGPipeline:
                 closers.append(store)
         if self._ingest is not None:
             closers.append(self._ingest)
+        # The embedders and the reranker were missing from this list, so a
+        # pipeline on a hosted embedding provider leaked one connection pool per
+        # instance — invisible in a script that exits, fatal in a long-lived
+        # service that rebuilds pipelines per tenant.
+        # The embedders and the reranker were missing from this list, so a
+        # pipeline on a hosted embedding provider leaked one connection pool per
+        # instance — invisible in a script that exits, fatal in a long-lived
+        # service that rebuilds pipelines per tenant.
+        closers.extend([self._dense, self._sparse, self._late, self._reranker])
         closers.append(self._cache)
         closers.append(self._llm)
         for component in closers:

@@ -34,7 +34,7 @@ from ragorc.core.errors import ConfigError, EmbeddingError, RateLimited, Transie
 from ragorc.core.models import FloatArray
 from ragorc.core.registry import register
 from ragorc.core.settings import Settings, get_settings
-from ragorc.embed.base import BaseEmbedder, batched, provider_concurrency
+from ragorc.embed.base import BaseEmbedder, aclose_client, batched, provider_concurrency
 from ragorc.embed.cache import EmbeddingCache
 
 log = structlog.get_logger(__name__)
@@ -180,6 +180,16 @@ class CohereEmbedder(BaseEmbedder):
             )
         return [np.asarray(vector, dtype=np.float32) for vector in vectors]
 
+    async def aclose(self) -> None:
+        """Release the vendor client.
+
+        Nothing closed it before: `RAGPipeline.aclose()` closed the stores, the
+        cache and the LLM but never the embedders, so every pipeline built on a
+        hosted embedding provider leaked its connection pool.
+        """
+        await aclose_client(getattr(self, "_cohere", None))
+        self._cohere = None
+
 
 @register("reranker", "cohere")
 class CohereReranker:
@@ -231,3 +241,13 @@ class CohereReranker:
         pairs = [(int(item.index), float(item.relevance_score)) for item in response.results]
         pairs.sort(key=lambda pair: pair[1], reverse=True)
         return pairs
+
+    async def aclose(self) -> None:
+        """Release the vendor client.
+
+        Nothing closed it before: `RAGPipeline.aclose()` closed the stores, the
+        cache and the LLM but never the embedders, so every pipeline built on a
+        hosted embedding provider leaked its connection pool.
+        """
+        await aclose_client(getattr(self, "_cohere", None))
+        self._cohere = None

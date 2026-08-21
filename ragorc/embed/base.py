@@ -40,6 +40,8 @@ in embedding wrappers — it silently converts one provider round trip into N.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from itertools import islice
 from typing import Any, TypeVar
@@ -58,6 +60,7 @@ log = structlog.get_logger(__name__)
 
 __all__ = [
     "BaseEmbedder",
+    "aclose_client",
     "apply_prefix",
     "batched",
     "cached_batch",
@@ -197,6 +200,28 @@ async def cached_batch(
         by_key.update(zip(missing, fresh, strict=True))
         await writer({key: by_key[key] for key in missing})
     return [by_key[key] for key in keys]
+
+
+async def aclose_client(client: Any) -> None:
+    """Release a vendor SDK client, whatever it calls the method.
+
+    The hosted providers each wrap an httpx client inside their own SDK and expose
+    a different name for closing it — ``aclose``, ``close``, or nothing at all.
+    Guessing once here beats three provider-specific branches, and suppressing is
+    right because a caller running this is on their way out: a socket that will not
+    close cleanly must not stop the next provider from releasing its own.
+    """
+    if client is None:
+        return
+    for name in ("aclose", "close"):
+        closer = getattr(client, name, None)
+        if closer is None:
+            continue
+        with contextlib.suppress(Exception):
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
+        return
 
 
 class BaseEmbedder:
