@@ -453,6 +453,11 @@ class RunReport:
         names = list(_OPERATIONAL_SERIES)
         if self.retrieval is not None:
             names.extend(self.retrieval.per_query)
+        # Prefixed the same way `document_retrieval_metrics` prefixes its means,
+        # so a run with document labels and no chunk labels — which is what the
+        # shipped dataset is — can still be A/B'd on retrieval quality.
+        if self.document_retrieval is not None:
+            names.extend(f"doc_{name}" for name in self.document_retrieval.per_query)
         names.extend(self.answer_scores)
         return names
 
@@ -467,6 +472,7 @@ class RunReport:
             "ks": list(self.ks),
             "operational": self.operational(),
             "retrieval": self.retrieval_metrics(),
+            "document_retrieval": self.document_retrieval_metrics(),
             "answer": self.answer_metrics(),
             "retrieval_detail": self.retrieval.to_dict() if self.retrieval is not None else {},
             "errors": [{"id": r.case.id, "error": r.error} for r in self.results if not r.ok],
@@ -491,8 +497,16 @@ class RunReport:
         retrieval = self.retrieval_metrics()
         if retrieval and self.retrieval is not None:
             lines += ["", self.retrieval.to_markdown()]
-        else:
-            lines += ["", "_no chunk labels: retrieval metrics not computed_"]
+        documents = self.document_retrieval_metrics()
+        if documents and self.document_retrieval is not None:
+            lines += [
+                "",
+                "Document-level (cases carry a source document, not chunk ids):",
+                "",
+                self.document_retrieval.to_markdown(),
+            ]
+        if not retrieval and not documents:
+            lines += ["", "_no retrieval labels: retrieval metrics not computed_"]
         answers = self.answer_metrics()
         if answers:
             lines += ["", "| answer metric | score |", "|---|---|"]

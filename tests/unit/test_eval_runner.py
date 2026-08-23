@@ -316,3 +316,45 @@ def test_the_comparison_table_prints_the_real_confidence_interval() -> None:
     assert f"{low:+.3f} to {high:+.3f}" in row, (
         f"expected the real interval {low:+.3f} to {high:+.3f} in: {row}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Document-level retrieval metrics have to reach a reader
+# ---------------------------------------------------------------------------
+def _report_with_document_labels():  # noqa: ANN202
+    """A report shaped like the shipped dataset: source documents, no chunk ids."""
+    from ragorc.eval.retrieval_metrics import evaluate_retrieval
+    from ragorc.eval.runner import RunReport
+
+    report = RunReport(name="run", dataset="examples/eval/questions.jsonl")
+    report.document_retrieval = evaluate_retrieval(
+        [["doc-a", "doc-b"], ["doc-c", "doc-a"]],
+        [["doc-a"], ["doc-c"]],
+        ks=(10,),
+    )
+    return report
+
+
+def test_document_level_retrieval_metrics_reach_the_report() -> None:
+    """`examples/eval/questions.jsonl` has 20 cases: none carry `expected_chunk_ids`
+    and 18 carry a `source_document`. So the shipped `make eval` computes
+    document-level retrieval quality for 18 cases and then throws it away —
+    `to_dict()` (the `--json` record) omitted it, `series_names()` excluded it so
+    `--compare` could never A/B it, and `to_markdown()` printed "no chunk labels:
+    retrieval metrics not computed", which is not true: they were computed.
+    """
+    report = _report_with_document_labels()
+
+    assert report.document_retrieval_metrics(), "the fixture must produce doc metrics"
+
+    payload = report.to_dict()
+    assert payload.get("document_retrieval"), (
+        f"the JSON record drops document-level retrieval: {sorted(payload)}"
+    )
+
+    markdown = report.to_markdown()
+    assert "not computed" not in markdown, f"claims nothing was measured:\n{markdown}"
+
+    assert any(name.startswith("doc_") for name in report.series_names()), (
+        f"--compare cannot A/B a metric it does not list: {report.series_names()}"
+    )
