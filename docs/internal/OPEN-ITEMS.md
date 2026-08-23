@@ -129,34 +129,83 @@ rejects against every window's list and `documents_in` stopped reconciling.
 * `docs/performance.md` pointed at `make bench` for recall@k and nDCG. `bench` is
   latency only, by its own docstring; `make eval` is the quality one.
 
+## 11b. Closed: the unit suite keeps its own no-infrastructure promise
+
+`tests/fakes` states the design goal — "the entire unit suite runs with no
+network, no containers, no API keys and no model downloads" — and two tests had
+quietly stopped keeping it. `_stub_pipeline` passed no stores, so `_prepare` built
+a real `QdrantStore` and `PostgresStore` from the default DSNs; they passed only
+on a machine with the compose stack up and a `.env` pointing at it. On a clean
+clone they did not fail with a useful message, they spent 30 seconds each timing
+out. They inject fakes now.
+
+The regression is prevented by a direct assertion on the helper
+(`test_the_offline_pipeline_helper_injects_its_stores`), because that is where the
+mistake is made.
+
+There is also an autouse socket guard in `conftest`, but be clear about its reach:
+it patches `socket.socket.connect`, so it only sees clients that connect from
+Python. Measured against this stack, an HTTP Qdrant client is caught while gRPC —
+the Qdrant default — and psycopg both connect inside C and bypass it entirely. It
+would *not* have caught these two tests. It is kept because it costs nothing
+measurable (11.7s vs 11.9s for the suite) and does catch the case the assertion
+cannot: a unit test reaching a hosted API.
+
+## 11c. Closed: a failed ingest does not leave writes for the next run
+
+`_deferred` is instance state and `_LinearEngine` reuses one `IngestPipeline` for
+every `POST /ingest`, so a run that died after a stage buffered its docstore
+writes left them queued for the *next* run to flush against an unrelated document
+set. `ingest()` now owns the buffer's lifetime in a `finally`.
+
+The same test showed the flush was in the wrong place: it ran after
+`_write_documents` but *before* the leaf chunks, and a parent is a chunk row —
+which is the marker `_existing_checksums` reads as "this document is ingested". A
+run dying on the vector write left parents behind, so the retry skipped the
+document with none of its searchable content indexed. It flushes last now, the
+only point where the rows exist, no purge is coming, and the leaves are in.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
-Measured, pre-existing, and not caused by anything in this round: a clean copy of
-the previous commit aborts the same way. Three of 38 `ragorc ingest` runs exited
-134 with
+Still open, but no longer a mystery. A macOS crash report names the frames::
 
-    libc++abi: terminating due to uncaught exception of type std::__1::system_error:
-    recursive_mutex lock failed: Invalid argument
+    onnxruntime_pybind11_state.so
+      HttpClientManager::onHttpResponse
+      HttpResponseDecoder::handleDecode
+      LogManagerImpl::DispatchEvent
+      DebugEventSource::DispatchEvent
+    libc++  recursive_mutex::lock -> __throw_system_error -> abort
 
-*after* the command had printed its report and closed its stores. It has not
-recurred in 44 consecutive runs since, and all three happened while the machine
-was also running the test suite — consistent with a teardown race that only loses
-under CPU contention. All three were on the semantic-splitter path, which does far
-more concurrent ONNX work than the recursive one (0 of 24 there).
+That is ONNX Runtime's bundled Microsoft 1DS telemetry client, on its own worker
+thread, dispatching the *response* to a request it had sent — onto a mutex static
+destruction had already destroyed. The work is always finished by then; what is
+wrong is the exit code, which reads as a failure to CI and files a crash report.
 
-The work always completes; what is wrong is the exit code, which reads as a
-failure to CI and files a macOS crash report. `ragorc/embed/_runtime.py` exists to
-mitigate exactly this and is doing its job — `ORT_DISABLE_TELEMETRY=1` is set
-before the runtime imports, and the release hooks are registered. Two gaps in it
-*were* found and are fixed: `register_shutdown_hook` was guarded by one global
-flag, so only the first module to import ever registered, and two of the three
-model caches had no release function at all.
+Three things this settled:
 
-The remaining option, if it recurs, is to skip interpreter finalization at the CLI
-entry points — flush the streams and `os._exit(code)` — which eliminates the whole
-class of static-destructor race for CLI users. Not done here: it is unverifiable
-against a fault that will not reproduce on demand, and it silently disables
-`atexit`, coverage writers and buffered output for everyone.
+* **`ORT_DISABLE_TELEMETRY` does not work on this build.** The crash happened
+  with it set. `ragorc/embed/_runtime.py` had described it as the primary
+  mitigation.
+* **The documented fallback never ran.** `configure_onnx_runtime` guarded its
+  `disable_telemetry_events()` call with `if "onnxruntime" in sys.modules`, which
+  is false at provider-import time — the only time it was called. Fixed:
+  `disable_onnx_telemetry()` runs where importing a FastEmbed class has just
+  loaded the extension, and is verified to be reached.
+* **Merely importing onnxruntime is enough.** The unit suite builds no model and
+  still loads the extension (via `list_supported_models`), so the telemetry
+  thread exists in a run that does no inference at all.
+
+**The fix is not proven.** Measured over repeated full-suite runs the crash rate
+tracks machine load far more than either mitigation: 8/10 and 6/10 under
+sustained back-to-back runs, 6/6 and 0/4 clean on an idle machine, with and
+without. Telemetry being off is worth having regardless — this library reads
+internal documents — but do not record the abort as fixed.
+
+If it needs to be closed for real, the remaining lever is to skip interpreter
+finalization at the CLI entry points: flush the streams and `os._exit(code)`.
+That eliminates the whole class of static-destructor race, and it silently
+disables `atexit`, coverage writers and buffered output for everyone, so it is
+not worth doing until someone is actually blocked.
 
 ## 13. Closed earlier, kept for the record
 
