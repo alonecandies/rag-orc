@@ -165,6 +165,73 @@ run dying on the vector write left parents behind, so the retry skipped the
 document with none of its searchable content indexed. It flushes last now, the
 only point where the rows exist, no purge is coming, and the leaves are in.
 
+## 11d. Closed: the ranking and evaluation mathematics
+
+A pass over the numbers, which no earlier audit had checked. A wrong formula here
+is invisible — nothing crashes, results are merely worse or a benchmark lies.
+
+* **`max_fusion` inverted its own weights on negative scores.** It multiplied raw
+  scores by weights, and for a negative score a smaller weight moves it *up*:
+  logits -5.0 at weight 1.0 versus -9.0 at weight 0.1 ranked the down-weighted
+  junk first, and weight 0.0 — "disable this source" — produced -0.0, the largest
+  value in an all-negative column. Cross-encoder logits are routinely negative
+  (the shipped reranker prints -0.442 and -10.273 on the example corpus) and
+  `FusionMethod.MAX` is reachable config with non-uniform default weights. A zero
+  weight now drops the list; negative scores with non-uniform weights raise and
+  name `fusion='relative'`. Shift-by-minimum was considered and rejected: with one
+  element per list the minimum *is* the element, so weights would silently stop
+  meaning anything.
+* **Document-level retrieval metrics were computed and thrown away.** The shipped
+  dataset has 20 cases, 0 with chunk labels and 18 with a source document, so
+  `make eval` measured retrieval quality for 18 cases and then omitted it from
+  `to_dict()`, excluded it from `series_names()` (so `--compare` could never A/B
+  it), and printed "no chunk labels: retrieval metrics not computed" — which was
+  false. All three surfaces carry it now.
+* **`ragorc eval --compare` crashed.** `paired_bootstrap` correctly returns `None`
+  for every statistic when two runs share no scored case; the table formatted
+  `None` with `:.3f` and the TypeError took down the whole render, including the
+  metrics that did compare. Undefined now prints as an em dash, which is not the
+  same as zero.
+* **The "95% CI" column was hard-zero.** `to_dict()` emits `ci` as a pair; the
+  table read `ci_low`/`ci_high`, which never existed, so `.get(..., 0.0)` pinned
+  the one number that says whether a difference is real to `+0.000 to +0.000`.
+* **Lexical metrics were ASCII-only.** `_WORD` was `[a-z0-9]+`, so two identical
+  Russian answers scored 0.0, `café` tokenized to `caf` and `Müller` to `m` +
+  `ller`. Widened to Unicode word runs, with kana/Hangul/Han split per character
+  since those scripts carry no spaces and would otherwise collapse to exact match.
+* **The overflow decision did not price the framing.** `decide_strategy` compared
+  bodies against the window while the packer also charges each passage its header,
+  wrapper and separator — 23 tokens each on the default settings. A set that
+  overflowed once framed was reported as fitting and the packer then dropped the
+  tail. `ContextPacker.overhead()` is public now and the budgeter charges it.
+* **`ContextSummarizer._clip` destroyed the caller's chunk**, truncating in place
+  and returning the same object — the same aliasing hazard as
+  `GraphLocalRetriever._annotate`. It returns a copy.
+* Error panels ate the extra they told you to install: Rich reads `[...]` as a
+  style tag, so `pip install 'ragorc[server]'` rendered as `pip install 'ragorc'`.
+  Data is escaped before it reaches the markup parser now.
+
+## 11e. Open: the per-source budget split is computed and never enforced
+
+`BudgetPlan.per_source` is filled from `DEFAULT_SHARES` on every request and
+reported by `to_dict()`, and nothing reads it — one store can consume the whole
+context window. Documented in `docs/modules/context.md` as part of the public
+plan, so it is an advertised guarantee that does not hold.
+
+Left open deliberately, like the model cascade: enforcing it starts dropping
+evidence that is currently packed, which is a behaviour change for existing
+deployments and the operator's call. The alternative is deleting the field. Until
+one is chosen, the field's own docstring says plainly that it is not enforced.
+
+## 11f. Verified clean: packaging and the clean-clone path
+
+Checked for the first time and found nothing wrong. The wheel builds with all 154
+modules and `py.typed`; it installs into a fresh virtualenv from base dependencies
+alone; `import ragorc` and the `ragorc` console script both work. Every
+third-party import is either declared in an extra or guarded with a working
+fallback (`yaml`, `grpc`, `onnxruntime`), and the ones that are not declared
+cannot be missing when their parent is (`tokenizers`, `starlette`).
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
