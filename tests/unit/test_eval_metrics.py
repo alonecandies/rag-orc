@@ -166,3 +166,46 @@ def test_batch_shape_is_preserved() -> None:
     assert result[0] == pytest.approx(1.0)
     assert result[1] == pytest.approx(0.0)
     assert result[2] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Lexical metrics outside ASCII
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Le remboursement prend cinq jours",
+        "Die Rückerstattung dauert fünf Tage",
+        "El reembolso tarda cinco días",
+        "Возврат занимает пять дней",
+        "払い戻しは五日かかります",
+        "退款需要五天",
+    ],
+)
+def test_token_f1_scores_an_identical_non_ascii_answer_as_perfect(text: str) -> None:
+    """`_WORD` was `[a-z0-9]+`, so anything outside ASCII was not a token.
+
+    Two byte-identical Russian answers scored 0.00 — indistinguishable from a
+    completely wrong answer — and `café` tokenized to `caf`, `Müller` to
+    `m` + `ller`. That is most of Europe and all of CJK silently mis-scored, in
+    the metric used to decide whether a change helped.
+    """
+    from ragorc.eval.answer_metrics import token_f1
+
+    assert token_f1(text, text) == pytest.approx(1.0), f"identical answers must score 1.0: {text}"
+
+
+def test_lexical_tokens_keep_accented_words_whole() -> None:
+    from ragorc.eval.answer_metrics import _tokens
+
+    assert _tokens("café") == ["café"]
+    assert _tokens("Müller") == ["müller"]
+    assert _tokens("naïve résumé") == ["naïve", "résumé"]
+
+
+def test_token_f1_still_separates_different_answers() -> None:
+    """Widening the character class must not make everything match everything."""
+    from ragorc.eval.answer_metrics import token_f1
+
+    assert token_f1("Возврат занимает пять дней", "Возврат невозможен") < 0.6
+    assert token_f1("refunds take five days", "shipping is free") == pytest.approx(0.0)

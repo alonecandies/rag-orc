@@ -121,7 +121,20 @@ _MAX_LEXICAL_TOKENS = 800
 longer than this are truncated: the marginal ranking signal in the tail is far
 smaller than the quadratic cost of measuring it."""
 
-_WORD = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)*")
+_WORD = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
+r"""Word runs in any script. ``[^\W_]`` is ``\w`` without the underscore.
+
+It was ``[a-z0-9]+``, which made every non-ASCII character a separator: two
+byte-identical Russian answers scored 0.0 — indistinguishable from a completely
+wrong answer — ``café`` tokenized to ``caf`` and ``Müller`` to ``m`` + ``ller``.
+These metrics decide whether a change helped, so mis-scoring most of Europe and
+all of CJK is not a cosmetic problem."""
+
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+r"""Kana, Hangul and Han. These scripts do not put spaces between words, so a
+whole clause matches ``_WORD`` as one token and lexical overlap collapses to
+exact match. Splitting them per character is the usual cheap substitute for a
+segmenter, and it is what gives partial credit at all here."""
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +326,14 @@ class Scorecard:
 # The cheap baseline — no model, no API, no cost
 # ---------------------------------------------------------------------------
 def _tokens(text: str) -> list[str]:
-    return _WORD.findall(text.casefold())[:_MAX_LEXICAL_TOKENS]
+    out: list[str] = []
+    for word in _WORD.findall(text.casefold()):
+        # A token holding un-spaced script is split per character; anything else
+        # stays whole, so "5日" gives ["5", "日"] and "café" stays "café".
+        out.extend(list(word) if _CJK.search(word) else [word])
+        if len(out) >= _MAX_LEXICAL_TOKENS:
+            break
+    return out[:_MAX_LEXICAL_TOKENS]
 
 
 def token_f1(answer: str, reference: str) -> float:
