@@ -646,13 +646,41 @@ async def test_ingest_counts_documents_that_produced_no_chunks(
 # An ingest stage the operator asked for and did not get
 # ---------------------------------------------------------------------------
 def _stub_pipeline(**settings_kwargs):  # noqa: ANN003, ANN202
+    """An offline pipeline.
+
+    The stores are injected. Without them `_prepare` builds a real `QdrantStore`
+    and `PostgresStore` from the default DSNs, so these tests passed only on a
+    machine with the compose stack up and a `.env` pointing at it — and on a clean
+    clone they did not fail fast, they spent 30 seconds each timing out. The
+    fakes' whole purpose is that the unit suite needs no infrastructure.
+    """
     from ragorc.index.pipeline import IngestPipeline
-    from tests.fakes import StubEmbedder, StubLLM
+    from tests.fakes import FakeDocumentStore, FakeVectorStore, StubEmbedder, StubLLM
 
     settings_kwargs.setdefault("security", {"enforce_tenant_isolation": False})
     return IngestPipeline(
-        llm=StubLLM(), dense_embedder=StubEmbedder(), settings=Settings(**settings_kwargs)
+        llm=StubLLM(),
+        dense_embedder=StubEmbedder(),
+        vector_store=FakeVectorStore(),
+        relational_store=FakeDocumentStore(),
+        settings=Settings(**settings_kwargs),
     )
+
+
+def test_the_offline_pipeline_helper_injects_its_stores() -> None:
+    """The unit suite must not need infrastructure, and `_stub_pipeline` is where
+    that is decided: with no stores passed, `_prepare` builds a real `QdrantStore`
+    and `PostgresStore` from the default DSNs. Two tests did exactly that and
+    passed only on a machine with the compose stack up; on a clean clone they
+    spent 30 seconds each timing out.
+
+    Asserted here rather than left to the socket guard in `conftest`, which cannot
+    see it — gRPC and psycopg both connect inside C, below the Python socket the
+    guard patches.
+    """
+    pipeline = _stub_pipeline()
+    assert pipeline.vector is not None, "a real QdrantStore would be built on first use"
+    assert pipeline.relational is not None, "a real PostgresStore would be built on first use"
 
 
 def test_an_enabled_stage_that_cannot_load_is_reported_not_just_logged(

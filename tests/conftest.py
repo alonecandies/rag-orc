@@ -7,6 +7,8 @@ the ``integration`` marker, which is deselected by default in
 
 from __future__ import annotations
 
+import socket
+
 import numpy as np
 import pytest
 
@@ -22,6 +24,60 @@ from tests.fakes import (
     StubReranker,
     StubSparseEmbedder,
 )
+
+_REAL_CONNECT = socket.socket.connect
+_REAL_CONNECT_EX = socket.socket.connect_ex
+
+
+@pytest.fixture(autouse=True)
+def _no_network(request: pytest.FixtureRequest):
+    """Fail a unit test that opens a real TCP connection *from Python*.
+
+    The design goal in `tests/fakes` — "the entire unit suite runs with no
+    network, no containers, no API keys and no model downloads" — was a promise
+    in a docstring, and two tests had quietly stopped keeping it.
+
+    **This is a partial net, and the gap is worth knowing.** It patches
+    `socket.socket.connect`, so it only sees clients that connect through Python.
+    Measured against this stack: an HTTP Qdrant client is caught; gRPC — which is
+    the Qdrant default — and psycopg both connect inside C and sail straight
+    past. So it will catch a stray OpenRouter call or an `httpx` request, and it
+    would *not* have caught the two ingest tests that motivated it.
+
+    What catches those is
+    `test_the_offline_pipeline_helper_injects_its_stores`: a direct assertion on
+    the helper, which is where the mistake is actually made. Keep both — this one
+    is cheap (no measurable effect on suite runtime) and covers the case that
+    assertion cannot, namely a test reaching a *hosted* API.
+
+    Only AF_INET/AF_INET6 are blocked: `socket.socketpair()` is AF_UNIX and is how
+    asyncio builds its self-pipe, so blocking that would break the event loop
+    itself. Integration tests are exempt — reaching a service is their purpose.
+    """
+    if "integration" in request.keywords:
+        yield
+        return
+
+    def _blocked(self, address, *args, **kwargs):  # noqa: ANN001, ANN202
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            raise AssertionError(
+                f"unit test opened a real connection to {address!r}. "
+                "Inject a fake store or embedder instead — see tests/fakes."
+            )
+        return _REAL_CONNECT(self, address, *args, **kwargs)
+
+    def _blocked_ex(self, address, *args, **kwargs):  # noqa: ANN001, ANN202
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            raise AssertionError(f"unit test opened a real connection to {address!r}")
+        return _REAL_CONNECT_EX(self, address, *args, **kwargs)
+
+    socket.socket.connect = _blocked
+    socket.socket.connect_ex = _blocked_ex
+    try:
+        yield
+    finally:
+        socket.socket.connect = _REAL_CONNECT
+        socket.socket.connect_ex = _REAL_CONNECT_EX
 
 
 @pytest.fixture(autouse=True)
