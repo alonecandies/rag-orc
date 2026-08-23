@@ -70,12 +70,23 @@ not be asked, and the failure is recorded in `warnings` rather than passed off a
 zero.
 
 **Write order is a constraint, not a preference.** `chunks.document_id` is a
-foreign key to `documents(id)` with `ON DELETE CASCADE`, so per window the order
-is: build chunks → purge the stale ones → write document rows → write everything
-the enrichment stages want persisted (parents, summarised sources) → write chunks.
+foreign key to `documents(id)` with `ON DELETE CASCADE`, so the order is: per
+window, build chunks → purge the stale ones → write document rows → write chunks;
+then once, at the end of the run, write everything the enrichment stages wanted
+persisted (parents, summarised sources).
+
 Parent-document and multi-representation writes are buffered during processing and
-flushed at that point; doing them inline put them before the row they reference and
-before a cascade that would have deleted them.
+flushed last because three things have to be true at once, and that is the only
+point where they all are: the document rows exist (foreign key), no purge is still
+coming (cascade), and the leaves are already written. The third matters because a
+parent *is* a chunk row, and chunk rows are the marker `_existing_checksums` reads
+as "this document is ingested" — flush them before the leaves and a run that dies
+on the vector write leaves parents behind, so the retry skips the document with
+none of its searchable content indexed.
+
+The buffer belongs to the run, not the pipeline: `ingest()` discards anything left
+in it on the way out, because the server reuses one pipeline across requests and a
+failed run's writes must not land in the next one.
 
 ```
 build_splitter(name=None, *, embedder=None, settings=None) -> Splitter

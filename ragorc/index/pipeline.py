@@ -517,7 +517,31 @@ class IngestPipeline:
         """
         report = IngestReport()
         run_started = time.perf_counter()
+        # A run owns its buffer, and gives it up on the way out however it leaves.
+        # `_deferred` is instance state and the server reuses one pipeline for
+        # every `POST /ingest`, so a run that died after a stage buffered its
+        # docstore writes — a store failure, a cancelled request — used to leave
+        # them queued for the *next* run to flush against an unrelated document
+        # set. That is the write-ordering bug the buffer exists to prevent,
+        # arriving by a different door. Discarding is right: the failed run's
+        # leaves were never written either, so its work is void and a retry
+        # rebuilds it from content-derived ids.
+        try:
+            return await self._ingest(target, report, run_started, force=force)
+        finally:
+            if self._deferred:
+                log.warning(
+                    "discarding_orphaned_docstore_writes",
+                    chunks=len(self._deferred),
+                    reason="the run did not reach its flush",
+                )
+                self._deferred = []
 
+    async def _ingest(
+        self, target: Any, report: IngestReport, run_started: float, *, force: bool
+    ) -> IngestReport:
+        """The run itself. Split out so :meth:`ingest` owns the buffer's lifetime
+        in one `finally` rather than at every return and raise inside it."""
         with timed("ingest"):
             strategy: ChunkingStrategy | None = None
             # One bulk-load window for the whole run, entered on the first batch
@@ -1107,9 +1131,6 @@ class IngestPipeline:
             if stale:
                 await self._purge(stale, report)
             await self._write_documents(ready, report)
-            # After the rows and after the cascade: the two conditions the
-            # deferred docstore writes were violating (see `_DeferredDocstore`).
-            await self._flush_deferred(report)
 
             pending.extend(chunks)
             while len(pending) >= batch:
@@ -1118,6 +1139,16 @@ class IngestPipeline:
 
         if pending:
             await self._write_chunks(pending, report)
+
+        # Last, after every leaf is written. Three conditions have to hold at once
+        # and this is the only point where they all do: the document rows exist
+        # (foreign key), no purge is still coming (cascade), and the leaves are
+        # already in — which matters because a parent *is* a chunk row, and chunk
+        # rows are what `_existing_checksums` treats as the marker saying a
+        # document is ingested. Flushed before the leaves, a run that died on the
+        # vector write left parents behind, and the retry then skipped the
+        # document as already done with none of its searchable content indexed.
+        await self._flush_deferred(report)
 
     async def _process_window(
         self,

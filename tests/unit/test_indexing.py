@@ -1506,3 +1506,56 @@ async def test_a_small_ingest_does_not_pay_for_bulk_load_mode() -> None:
     await pipeline.ingest(few)
 
     assert store.entries == 0
+
+
+async def test_a_failed_run_does_not_leave_chunks_for_the_next_one_to_write() -> None:
+    """`_deferred` is instance state on a pipeline the server reuses.
+
+    `_LinearEngine` builds one `IngestPipeline` and calls `ingest()` on it for
+    every `POST /ingest`. A run that dies after a stage has buffered its docstore
+    writes — a vector-store failure, a cancelled request — leaves them in
+    `_deferred`, and the *next* run flushes them after its own `_write_documents`.
+    The result is chunks from a failed run appearing in a later one, attached to a
+    document set that has nothing to do with them, which is exactly the class of
+    write-ordering bug the buffer was introduced to prevent.
+    """
+    from tests.fakes import FakeDocumentStore, FakeVectorStore
+
+    class _FailsOnce(FakeVectorStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        async def upsert(self, chunks: Any) -> int:
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("qdrant went away mid-run")
+            return await super().upsert(chunks)
+
+    store = FakeDocumentStore()
+    pipeline = _fk_pipeline(store, parent_document_enabled=True)
+    pipeline.vector = _FailsOnce()
+    body = "\n\n".join(f"Section {i}. " + "Refund policy detail. " * 40 for i in range(3))
+
+    with pytest.raises(RuntimeError, match="qdrant went away"):
+        await pipeline.ingest([Document(id="doomed", content=body)])
+
+    assert pipeline._deferred == [], (
+        "a failed run must not leave its buffered writes queued on a pipeline the "
+        "server will reuse for the next request"
+    )
+
+    await pipeline.ingest([Document(id="healthy", content=body)])
+
+    # Parents are the buffered writes, so they are what this is about. Leaf chunks
+    # from the failed run may survive: `_write_chunks` fans out to both stores and
+    # this double's relational write never awaits, so there is no point at which
+    # the sibling cancellation can preempt it. Real psycopg yields on I/O and the
+    # transaction rolls back — but the library promises idempotent re-ingest by
+    # content-derived id, not cross-store atomicity, so asserting the stronger
+    # property here would be asserting something the design does not offer.
+    orphaned = [c for c in store.chunks.values() if c.dense is None and c.document_id == "doomed"]
+    assert not orphaned, f"the failed run's buffered parents were written later: {orphaned}"
+    assert any(c.dense is None and c.document_id == "healthy" for c in store.chunks.values()), (
+        "the healthy run's own parents must still be persisted"
+    )
