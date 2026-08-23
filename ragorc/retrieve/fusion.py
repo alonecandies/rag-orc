@@ -555,12 +555,47 @@ def max_fusion(
     reranker applied to several candidate pools — where per-list normalization
     would manufacture differences that do not exist.
     """
-    align = _align(result_lists, names, weights)
+    # A zero weight means "do not use this list", so drop it before alignment.
+    # Multiplying instead mapped its every score to -0.0, which in an
+    # all-negative column is the *largest* value there is — the one setting that
+    # disables a source promoted it to first place. Dropping the list here, not
+    # masking it later, also keeps chunks that only it contributed out of the
+    # output entirely rather than leaving them with a NaN score.
+    labels, lists = _label_lists(result_lists, names)
+    weight_vector = _weight_vector(labels, weights)
+    live = [i for i, w in enumerate(weight_vector) if w > 0.0]
+    if not live:
+        return []
+    if len(live) != len(lists):
+        log.debug(
+            "fusion_zero_weight_lists_dropped",
+            dropped=[labels[i] for i in range(len(labels)) if i not in set(live)],
+        )
+        lists = [lists[i] for i in live]
+        labels = [labels[i] for i in live]
+        weights = {labels[j]: float(weight_vector[i]) for j, i in enumerate(live)}
+
+    align = _align(lists, labels, weights)
     if not align.chunks:
         return []
     # NaN marks "absent", and every column has at least one contributor by
     # construction, so nanmax is well defined and needs no fill value.
     contributions = np.where(align.present, align.scores, np.nan)
+
+    # Multiplicative weighting needs a ratio scale, and these scores are raw and
+    # may be negative: a cross-encoder logit of -9.0 at weight 0.1 becomes -0.9
+    # and outranks a -5.0 at weight 1.0, so down-weighting a list *promotes* it.
+    # Uniform positive weights are fine — scaling everything by one constant is
+    # order-preserving — so only the mixed case is refused, and it is refused
+    # loudly rather than returning a plausible, wrongly ordered list.
+    if bool(np.any(contributions < 0.0)) and not bool(np.allclose(align.weights, align.weights[0])):
+        raise ValueError(
+            "max fusion cannot weight negative scores: multiplying by a weight "
+            "below 1 moves a negative score up, so a down-weighted list outranks "
+            "the list you trust. Use fusion='relative' (min-max per list, then "
+            "max), or drop the per-list weights."
+        )
+
     totals = np.nanmax(contributions * align.weights[:, None], axis=0)
     return _assemble(
         align, np.nan_to_num(contributions, nan=0.0), totals, method="max", top_k=top_k

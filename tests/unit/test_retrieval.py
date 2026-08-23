@@ -641,3 +641,80 @@ async def test_parent_retriever_returns_nothing_for_nothing() -> None:
         settings=Settings(security={"enforce_tenant_isolation": False}),
     )
     assert await retriever.retrieve(Query(text="q"), top_k=5) == []
+
+
+# ---------------------------------------------------------------------------
+# Weighted max over raw scores
+# ---------------------------------------------------------------------------
+def _weighted(cid: str, score: float):  # noqa: ANN202
+    from ragorc.core.models import Chunk, RetrievalSource, ScoredChunk
+
+    return ScoredChunk(
+        chunk=Chunk(id=cid, content=cid),
+        score=score,
+        source=RetrievalSource.DENSE,
+        rank=0,
+    )
+
+
+def test_max_fusion_does_not_promote_a_down_weighted_negative_score() -> None:
+    """Multiplying a *negative* score by a weight below 1 moves it toward zero,
+    which for a maximum means *up*. So down-weighting a list promoted it.
+
+    Cross-encoder logits are routinely negative — the shipped reranker prints
+    -0.442 and -10.273 on the example corpus — and `retrieval.fusion = "max"` is
+    reachable configuration, so this is not a hypothetical scale. With weights
+    1.0 and 0.1 over logits -5.0 and -9.0, the down-weighted irrelevant chunk
+    came first.
+    """
+    from ragorc.retrieve.fusion import max_fusion
+
+    with pytest.raises(ValueError, match="cannot weight negative scores") as caught:
+        max_fusion(
+            [[_weighted("relevant", -5.0)], [_weighted("irrelevant", -9.0)]],
+            {"trusted": 1.0, "junk": 0.1},
+            names=["trusted", "junk"],
+        )
+    # The message has to name the way out, or it is just a new failure mode.
+    assert "relative" in str(caught.value)
+
+
+def test_a_zero_weight_excludes_a_list_rather_than_winning_with_it() -> None:
+    """`-9.0 * 0.0` is `-0.0`, the largest value in an all-negative column, so
+    the one weight that means "do not use this source at all" made it win."""
+    from ragorc.retrieve.fusion import max_fusion
+
+    out = max_fusion(
+        [[_weighted("relevant", -0.4)], [_weighted("irrelevant", -9.0)]],
+        {"trusted": 1.0, "junk": 0.0},
+        names=["trusted", "junk"],
+    )
+    assert [r.chunk.id for r in out] == ["relevant"], (
+        f"a zero-weighted list must contribute nothing: {[(r.chunk.id, r.score) for r in out]}"
+    )
+
+
+def test_max_fusion_still_weights_non_negative_scores_as_before() -> None:
+    """The documented case — commensurable, non-negative scores — must not move."""
+    from ragorc.retrieve.fusion import max_fusion
+
+    out = max_fusion(
+        [[_weighted("a", 0.8)], [_weighted("b", 0.6)]],
+        {"x": 1.0, "y": 0.5},
+        names=["x", "y"],
+    )
+    scores = {r.chunk.id: round(r.score, 6) for r in out}
+    assert scores == {"a": 0.8, "b": 0.3}, scores
+
+
+def test_max_fusion_keeps_order_for_negative_scores_under_uniform_weights() -> None:
+    """Scaling every list by the same positive constant is order-preserving, so
+    uniform weights stay legal on negative scores."""
+    from ragorc.retrieve.fusion import max_fusion
+
+    out = max_fusion(
+        [[_weighted("better", -1.0)], [_weighted("worse", -7.0)]],
+        {"x": 1.0, "y": 1.0},
+        names=["x", "y"],
+    )
+    assert [r.chunk.id for r in out] == ["better", "worse"]
