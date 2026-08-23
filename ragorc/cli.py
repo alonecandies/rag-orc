@@ -53,6 +53,7 @@ import orjson
 import structlog
 import typer
 from rich.console import Console
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -200,9 +201,33 @@ async def _service(settings: Settings) -> AsyncIterator[RagService]:
 # ---------------------------------------------------------------------------
 # Error presentation
 # ---------------------------------------------------------------------------
+def _plain(text: object) -> str:
+    """Escape text that is *data*, before it reaches Rich's markup parser.
+
+    Rich reads ``[...]`` as a style tag, so an unescaped
+    ``pip install 'ragorc[server]'`` renders as ``pip install 'ragorc'`` — advice
+    to install the package the operator already has, delivered at the moment they
+    are stuck. Every optional import in this library raises with its own pip hint,
+    and those messages are printed straight into a panel, so the extra was being
+    eaten from the one line that would have fixed the problem.
+
+    The same hazard applies to any interpolated filename, error or model output:
+    ``notes[2024].md`` loses its year. Style tags this module writes itself stay
+    outside the escaped part.
+    """
+    return _escape_markup(str(text))
+
+
 def _fail(title: str, message: str, hint: str, code: int) -> NoReturn:
     """Report and exit. Declared ``NoReturn`` so callers need no unreachable branch."""
-    err.print(Panel(message, title=f"[red]{title}[/red]", subtitle=hint, border_style="red"))
+    err.print(
+        Panel(
+            _plain(message),
+            title=f"[red]{_plain(title)}[/red]",
+            subtitle=_plain(hint),
+            border_style="red",
+        )
+    )
     raise typer.Exit(code)
 
 
@@ -607,7 +632,7 @@ async def _discover(
                 documents.extend(await load(path, tenant_id=tenant, settings=settings))
     err.print(f"discovered [bold]{len(documents)}[/bold] document(s)")
     for source, reason in failures[:10]:
-        err.print(f"[yellow]unreadable[/yellow] {source}: {reason}")
+        err.print(f"[yellow]unreadable[/yellow] {_plain(source)}: {_plain(reason)}")
     if len(failures) > 10:
         err.print(f"[yellow]... and {len(failures) - 10} more unreadable file(s)[/yellow]")
     return documents
@@ -729,7 +754,7 @@ def _report_table(report: Any) -> Table:
 def _print_problems(report: Any) -> None:
     for label, rows in (("rejected", report.rejected), ("failed", report.failed)):
         for source, reason in list(rows)[:10]:
-            err.print(f"[yellow]{label}[/yellow] {source}: {reason}")
+            err.print(f"[yellow]{_plain(label)}[/yellow] {_plain(source)}: {_plain(reason)}")
         if len(rows) > 10:
             err.print(f"[yellow]... and {len(rows) - 10} more {label}[/yellow]")
 
@@ -798,7 +823,7 @@ async def _stream_answer(service: RagService, request: QueryRequest) -> None:
         if event == "token":
             console.print(data, end="", markup=False, highlight=False)
         elif event == "warning":
-            err.print(f"[yellow]{data}[/yellow]")
+            err.print(f"[yellow]{_plain(data)}[/yellow]")
         elif event == "done":
             console.print()
             summary = orjson.loads(data)
@@ -823,7 +848,7 @@ def _print_answer(response: Any, *, elapsed_ms: float, show_trace: bool) -> None
     console.print(Panel(response.answer, title=title, border_style="cyan", highlight=False))
 
     if response.abstained and response.abstain_reason:
-        console.print(f"[dim]reason: {response.abstain_reason}[/dim]")
+        console.print(f"[dim]reason: {_plain(response.abstain_reason)}[/dim]")
 
     if response.citations:
         table = Table(title="citations", box=None, pad_edge=False)
@@ -860,7 +885,7 @@ def _print_answer(response: Any, *, elapsed_ms: float, show_trace: bool) -> None
         console.print(table)
 
     for warning in response.warnings:
-        err.print(f"[yellow]{warning}[/yellow]")
+        err.print(f"[yellow]{_plain(warning)}[/yellow]")
 
     cost = response.metadata.get("cost", {}) if isinstance(response.metadata, dict) else {}
     console.print(
@@ -989,7 +1014,7 @@ def evaluate(
             if hidden:
                 err.print(f"[dim]{hidden} inconclusive metric(s) hidden; --json has all[/dim]")
         for warning in [*baseline.warnings, *(variant.warnings if variant else [])]:
-            err.print(f"[yellow]{warning}[/yellow]")
+            err.print(f"[yellow]{_plain(warning)}[/yellow]")
 
     _run(run)
 
@@ -1110,6 +1135,24 @@ def _metrics_tables(rows: Sequence[tuple[str, Any]]) -> list[Table]:
     return [operational, quality]
 
 
+_EMPTY = "—"
+"""Shown where a statistic is undefined, which is not the same as zero."""
+
+
+def _number(value: object, *, sign: bool = False) -> str:
+    """Format a statistic, or mark it undefined.
+
+    `paired_bootstrap` returns `None` for every field when the two runs share no
+    comparable case. Formatting that with `:.3f` raised
+    `TypeError: unsupported format string passed to NoneType.__format__` and took
+    down the whole `--compare` render, including the metrics that did compare.
+    Substituting 0.0 would be worse: it reads as a measured no-difference.
+    """
+    if value is None or not isinstance(value, (int, float)):
+        return _EMPTY
+    return f"{value:+.3f}" if sign else f"{value:.3f}"
+
+
 def _comparison_table(comparison: dict[str, Any]) -> tuple[Table, int]:
     """Render an A/B, showing everything that moved plus the headline metrics.
 
@@ -1147,14 +1190,20 @@ def _comparison_table(comparison: dict[str, Any]) -> tuple[Table, int]:
             continue
         verdict = str(result.get("verdict", ""))
         colour = colours.get(verdict, "dim")
+        # Every statistic is `None` when the two runs share no scored case, and
+        # the interval is a `ci` *pair* — not `ci_low`/`ci_high`, which never
+        # existed, so `.get(..., 0.0)` pinned this column to "+0.000 to +0.000"
+        # on every row. That is the one number that says whether a difference is
+        # real, so a hard zero there is worse than no column at all.
+        low, high = (result.get("ci") or (None, None))[:2]
         table.add_row(
             name,
-            f"{result.get('baseline', 0.0):.3f}",
-            f"{result.get('candidate', 0.0):.3f}",
-            f"{result.get('difference', 0.0):+.3f}",
-            f"{result.get('ci_low', 0.0):+.3f} to {result.get('ci_high', 0.0):+.3f}",
-            f"{result.get('p_value', 1.0):.3f}",
-            f"[{colour}]{verdict}[/{colour}]",
+            _number(result.get("baseline")),
+            _number(result.get("candidate")),
+            _number(result.get("difference"), sign=True),
+            _EMPTY if low is None or high is None else f"{low:+.3f} to {high:+.3f}",
+            _number(result.get("p_value")),
+            f"[{colour}]{_plain(verdict)}[/{colour}]",
         )
     return table, len(metrics) - len(shown)
 
@@ -1469,7 +1518,7 @@ def inspect_config(
         if stores:
             console.print(_store_table(payload["health"]))
             for warning in payload["health"]["warnings"]:
-                err.print(f"[yellow]{warning}[/yellow]")
+                err.print(f"[yellow]{_plain(warning)}[/yellow]")
 
     _run(run)
 

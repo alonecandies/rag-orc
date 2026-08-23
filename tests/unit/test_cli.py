@@ -173,3 +173,58 @@ def test_the_batched_ingest_report_carries_every_field_the_table_prints() -> Non
     # raises KeyError on a real run.
     rendered = _report_table(merged)
     assert rendered.row_count >= 12
+
+
+def test_an_error_panel_does_not_eat_the_extra_it_tells_you_to_install() -> None:
+    """Rich treats `[...]` as a style tag, so `pip install 'ragorc[server]'`
+    renders as `pip install 'ragorc'` — advice to install the package you already
+    have, printed at the exact moment you are stuck.
+
+    Worst on the generic `ImportError` branch: every optional import in this
+    library raises with its own pip hint, and `_run` prints that message through a
+    panel, so the extra is stripped out of the one line that would have fixed it.
+    """
+    import io
+
+    import typer
+    from rich.console import Console
+
+    from ragorc import cli
+
+    captured = Console(file=io.StringIO(), width=100)
+    original = cli.err
+    cli.err = captured  # type: ignore[assignment]
+    try:
+        with pytest.raises(typer.Exit):
+            cli._fail(
+                "missing dependency",
+                "RedisCache requires the redis extra: pip install 'ragorc[redis]'",
+                "pip install 'ragorc[server]'",
+                2,
+            )
+    finally:
+        cli.err = original  # type: ignore[assignment]
+
+    out = captured.file.getvalue()  # type: ignore[attr-defined]
+    assert "ragorc[redis]" in out, f"the message lost its extra:\n{out}"
+    assert "ragorc[server]" in out, f"the hint lost its extra:\n{out}"
+
+
+def test_dynamic_text_in_the_console_survives_square_brackets() -> None:
+    """The same hazard wherever a filename, an error or model output is
+    interpolated into a Rich string: a path like `notes[2024].md` loses its
+    year, and an error quoting a list loses the list."""
+    import io
+
+    from rich.console import Console
+
+    from ragorc.cli import _plain
+
+    captured = Console(file=io.StringIO(), width=100)
+    captured.print(
+        f"[yellow]unreadable[/yellow] {_plain('notes[2024].md')}: {_plain('bad [utf-8]')}"
+    )
+    out = captured.file.getvalue()
+
+    assert "notes[2024].md" in out, out
+    assert "[utf-8]" in out, out

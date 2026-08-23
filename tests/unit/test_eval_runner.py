@@ -251,3 +251,68 @@ def test_an_inconclusive_difference_is_not_a_verdict() -> None:
         p_value=0.6,
     )
     assert noise.verdict == "inconclusive"
+
+
+# ---------------------------------------------------------------------------
+# The A/B table
+# ---------------------------------------------------------------------------
+def _rendered(comparison: object) -> str:
+    import io
+
+    from rich.console import Console
+
+    from ragorc.cli import _comparison_table
+
+    table, _hidden = _comparison_table(comparison.to_dict())  # type: ignore[attr-defined]
+    console = Console(file=io.StringIO(), width=140)
+    console.print(table)
+    return console.file.getvalue()  # type: ignore[attr-defined]
+
+
+def test_the_comparison_table_survives_a_metric_with_no_comparable_pairs() -> None:
+    """`paired_bootstrap` returns `None` for every statistic when the two runs
+    share no scored case — correct, since there is nothing to compare. The table
+    then formatted `None` with `:.3f` and the whole `ragorc eval --compare`
+    invocation died with a TypeError, taking the metrics that *did* compare with
+    it."""
+    from ragorc.eval.runner import Comparison, paired_bootstrap
+
+    comparison = Comparison(
+        baseline="a",
+        candidate="b",
+        results={
+            "ndcg@10": paired_bootstrap({}, {}, metric="ndcg@10"),
+            "faithfulness": paired_bootstrap(
+                {"q1": 0.2, "q2": 0.3}, {"q1": 0.9, "q2": 0.8}, metric="faithfulness"
+            ),
+        },
+    )
+
+    out = _rendered(comparison)
+
+    assert "ndcg@10" in out, out
+    assert "faithfulness" in out, "a comparable metric must still be reported"
+
+
+def test_the_comparison_table_prints_the_real_confidence_interval() -> None:
+    """`BootstrapResult.to_dict()` emits `ci` as a `[low, high]` pair. The table
+    read `ci_low` and `ci_high`, which do not exist, so `.get(..., 0.0)` made the
+    column read `+0.000 to +0.000` on every row — the one number that says
+    whether an A/B difference is real, permanently pinned to zero."""
+    from ragorc.eval.runner import Comparison, paired_bootstrap
+
+    baseline = {f"q{i}": 0.10 * (i % 3) for i in range(30)}
+    candidate = {f"q{i}": 0.10 * (i % 3) + 0.5 for i in range(30)}
+    result = paired_bootstrap(baseline, candidate, metric="faithfulness")
+    low, high = result.to_dict()["ci"]
+    assert low is not None and abs(low) > 1e-9, f"the fixture needs a real interval: {low}"
+
+    out = _rendered(Comparison(baseline="a", candidate="b", results={"faithfulness": result}))
+    row = next(line for line in out.splitlines() if "faithfulness" in line)
+
+    assert "+0.000 to +0.000" not in row, f"the interval column is hard-zero: {row}"
+    # The whole interval as one substring: matching the bound alone passes by
+    # coincidence when it equals the delta printed in the neighbouring column.
+    assert f"{low:+.3f} to {high:+.3f}" in row, (
+        f"expected the real interval {low:+.3f} to {high:+.3f} in: {row}"
+    )
