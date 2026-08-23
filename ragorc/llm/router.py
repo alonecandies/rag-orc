@@ -160,16 +160,6 @@ class ModelRouter:
             "completion", 0.0
         )
 
-    def should_escalate(self, confidence: float, *, threshold: float | None = None) -> bool:
-        """Cascade decision: retry a low-confidence cheap answer on the strong
-        model. Most queries never trigger this, so the average cost stays near
-        the cheap tier while the tail gets the good model."""
-        settings = get_settings().cost
-        if not settings.cascade_enabled:
-            return False
-        limit = threshold if threshold is not None else settings.cascade_confidence_threshold
-        return confidence < limit
-
     def describe(self) -> dict[str, Any]:
         return {
             "fast": self.settings.fast_model,

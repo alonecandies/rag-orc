@@ -36,7 +36,6 @@ ModelRouter(settings=None, overrides: dict[Task, str] | None = None,
 .model_for(task: Task, *, escalate: bool = False) -> str
 .model_for_tier(tier: ModelTier) -> str
 .estimate_cost(model, prompt_tokens, completion_tokens) -> float
-.should_escalate(confidence, *, threshold=None) -> bool
 ```
 
 `Task` enumerates **every** LLM-using stage. Adding a stage means adding a member,
@@ -83,7 +82,7 @@ an itemized bill rather than one number.
 | Setting | Effect |
 |---|---|
 `llm.api_key` · `llm.base_url` | any OpenAI-compatible endpoint works |
-`llm.model` · `fast_model` · `strong_model` | the three cascade slots; `strong_model` is reached only by the Text-to-SQL guard repair |
+`llm.model` · `fast_model` · `strong_model` | the three cascade slots; `strong_model` is reached only by the Text-to-SQL guard repair (ADR-0005 explains why there is no confidence gate) |
 `llm.temperature` | 0.0 — RAG answers should be reproducible and classifiers want argmax |
 `llm.max_concurrency` | shared semaphore over all in-flight requests |
 `llm.max_retries` · `retry_base_delay_s` · `retry_max_delay_s` | backoff with full jitter |
@@ -93,6 +92,5 @@ an itemized bill rather than one number.
 `llm.require_parameters` | only providers that support `response_format`, so structured output cannot silently degrade |
 `llm.data_collection` | `deny` excludes providers that train on prompts |
 `llm.enable_prompt_cache` | emits provider cache hints; large static systems then cost ~10% on repeats |
-`cost.cascade_enabled` · `cascade_confidence_threshold` | **inert** — `should_escalate` implements the gate and nothing calls it (ADR-0005) |
 `cost.refresh_prices` | pull live prices from `/models` so cost stays correct |
 `cache.cache_llm` | route completions through `LLMCache` |

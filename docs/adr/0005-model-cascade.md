@@ -24,26 +24,44 @@ Three named tiers, and every stage declares which it needs via the `Task` enum:
 |---|---|---|
 `fast` | `llm.fast_model` | routing, all grading, rewriting, decomposition, self-query, compression, claim verification, sufficiency checks, HyDE |
 `balanced` | `llm.model` | the answer, summarization, proposition extraction, graph extraction, community reports, RankGPT |
-`strong` | `llm.strong_model` | escalation only — today that is the Text-to-SQL guard repair and nothing else (see below) |
+`strong` | `llm.strong_model` | escalation only: the Text-to-SQL guard repair, unconditionally (see below) |
 
 Summarization sits in `balanced` despite being high-volume, because a summary
 *becomes the retrieval target* — a bad summary is permanently bad, in a way a bad
 one-off grade is not. Graph extraction is `balanced` for the same reason:
 extraction quality determines whether traversal finds anything at all.
 
-### Status of the confidence gate
+### Rejected: confidence-gated escalation on the answer path
 
-The confidence-gated escalation this ADR describes is **decided but not wired**.
-`ModelRouter.should_escalate` exists and reads `cost.cascade_enabled` and
-`cost.cascade_confidence_threshold`, and nothing calls it: the only
-`escalate=True` in the library is `construct/text_to_sql.py`'s guard repair,
-which is unconditional rather than confidence-gated. So both settings are
-currently inert, and no answer is re-asked on `strong_model`.
+An earlier draft of this ADR called for re-asking `strong_model` whenever a cheap
+answer scored below a confidence threshold. `ModelRouter.should_escalate` and two
+`cost.cascade_*` settings were written for it and never wired. Both are now
+removed, deliberately, for three reasons.
 
-Wiring it is a cost decision, not a mechanical one — `cascade_enabled` defaults
-to `true`, so implementing the gate starts spending on `strong_model` for every
-answer that scores below the threshold. It is recorded in
-`docs/internal/OPEN-ITEMS.md` rather than quietly switched on.
+**There is no confidence signal to gate on.** `Answer.confidence` is a literal
+`1.0` on the plain and JSON-citation paths; the only real measurement is
+self-consistency agreement, which is off by default. With `check_groundedness`
+on — also the default — `confidence` reduces to the groundedness score. So the
+gate would not have measured model uncertainty at all. It would have measured
+groundedness, under another name.
+
+**The gate it would really be duplicates one that already fires.** Abstention
+already triggers below `groundedness_threshold` (0.70) and the cascade threshold
+was 0.75, leaving a five-point band where the two do not overlap. Placed after
+abstention it is nearly inert; placed before it, it retries every ungrounded
+answer on the most expensive model in the stack — one extra *synthesis* call,
+which is the single largest call in a query because it carries the whole packed
+context, and it forecloses streaming for those requests.
+
+**A bigger model is the weakest available response to poor grounding.** Low
+groundedness usually means retrieval failed, and re-reading the same bad context
+with a stronger model does not fix that. This library already ships three better
+answers to it: CRAG re-retrieves, RRR rewrites the query, and abstention refuses.
+Those act on the cause.
+
+`strong_model` stays. It is reached by `model_for(..., escalate=True)` from the
+Text-to-SQL guard repair, which escalates unconditionally — a query the guard
+rejected is worth one expensive retry rather than a failed answer.
 
 Supporting mechanisms:
 
