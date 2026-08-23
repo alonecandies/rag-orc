@@ -27,19 +27,40 @@ SIGPIPE from ``| head``, a container stop) while sessions exist, and more likely
 the more sessions there are: the default configuration loads three (dense,
 sparse, reranker).
 
+A crash report from ORT 1.29 on macOS names the frames exactly::
+
+    HttpClientManager::onHttpResponse -> HttpResponseDecoder::handleDecode
+      -> LogManagerImpl::DispatchEvent -> recursive_mutex::lock -> abort
+
+so the client had made a request to Microsoft and was dispatching the *reply*
+when the mutex it needed was already gone.
+
 Two mitigations, applied in order of directness:
 
 1. **Disable the telemetry subsystem itself.** It is the exact code in the stack
-   trace, it sends usage data to Microsoft, and nothing here needs it. Disabled
-   via the environment variable *before* ``onnxruntime`` is imported (the C++
-   side reads it during static initialization, so setting it afterwards is too
-   late) and via the Python API as a second attempt for builds that ignore it.
+   trace, it sends usage data to Microsoft, and nothing here needs it —
+   :func:`disable_onnx_telemetry` calls the runtime's own
+   ``disable_telemetry_events()`` at the point where importing a FastEmbed class
+   has just loaded the extension.
+
+   ``ORT_DISABLE_TELEMETRY`` is still set before the import, but do not rely on
+   it: the crash above happened with it set, so this build ignores it. Worse, the
+   Python call that was meant to be the fallback sat behind
+   ``if "onnxruntime" in sys.modules`` — false at provider-import time, which is
+   the only time it ran — so until :func:`disable_onnx_telemetry` existed the
+   API was never called at all and the env var was the *only* mitigation.
 2. **Release sessions before static destruction.** An ``atexit`` handler drops
    the cached models while the interpreter is still alive, so ONNX tears down its
-   threads in a defined order instead of racing the C++ runtime's own exit.
+   threads in a defined order instead of racing the C++ runtime's own exit. All
+   three model caches in this package register one; for a long time only
+   FastEmbed's did.
 
-Both are cheap, neither changes inference behaviour, and together they turn a
-crash-on-exit into a clean exit.
+Both are cheap and neither changes inference behaviour. **Neither is a proven fix
+for the abort.** Measured over repeated full-suite runs the crash rate moves with
+machine load far more than with either mitigation — 8/10 under sustained parallel
+load, 0/4 on an idle machine, with and without. What is certain is that telemetry
+is now actually off, which is worth having on its own for a library that reads
+internal documents.
 """
 
 from __future__ import annotations
@@ -54,7 +75,7 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["configure_onnx_runtime", "register_shutdown_hook"]
+__all__ = ["configure_onnx_runtime", "disable_onnx_telemetry", "register_shutdown_hook"]
 
 #: Read by ONNX Runtime's C++ static initializer, so it must be set before the
 #: extension module is imported.
@@ -105,6 +126,53 @@ def configure_onnx_runtime() -> None:
             set_severity(3)
         except Exception as exc:  # noqa: BLE001
             log.debug("onnx_logger_severity_failed", error=str(exc)[:120])
+
+
+_telemetry_disabled = False
+
+
+def disable_onnx_telemetry() -> bool:
+    """Turn ONNX Runtime's telemetry client off through its Python API.
+
+    Must be called *after* ``onnxruntime`` is imported, which is why it is
+    separate from :func:`configure_onnx_runtime`. That function runs at provider
+    import time — before the extension loads — so its own API attempt was guarded
+    by ``if "onnxruntime" in sys.modules`` and therefore never ran. It set the
+    environment variable and returned, and the environment variable does not stop
+    this build: a crash report from ORT 1.29 shows the 1DS client on a worker
+    thread, in ``HttpClientManager::onHttpResponse`` — it had made a request to
+    Microsoft and was dispatching the reply onto a ``recursive_mutex`` that static
+    destruction had already torn down.
+
+    That is the abort this module exists to prevent, so the mitigation has to be
+    the call the runtime actually honours. Idempotent, and never raises: a build
+    without the API is a build that does not need it.
+    """
+    global _telemetry_disabled
+    if _telemetry_disabled:
+        return True
+    try:
+        import onnxruntime
+    except ImportError:  # pragma: no cover - onnxruntime ships with fastembed
+        return False
+
+    disable = getattr(onnxruntime, "disable_telemetry_events", None)
+    if not callable(disable):
+        return False
+    try:
+        disable()
+    except Exception as exc:  # noqa: BLE001 - never fail a model load over this
+        log.debug("onnx_telemetry_disable_failed", error=str(exc)[:120])
+        return False
+
+    severity = getattr(onnxruntime, "set_default_logger_severity", None)
+    if callable(severity):
+        with contextlib.suppress(Exception):
+            severity(3)
+
+    _telemetry_disabled = True
+    log.debug("onnx_telemetry_disabled")
+    return True
 
 
 def register_shutdown_hook(release: Any) -> None:

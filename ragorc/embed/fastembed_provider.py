@@ -47,7 +47,11 @@ from ragorc.core.errors import EmbeddingError
 from ragorc.core.models import FloatArray, SparseVector
 from ragorc.core.registry import register
 from ragorc.core.settings import Settings, get_settings
-from ragorc.embed._runtime import configure_onnx_runtime, register_shutdown_hook
+from ragorc.embed._runtime import (
+    configure_onnx_runtime,
+    disable_onnx_telemetry,
+    register_shutdown_hook,
+)
 from ragorc.embed.base import (
     BaseEmbedder,
     cached_batch,
@@ -95,30 +99,43 @@ def clear_model_cache() -> int:
 register_shutdown_hook(clear_model_cache)
 
 
+def _silenced(cls: Any) -> Any:
+    """Turn ONNX telemetry off now that importing the class has loaded it."""
+    disable_onnx_telemetry()
+    return cls
+
+
 def _model_class(kind: str) -> Any:
     """Resolve the FastEmbed class for a kind.
 
     Imported here, not at module scope: pulling in ``fastembed`` also pulls
     ``onnxruntime`` and ``huggingface_hub`` (~1s and ~200 MB of RSS), which
     nothing that merely imports ``ragorc.embed`` should have to pay for.
+
+    This is also the chokepoint where telemetry gets switched off, because
+    *importing* onnxruntime is what starts its 1DS client — no model has to be
+    built for the worker thread that aborts the process on exit to exist. Every
+    path in this module that reaches onnxruntime reaches it through here,
+    including ``list_supported_models``, which loads the extension to answer a
+    question about static metadata.
     """
     try:
         if kind == "dense":
             from fastembed import TextEmbedding
 
-            return TextEmbedding
+            return _silenced(TextEmbedding)
         if kind == "sparse":
             from fastembed import SparseTextEmbedding
 
-            return SparseTextEmbedding
+            return _silenced(SparseTextEmbedding)
         if kind == "late":
             from fastembed import LateInteractionTextEmbedding
 
-            return LateInteractionTextEmbedding
+            return _silenced(LateInteractionTextEmbedding)
         if kind == "cross":
             from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-            return TextCrossEncoder
+            return _silenced(TextCrossEncoder)
     except ImportError as exc:  # pragma: no cover - fastembed is a base dep
         raise ImportError(
             "fastembed is required for the default embedding provider: "
