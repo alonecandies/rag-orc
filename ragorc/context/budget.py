@@ -56,6 +56,15 @@ class BudgetPlan:
 
     budget: TokenBudget
     per_source: dict[str, int] = field(default_factory=dict)
+    """Budget shares per retrieval source. **Computed on every request and read
+    by nothing.**
+
+    `plan()` fills it from `DEFAULT_SHARES` and `to_dict()` reports it, but no
+    packer, retriever or generator consults it, so one store can still take the
+    whole context window. Kept rather than deleted because enforcing it is a
+    behaviour change — it would start dropping evidence that is currently
+    packed — and that is a decision for the operator, not a tidy-up. Tracked in
+    docs/internal/OPEN-ITEMS.md."""
     context_tokens: int = 0
     overflow: bool = False
     dropped_chunks: int = 0
@@ -114,10 +123,35 @@ class ContextBudgeter:
                 chunks[i].chunk.token_count = n
         return [c.chunk.token_count or 0 for c in chunks]
 
-    def fits(self, chunks: Sequence[ScoredChunk], plan: BudgetPlan) -> bool:
-        return sum(self.measure(chunks)) <= plan.budget.available_context
+    def _total(self, chunks: Sequence[ScoredChunk], overhead: Sequence[int] | None) -> int:
+        """Bodies plus the framing the packer will add around them.
 
-    def decide_strategy(self, chunks: Sequence[ScoredChunk], plan: BudgetPlan) -> str:
+        ``overhead`` comes from :meth:`~ragorc.context.pack.ContextPacker.overhead`,
+        which measures it exactly. Omitted, this prices bodies alone — which is
+        what it always did, and why a set that overflowed once framed was
+        reported as fitting.
+        """
+        total = sum(self.measure(chunks))
+        if overhead:
+            total += sum(overhead[: len(chunks)])
+        return total
+
+    def fits(
+        self,
+        chunks: Sequence[ScoredChunk],
+        plan: BudgetPlan,
+        *,
+        overhead: Sequence[int] | None = None,
+    ) -> bool:
+        return self._total(chunks, overhead) <= plan.budget.available_context
+
+    def decide_strategy(
+        self,
+        chunks: Sequence[ScoredChunk],
+        plan: BudgetPlan,
+        *,
+        overhead: Sequence[int] | None = None,
+    ) -> str:
         """Choose how to handle overflow.
 
         Truncating is free and loses the tail; summarizing costs LLM calls and
@@ -125,7 +159,7 @@ class ContextBudgeter:
         chunks — they were ranked last for a reason. If the overflow is large,
         the tail is too much evidence to discard, so compress instead.
         """
-        total = sum(self.measure(chunks))
+        total = self._total(chunks, overhead)
         available = plan.budget.available_context
         if total <= available:
             return "fit"

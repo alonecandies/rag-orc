@@ -119,6 +119,19 @@ class ContextPacker:
         result = self.build(chunks, budget=budget, isolate=isolate)
         return result.chunks, result.text
 
+    def overhead(self, chunks: Sequence[ScoredChunk], *, isolate: bool = True) -> list[int]:
+        """What each passage costs before any body text — header, wrapper, separator.
+
+        Public because the budgeter has to charge the same thing. It priced only
+        chunk bodies, so a set that overflows once framed was reported as
+        fitting, and this packer then dropped the tail the budgeter had decided
+        to keep. Measured here rather than estimated there: the scaffolding grows
+        with whatever provenance a chunk carries, so any constant is wrong in
+        both directions.
+        """
+        separator = count_tokens(_PASSAGE_SEPARATOR)
+        return [n + separator for n in self._scaffold_tokens(chunks, isolate=isolate)]
+
     def build(
         self,
         chunks: Sequence[ScoredChunk],

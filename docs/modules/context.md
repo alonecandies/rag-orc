@@ -13,6 +13,7 @@ ContextBudgeter(settings=None)
     fits(chunks, plan) -> bool
     decide_strategy(chunks, plan) -> str          # "fit" | "truncate" | "summarize"
 BudgetPlan(budget: TokenBudget, per_source, context_tokens, overflow, dropped_chunks, strategy)
+    # per_source is computed and reported but not enforced — see OPEN-ITEMS
 DEFAULT_SHARES = {"vector": 0.55, "graph": 0.20, "relational": 0.10, "summary": 0.10, "web": 0.05}
 
 ContextPacker(settings=None)

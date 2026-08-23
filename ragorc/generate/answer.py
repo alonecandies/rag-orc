@@ -113,7 +113,10 @@ class AnswerGenerator:
 
         # --- budget, pack, compress ----------------------------------------
         plan = self.budgeter.plan(system_prompt=prompt.system, question=query.text)
-        strategy = self.budgeter.decide_strategy(chunks, plan)
+        # The packer's own measurement, so both agree on what has to fit.
+        strategy = self.budgeter.decide_strategy(
+            chunks, plan, overhead=self.packer.overhead(chunks)
+        )
         if strategy == "summarize":
             with timed("compress_context"):
                 compressed = await self.summarizer.fit(

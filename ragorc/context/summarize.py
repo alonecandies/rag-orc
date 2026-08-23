@@ -249,10 +249,18 @@ class ContextSummarizer:
 
     @staticmethod
     def _clip(scored: ScoredChunk, budget: int) -> ScoredChunk:
+        """Return a shortened *copy*, leaving the caller's chunk alone.
+
+        It used to truncate in place and hand back the same object. A
+        `ScoredChunk` is shared with the retrieval result, the cache and every
+        other consumer of that result set, so the map-failure path was quietly
+        rewriting evidence those callers still hold — the same aliasing hazard as
+        `GraphLocalRetriever._annotate`, which copies for the same reason.
+        """
+        from dataclasses import replace
+
         from ragorc.core.tokens import truncate_to_tokens
 
         clipped = truncate_to_tokens(scored.chunk.content, budget)
-        scored.chunk.content = clipped
-        scored.chunk.token_count = count_tokens(clipped)
-        scored.explain["truncated"] = True
-        return scored
+        chunk = replace(scored.chunk, content=clipped, token_count=count_tokens(clipped))
+        return replace(scored, chunk=chunk, explain={**scored.explain, "truncated": True})

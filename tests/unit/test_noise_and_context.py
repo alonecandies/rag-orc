@@ -690,3 +690,78 @@ def test_operator_only_chunks_survive_the_whole_filter() -> None:
     assert {k.chunk.id for k in kept} == {"eq", "ne"}
     assert report.exact_duplicates == 0
     assert report.near_duplicates == 0
+
+
+async def test_summarizer_clip_does_not_destroy_the_caller_s_chunk() -> None:
+    """`_clip` truncated `scored.chunk.content` in place and returned the same
+    object, so the map-failure path rewrote a chunk the caller still holds.
+
+    The same aliasing hazard as `GraphLocalRetriever._annotate`: a `ScoredChunk`
+    is shared with the retrieval result, the cache and every other consumer of
+    that result set, and none of them asked to have their copy shortened.
+    """
+    from ragorc.context.summarize import ContextSummarizer
+    from ragorc.core.models import Chunk, RetrievalSource, ScoredChunk
+
+    original = "Refunds are processed within five business days. " * 40
+    scored = ScoredChunk(
+        chunk=Chunk(id="c1", content=original),
+        score=0.9,
+        source=RetrievalSource.DENSE,
+        rank=0,
+    )
+
+    clipped = ContextSummarizer._clip(scored, 16)
+
+    assert scored.chunk.content == original, "the caller's chunk must be untouched"
+    assert clipped.chunk.content != original, "the returned copy must be the clipped one"
+    assert len(clipped.chunk.content) < len(original)
+    assert clipped.explain.get("truncated") is True
+    assert "truncated" not in scored.explain, "nor may the caller's explain be written"
+
+
+def test_the_overflow_decision_prices_the_scaffolding_the_packer_will_add() -> None:
+    """`decide_strategy` compared body tokens against the window, but the packer
+    charges each passage its header, wrapper and separator too — 3 tokens for a
+    bare numbered passage, up to ~23 for a wrapped one with provenance.
+
+    So a set that overflows once framed was reported as "fit", and the packer
+    then silently dropped the tail the budgeter had decided to keep. The gap
+    scales with the number of passages, which is exactly when it matters.
+    """
+    from ragorc.context.budget import ContextBudgeter
+    from ragorc.context.pack import ContextPacker
+    from ragorc.core.models import Chunk, RetrievalSource, ScoredChunk
+    from ragorc.core.settings import Settings
+    from ragorc.core.tokens import count_tokens
+
+    settings = Settings(security={"enforce_tenant_isolation": False})
+    packer, budgeter = ContextPacker(settings), ContextBudgeter(settings)
+
+    chunks = [
+        ScoredChunk(
+            chunk=Chunk(id=f"c{i}", content="Refund policy detail. " * 8, document_id="d1"),
+            score=1.0 - i / 100,
+            source=RetrievalSource.DENSE,
+            rank=i,
+        )
+        for i in range(12)
+    ]
+    bodies = sum(count_tokens(c.chunk.content) for c in chunks)
+    overhead = packer.overhead(chunks)
+    assert sum(overhead) > 0, "the fixture must actually carry scaffolding"
+
+    # A window whose *available context* is just big enough for the bodies and
+    # nothing more. `available_context` also subtracts the output reserve and a
+    # safety margin, so the window is searched for rather than assumed.
+    window = settings.generation.reserved_output_tokens + bodies
+    while budgeter.plan(window=window).budget.available_context < bodies:
+        window += 8
+    plan = budgeter.plan(window=window)
+    assert bodies <= plan.budget.available_context < bodies + sum(overhead), (
+        "fixture: the bodies must fit alone and the framing must be what tips it over"
+    )
+
+    assert budgeter.decide_strategy(chunks, plan, overhead=overhead) != "fit", (
+        "the framing is part of what has to fit"
+    )
