@@ -126,7 +126,13 @@ class AnswerGenerator:
             usages.append(compressed.usage)
 
         with timed("pack_context"):
-            pack = self.packer.build(chunks, budget=plan.budget.available_context)
+            # `plan.per_source` is a floor per contributing store, not a cap: it
+            # was computed on every request and read by nothing, so one leg could
+            # take the whole window and the decisive row from another never
+            # shipped. See `ContextPacker._allowances`.
+            pack = self.packer.build(
+                chunks, budget=plan.budget.available_context, shares=plan.per_source
+            )
         packed = pack.chunks
         plan.context_tokens = pack.tokens
         plan.dropped_chunks = pack.dropped

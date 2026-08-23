@@ -518,3 +518,38 @@ async def test_every_answer_path_applies_max_answer_tokens(gen_settings: Setting
     assert consistent and all(c == cap for c in consistent), (
         f"every self-consistency sample must carry the cap, saw {consistent}"
     )
+
+
+async def test_the_answer_path_hands_the_packer_its_per_source_floors(
+    gen_settings: Settings,
+) -> None:
+    """`BudgetPlan.per_source` was computed on every request and read by nothing.
+
+    Implementing the floor in `ContextPacker` is only half of it: the packer takes
+    `shares` as an optional argument, so the generator forgetting to pass them
+    would restore the original bug with every packer test still green. That is
+    how the field went dead the first time, so the wiring gets its own assertion.
+    """
+    from ragorc.context.pack import ContextPacker
+
+    seen: dict[str, object] = {}
+
+    class _Recording(ContextPacker):
+        def build(self, chunks, **kwargs):  # noqa: ANN001, ANN003, ANN201
+            seen["shares"] = kwargs.get("shares")
+            return super().build(chunks, **kwargs)
+
+    llm = StubLLM(
+        text="Refunds are processed within 14 days [1].",
+        responses={"GroundednessGrade": GroundednessGrade(grounded=True, score=0.95)},
+    )
+    generator = AnswerGenerator(llm, gen_settings, packer=_Recording(gen_settings))
+
+    await generator.generate(
+        Query(text="how long do refunds take?"),
+        RetrievalResult(chunks=[chunk("c1", POLICY)]),
+    )
+
+    shares = seen.get("shares")
+    assert shares, f"the packer was given no per-source floors: {shares!r}"
+    assert all(isinstance(v, int) and v >= 0 for v in shares.values()), shares  # type: ignore[union-attr]

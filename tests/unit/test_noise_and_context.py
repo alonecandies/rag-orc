@@ -765,3 +765,101 @@ def test_the_overflow_decision_prices_the_scaffolding_the_packer_will_add() -> N
     assert budgeter.decide_strategy(chunks, plan, overhead=overhead) != "fit", (
         "the framing is part of what has to fit"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-source floors
+# ---------------------------------------------------------------------------
+def _sourced(cid: str, source, score: float, words: int):  # noqa: ANN001, ANN202
+    from ragorc.core.models import Chunk, ScoredChunk
+
+    return ScoredChunk(
+        chunk=Chunk(id=cid, content=" ".join(["detail"] * words), document_id="d1"),
+        score=score,
+        source=source,
+        rank=0,
+    )
+
+
+def test_one_store_cannot_starve_the_others_out_of_the_window() -> None:
+    """The packer took globally best-ranked chunks until the window filled, so a
+    leg returning many strong-scoring passages could push every other store out
+    entirely — and silently, because the answer still looks well-supported.
+
+    `BudgetPlan.per_source` existed to prevent exactly this and was read by
+    nothing.
+    """
+    from ragorc.context.budget import DEFAULT_SHARES, ContextBudgeter
+    from ragorc.context.pack import ContextPacker
+    from ragorc.core.models import RetrievalSource
+    from ragorc.core.settings import Settings
+
+    settings = Settings(security={"enforce_tenant_isolation": False})
+    packer, budgeter = ContextPacker(settings), ContextBudgeter(settings)
+
+    # Vector floods with high scores; the one SQL row and one graph path score
+    # lower but are the only evidence their stores have.
+    chunks = [_sourced(f"v{i}", RetrievalSource.DENSE, 0.9 - i / 100, 60) for i in range(20)]
+    chunks.append(_sourced("sql1", RetrievalSource.SQL, 0.30, 20))
+    chunks.append(_sourced("graph1", RetrievalSource.GRAPH_LOCAL, 0.28, 20))
+
+    plan = budgeter.plan(window=2400)
+    shares = plan.budget.split(DEFAULT_SHARES)
+
+    without = packer.build(chunks, budget=plan.budget.available_context)
+    with_floor = packer.build(chunks, budget=plan.budget.available_context, shares=shares)
+
+    kept = lambda pack: {c.chunk.id for c in pack.chunks}  # noqa: E731
+    assert "sql1" not in kept(without) or "graph1" not in kept(without), (
+        "the fixture must actually starve a store without the floor"
+    )
+    assert {"sql1", "graph1"} <= kept(with_floor), (
+        f"each store must get its floor: {sorted(kept(with_floor))}"
+    )
+
+
+def test_a_single_source_query_packs_exactly_as_before() -> None:
+    """The floor is a guarantee, not a cap: with one store contributing its share
+    normalizes to the whole window, so the common case must not change. A cap
+    would waste 45% of the window on stores that returned nothing."""
+    from ragorc.context.budget import DEFAULT_SHARES, ContextBudgeter
+    from ragorc.context.pack import ContextPacker
+    from ragorc.core.models import RetrievalSource
+    from ragorc.core.settings import Settings
+
+    settings = Settings(security={"enforce_tenant_isolation": False})
+    packer, budgeter = ContextPacker(settings), ContextBudgeter(settings)
+    chunks = [_sourced(f"v{i}", RetrievalSource.DENSE, 0.9 - i / 100, 60) for i in range(20)]
+
+    plan = budgeter.plan(window=2400)
+    shares = plan.budget.split(DEFAULT_SHARES)
+
+    without = packer.build(chunks, budget=plan.budget.available_context)
+    with_floor = packer.build(chunks, budget=plan.budget.available_context, shares=shares)
+
+    assert [c.chunk.id for c in with_floor.chunks] == [c.chunk.id for c in without.chunks]
+    assert with_floor.tokens == without.tokens
+
+
+def test_an_unused_share_is_given_away_rather_than_wasted() -> None:
+    """Reallocation is what makes this a floor. A store that wants less than its
+    share must not leave the window half empty."""
+    from ragorc.context.budget import DEFAULT_SHARES, ContextBudgeter
+    from ragorc.context.pack import ContextPacker
+    from ragorc.core.models import RetrievalSource
+    from ragorc.core.settings import Settings
+
+    settings = Settings(security={"enforce_tenant_isolation": False})
+    packer, budgeter = ContextPacker(settings), ContextBudgeter(settings)
+    chunks = [_sourced(f"v{i}", RetrievalSource.DENSE, 0.9 - i / 100, 60) for i in range(20)]
+    chunks.append(_sourced("sql1", RetrievalSource.SQL, 0.30, 5))  # tiny: wants little
+
+    plan = budgeter.plan(window=2400)
+    shares = plan.budget.split(DEFAULT_SHARES)
+    pack = packer.build(chunks, budget=plan.budget.available_context, shares=shares)
+
+    vector_kept = sum(1 for c in pack.chunks if c.chunk.id.startswith("v"))
+    assert "sql1" in {c.chunk.id for c in pack.chunks}, "the small store still gets its row"
+    assert vector_kept >= 5, (
+        f"vector must receive the share SQL did not use, kept only {vector_kept}"
+    )

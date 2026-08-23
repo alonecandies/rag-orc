@@ -22,13 +22,13 @@ chunks occupy the positions the model actually attends to.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
 import structlog
 
-from ragorc.core.models import ScoredChunk
+from ragorc.core.models import RetrievalSource, ScoredChunk
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.tokens import count_tokens, count_tokens_batch, truncate_to_tokens
 from ragorc.security.injection import wrap_untrusted
@@ -101,6 +101,36 @@ class ContextPack:
         return len(self.chunks)
 
 
+_SOURCE_BUCKETS: dict[RetrievalSource, str] = {
+    RetrievalSource.DENSE: "vector",
+    RetrievalSource.SPARSE: "vector",
+    RetrievalSource.BM25: "vector",
+    RetrievalSource.COLBERT: "vector",
+    RetrievalSource.FUSED: "vector",
+    RetrievalSource.PARENT: "vector",
+    RetrievalSource.CACHE: "vector",
+    RetrievalSource.SQL: "relational",
+    RetrievalSource.FULLTEXT: "relational",
+    RetrievalSource.CYPHER: "graph",
+    RetrievalSource.GRAPH_LOCAL: "graph",
+    RetrievalSource.GRAPH_GLOBAL: "graph",
+    RetrievalSource.GRAPH_PATH: "graph",
+    RetrievalSource.RAPTOR: "summary",
+    RetrievalSource.WEB: "web",
+}
+"""Which budget share each retrieval source draws on.
+
+The shares in :data:`~ragorc.context.budget.DEFAULT_SHARES` are named for
+*stores*, and a store speaks through several sources — Postgres answers both as
+`SQL` and as `FULLTEXT`, the graph as four. Anything unmapped falls to `vector`,
+which is where a new dense-ish source most likely belongs and is the largest
+share, so an unknown source is never starved by a mapping oversight."""
+
+
+def _bucket(source: RetrievalSource) -> str:
+    return _SOURCE_BUCKETS.get(source, "vector")
+
+
 class ContextPacker:
     """Selects, orders and renders retrieved chunks into prompt text."""
 
@@ -139,6 +169,7 @@ class ContextPacker:
         budget: int,
         isolate: bool = True,
         expand_parents: bool | None = None,
+        shares: Mapping[str, int] | None = None,
     ) -> ContextPack:
         if not chunks:
             return ContextPack(text="", chunks=[], tokens=0)
@@ -148,7 +179,7 @@ class ContextPacker:
         # <untrusted_document> wrapper, and that wrapper is most of what a passage
         # costs beyond its body text. Pricing it wrong is what put the pack over
         # `budget`; see `_select`.
-        selected, dropped, truncated = self._select(working, budget, isolate=isolate)
+        selected, dropped, truncated = self._select(working, budget, isolate=isolate, shares=shares)
 
         if self.settings.retrieval.reorder_lost_in_middle and len(selected) > 2:
             ordered = reorder_lost_in_middle(selected)
@@ -179,7 +210,12 @@ class ContextPacker:
 
     # -- selection ---------------------------------------------------------
     def _select(
-        self, chunks: Sequence[ScoredChunk], budget: int, *, isolate: bool
+        self,
+        chunks: Sequence[ScoredChunk],
+        budget: int,
+        *,
+        isolate: bool,
+        shares: Mapping[str, int] | None = None,
     ) -> tuple[list[ScoredChunk], int, int]:
         """Density-first knapsack with a rank-order guarantee for the top hit.
 
@@ -274,7 +310,32 @@ class ContextPacker:
             # Higher score per token first; on a tie prefer the better rank.
             key=lambda t: (-((t[1].score + shift) / max(t[2], 1)), t[0]),
         )
+        # Reserve pass: give each contributing store its floor before the open
+        # competition starts. Without it one leg returning many strong passages
+        # takes the whole window and the single decisive SQL row never ships —
+        # silently, because the answer still looks well supported.
+        #
+        # A floor, not a cap. Shares are renormalized over the stores that
+        # actually returned something, so a single-source query gives that source
+        # the entire window and packs exactly as it did before, and whatever a
+        # store does not use falls through to the free pass below rather than
+        # being held empty. A hard cap would do the opposite: waste 45% of the
+        # window on stores with nothing to say, which is the common case.
+        reserved: set[int] = set()
+        for bucket, allowance in self._allowances(candidates, shares, remaining).items():
+            spent = 0
+            for index, chunk, cost in candidates:
+                if index in reserved or _bucket(chunk.source) != bucket:
+                    continue
+                if cost <= remaining and spent + cost <= allowance:
+                    chosen.append((index, chunk))
+                    reserved.add(index)
+                    remaining -= cost
+                    spent += cost
+
         for index, chunk, cost in candidates:
+            if index in reserved:
+                continue
             if cost <= remaining:
                 chosen.append((index, chunk))
                 remaining -= cost
@@ -282,6 +343,34 @@ class ContextPacker:
         chosen.sort(key=lambda t: t[0])  # restore rank order for presentation
         selected = [c for _, c in chosen]
         return selected, len(chunks) - len(selected), truncated
+
+    @staticmethod
+    def _allowances(
+        candidates: Sequence[tuple[int, ScoredChunk, int]],
+        shares: Mapping[str, int] | None,
+        remaining: int,
+    ) -> dict[str, int]:
+        """Tokens each contributing store is guaranteed, largest share first.
+
+        `shares` is `BudgetPlan.per_source` — an absolute split of the window
+        across every store the deployment *could* use. Only the ones that
+        returned candidates take part, so the weights are renormalized over those
+        and the window is never divided among stores that said nothing.
+
+        Ordered by share descending so the largest reservation is filled while the
+        budget is whole; the remainder reaches the free pass either way.
+        """
+        if not shares or remaining <= 0:
+            return {}
+        present = {_bucket(chunk.source) for _, chunk, _ in candidates}
+        weights = {b: shares[b] for b in present if shares.get(b, 0) > 0}
+        total = sum(weights.values())
+        if total <= 0:
+            return {}
+        return {
+            bucket: int(remaining * weight / total)
+            for bucket, weight in sorted(weights.items(), key=lambda kv: -kv[1])
+        }
 
     def _expand(
         self, chunks: Sequence[ScoredChunk], expand_parents: bool | None

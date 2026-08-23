@@ -56,15 +56,19 @@ class BudgetPlan:
 
     budget: TokenBudget
     per_source: dict[str, int] = field(default_factory=dict)
-    """Budget shares per retrieval source. **Computed on every request and read
-    by nothing.**
+    """Tokens guaranteed to each retrieval source: a floor, not a cap.
 
-    `plan()` fills it from `DEFAULT_SHARES` and `to_dict()` reports it, but no
-    packer, retriever or generator consults it, so one store can still take the
-    whole context window. Kept rather than deleted because enforcing it is a
-    behaviour change — it would start dropping evidence that is currently
-    packed — and that is a decision for the operator, not a tidy-up. Tracked in
-    docs/internal/OPEN-ITEMS.md."""
+    `ContextPacker` reserves each contributing store its share before the open
+    density competition, then hands anything unused to the free pass. Shares are
+    renormalized over the stores that actually returned candidates, so a
+    single-source query gives that source the whole window and packs exactly as
+    it would with no floors at all.
+
+    A cap was the wrong shape: most queries are single-source, and capping vector
+    at 55% would waste the rest of the window on stores with nothing to say. The
+    failure this prevents is the opposite one — a leg returning many strong
+    passages taking the whole window, so the single decisive SQL row never ships,
+    silently, because the answer still looks well supported."""
     context_tokens: int = 0
     overflow: bool = False
     dropped_chunks: int = 0
