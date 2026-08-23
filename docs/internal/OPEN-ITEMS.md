@@ -9,22 +9,26 @@ Nothing here is a secret or a live vulnerability. The security findings from
 earlier audits are fixed and covered by tests in `tests/unit/test_security_guards.py`
 and `tests/unit/test_guard_properties.py`.
 
-## 1. Open: the confidence-gated model cascade is decided but not wired
+## 1. Closed by deletion: the confidence-gated model cascade
 
-`ModelRouter.should_escalate` implements the decision and reads
-`cost.cascade_enabled` and `cost.cascade_confidence_threshold`. Nothing calls it.
-The only `escalate=True` in the library is `construct/text_to_sql.py`'s guard
-repair, which escalates unconditionally rather than on confidence, and
-`_DEFAULT_TIERS` maps no `Task` to `ModelTier.STRONG`. So both settings are inert
-and no answer is ever re-asked on `strong_model`.
+`ModelRouter.should_escalate` and the two `cost.cascade_*` settings are removed.
+The decision and its reasoning are recorded in ADR-0005 under "Rejected:
+confidence-gated escalation on the answer path"; in short:
 
-This is the one item here that is a *decision*, not a defect to fix. Wiring it is
-a spending change: `cascade_enabled` defaults to `true`, so implementing the gate
-starts paying for `strong_model` on every answer scoring below 0.75 the moment
-anyone upgrades. The two honest options are to wire it (and probably flip the
-default to `false`), or to delete the settings and the method. Until one is
-chosen, ADR-0005 and both settings docstrings say plainly that it is not wired,
-so nothing in the repo claims otherwise.
+* There was no confidence signal to gate on. `Answer.confidence` is a literal
+  `1.0` on the plain and JSON-citation paths, and with `check_groundedness` on
+  (the default) it reduces to the groundedness score — so the gate would have
+  measured grounding, not model uncertainty.
+* That gate already exists. Abstention fires below `groundedness_threshold`
+  (0.70) against a cascade threshold of 0.75, leaving a five-point band; placed
+  after abstention it is nearly inert, placed before it, it re-runs the most
+  expensive call in the pipeline on every ungrounded answer and forecloses
+  streaming.
+* A larger model is the weakest response to poor grounding, which usually means
+  retrieval failed. CRAG, RRR and abstention all act on the cause instead.
+
+`strong_model` stays: `model_for(..., escalate=True)` still reaches it from the
+Text-to-SQL guard repair, which escalates unconditionally.
 
 ## 2. Closed: derived units are searched the same way leaf chunks are
 
@@ -211,17 +215,25 @@ is invisible — nothing crashes, results are merely worse or a benchmark lies.
   style tag, so `pip install 'ragorc[server]'` rendered as `pip install 'ragorc'`.
   Data is escaped before it reaches the markup parser now.
 
-## 11e. Open: the per-source budget split is computed and never enforced
+## 11e. Closed: the per-source budget split is enforced as a floor
 
-`BudgetPlan.per_source` is filled from `DEFAULT_SHARES` on every request and
-reported by `to_dict()`, and nothing reads it — one store can consume the whole
-context window. Documented in `docs/modules/context.md` as part of the public
-plan, so it is an advertised guarantee that does not hold.
+`ContextPacker` reserves each contributing store its share before the open
+density competition and hands anything unused to the free pass;
+`AnswerGenerator` passes `plan.per_source`, and that wiring has its own test —
+the packer's argument is optional, so a generator that forgot to pass it would
+have restored the original bug with every packer test still green. That is how
+the field went dead the first time.
 
-Left open deliberately, like the model cascade: enforcing it starts dropping
-evidence that is currently packed, which is a behaviour change for existing
-deployments and the operator's call. The alternative is deleting the field. Until
-one is chosen, the field's own docstring says plainly that it is not enforced.
+A floor rather than a cap, deliberately. Shares are renormalized over the stores
+that actually returned candidates, so a single-source query gives that source the
+whole window and packs byte-identically to before. A hard cap would have made the
+common case worse: most queries are single-source, and holding 45% of the window
+for stores with nothing to say trades good evidence for none.
+
+`_SOURCE_BUCKETS` maps each `RetrievalSource` onto a share name, because a store
+speaks through several sources — Postgres as both `SQL` and `FULLTEXT`, the graph
+as four. Anything unmapped falls to `vector`, the largest share, so a new source
+is never starved by an oversight in that table.
 
 ## 11f. Verified clean: packaging and the clean-clone path
 
