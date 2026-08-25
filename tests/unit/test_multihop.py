@@ -359,7 +359,14 @@ async def test_sufficiency_prompt_isolates_every_retrieved_passage(settings: Set
     await retriever.retrieve(Query(text=QUESTION, top_k=5))
 
     prompt = llm.calls_for("multihop_reason")[0]["prompt"]
-    assert f'<untrusted_document index="1">\n{INJECTED}\n</untrusted_document>' in prompt
+    # Asserted as containment rather than as an exact byte layout: the passage's
+    # provenance line now sits inside the fence too (it is caller-supplied
+    # metadata, so it is untrusted for the same reason the body is), and pinning
+    # the exact rendering would make this security test fail on a formatting
+    # change while passing on a real regression.
+    opened = prompt.index('<untrusted_document index="1">')
+    closed = prompt.index("</untrusted_document>")
+    assert opened < prompt.index(INJECTED) < closed, "the passage escaped its wrapper"
     assert prompt.count(INJECTED) == 1, "the passage must appear only inside its wrapper"
 
 
