@@ -4,6 +4,22 @@ Bad documents are cheaper to reject than to index: an empty chunk consumes an
 embedding call and a vector slot while being unretrievable, and a 40 MB
 "document" that is actually a minified bundle will poison a semantic splitter's
 percentile threshold for the whole batch.
+
+The injection scan is here for the same reason, and for one more
+--------------------------------------------------------------
+:mod:`ragorc.security.injection` opens by naming the gap it exists to close:
+"Everyone guards the *user input*. Almost nobody guards the *retrieved
+documents*." The scanner was nonetheless wired into exactly two places — the
+user's question (:mod:`ragorc.validate.input`) and web results
+(:mod:`ragorc.retrieve.web`) — and never into the corpus. A poisoned document
+uploaded through ``POST /ingest`` was indexed unexamined, and the only thing
+standing between it and the generator was the structural fence at render time.
+
+Scanning at ingest rather than at retrieval, because a document is written once
+and read many times: the cost is paid per document instead of per query, and
+``injection_action="block"`` can only mean something at the door — refusing a
+document at *read* time is a corpus you cannot query and a defence you cannot
+notice.
 """
 
 from __future__ import annotations
@@ -13,9 +29,10 @@ from dataclasses import dataclass, field
 
 import structlog
 
-from ragorc.core.errors import ValidationFailed
+from ragorc.core.errors import GuardrailViolation, ValidationFailed
 from ragorc.core.models import Chunk, Document
 from ragorc.core.settings import Settings, get_settings
+from ragorc.security.injection import InjectionScanner
 
 log = structlog.get_logger(__name__)
 
@@ -42,6 +59,7 @@ class DocumentValidator:
     def __init__(self, settings: Settings | None = None, *, max_bytes: int = 20_000_000) -> None:
         self.settings = settings or get_settings()
         self.max_bytes = max_bytes
+        self.scanner = InjectionScanner(self.settings.security)
 
     def validate_document(self, doc: Document) -> Document:
         if isinstance(doc, (list, tuple, set)):
@@ -77,6 +95,51 @@ class DocumentValidator:
                 "tenant_id is required on ingest when tenant isolation is enabled",
                 doc_id=doc.id,
             )
+
+        return self._scan(doc)
+
+    def _scan(self, doc: Document) -> Document:
+        """Run the document through the injection scanner. Last, and deliberately.
+
+        Every check above is a length comparison or a single pass over the text;
+        this one runs a dozen patterns across three re-spellings of it, so it goes
+        after the cheap rejections rather than before them.
+
+        ``clean_text`` is taken unconditionally, which is what
+        :meth:`~ragorc.security.injection.InjectionScanner._normalize` is designed
+        for — it documents itself as "a faithful rendering of the document", the
+        aggressive re-spellings being confined to matching. That means NFKC folding
+        and invisible-character stripping land on every ingested document, and both
+        are wanted independently of injection: a zero-width space inside a word is
+        the preferred carrier for hidden instructions *and* it silently breaks every
+        lexical match on that word.
+
+        ``block`` is converted to a :class:`ValidationFailed` rather than allowed to
+        propagate. A ``GuardrailViolation`` out of here would abort the whole batch,
+        so one poisoned file in a 10 000-document upload would reject the other
+        9 999 — the denial-of-service primitive :mod:`ragorc.retrieve.web` declines
+        to build for the same reason. As a ``ValidationFailed`` it lands in
+        ``IngestReport.rejected`` beside every other refused document, named and
+        counted.
+        """
+        try:
+            scan = self.scanner.scan(doc.content, source=f"document:{doc.id}")
+        except GuardrailViolation as exc:
+            raise ValidationFailed(
+                "possible prompt injection in document content",
+                doc_id=doc.id,
+                risk=exc.detail.get("risk"),
+                rules=exc.detail.get("rules"),
+            ) from exc
+
+        doc.content = scan.clean_text
+        if scan.matches:
+            # Recorded on the document so it survives into every chunk's metadata:
+            # an operator needs to be able to find what was flagged after the fact,
+            # and under ``flag`` (or a sub-threshold ``sanitize``) this record is the
+            # entire outcome of the scan.
+            doc.metadata["injection_risk"] = scan.risk
+            doc.metadata["injection_rules"] = list(scan.rules)
         return doc
 
     def validate_batch(self, docs: list[Document]) -> IngestReport:
