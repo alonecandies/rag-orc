@@ -34,6 +34,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import structlog
 
@@ -350,13 +351,48 @@ class InjectionScanner:
         return "\n".join(lines)
 
 
+@lru_cache(maxsize=8)
+def _fence_pattern(tag: str) -> re.Pattern[str]:
+    """Every spelling of this fence's own tag, opening or closing.
+
+    Cached because :func:`wrap_untrusted` runs once per passage per query and
+    the tag is effectively a constant; compiling the pattern per call would put
+    a regex compile on the hot path for no benefit.
+
+    Deliberately wider than the tag as we emit it. An exact ``</tag>`` match is
+    only a defence against an attacker who spells it the way we do, and XML
+    parsers, HTML parsers and language models each accept a different superset:
+
+    * ``</UNTRUSTED_DOCUMENT>`` — case, which XML rejects and every model reads;
+    * ``</untrusted_document >`` — trailing space, which HTML accepts;
+    * ``< /untrusted_document>`` — leading space, which nothing formally accepts
+      but a model reading prose will still take as the end of the block;
+    * ``<untrusted_document index="9">`` — the *opening* tag, which forges a new
+      passage boundary rather than escaping the current one. Escaping only the
+      closing tag stops break-out and leaves forgery.
+
+    ``\b`` after the tag is what keeps ``<untrusted_documentation>`` — a
+    plausible word in a document about this very library — from being mangled.
+    """
+    return re.compile(rf"<\s*/?\s*{re.escape(tag)}\b[^>]*>", re.IGNORECASE)
+
+
+def _defang_fence(match: re.Match[str]) -> str:
+    """Escape the angle brackets, keep the text.
+
+    The document stays readable as evidence — a page *about* prompt injection
+    may be the one that answers the question — it just stops being markup.
+    """
+    return match.group(0).replace("<", "&lt;").replace(">", "&gt;")
+
+
 def wrap_untrusted(text: str, *, tag: str = "untrusted_document", index: int | None = None) -> str:
     """Structurally isolate retrieved text.
 
-    The load-bearing defence. Any closing tag inside the payload is escaped so
-    the content cannot terminate its own container, which is how a naive
-    delimiter scheme gets broken out of.
+    The load-bearing defence. Any occurrence of the fence tag inside the payload
+    is escaped so the content can neither terminate its own container nor open a
+    new one, which is how a naive delimiter scheme gets broken out of.
     """
-    safe = text.replace(f"</{tag}>", f"&lt;/{tag}&gt;")
+    safe = _fence_pattern(tag).sub(_defang_fence, text)
     attrs = f' index="{index}"' if index is not None else ""
     return f"<{tag}{attrs}>\n{safe}\n</{tag}>"

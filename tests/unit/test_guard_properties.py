@@ -445,12 +445,20 @@ def test_wrap_untrusted_cannot_be_escaped_by_any_payload(payload: str) -> None:
     Structural isolation only works if content cannot terminate its own
     container, so exactly one closing tag may appear however the payload is
     constructed.
+
+    Counted case-insensitively, and over the opening tag too. The exact-string
+    ``count("</untrusted_document>")`` this used to assert was satisfied by
+    ``</UNTRUSTED_DOCUMENT>`` — a payload Hypothesis can and does generate, and
+    which a model reads as the end of the block. The property held while the
+    defence did not.
     """
     from ragorc.security.injection import wrap_untrusted
 
     assume("\x00" not in payload)
     wrapped = wrap_untrusted(payload, index=1)
-    assert wrapped.count("</untrusted_document>") == 1
+    lowered = wrapped.lower()
+    assert lowered.count("</untrusted_document>") == 1
+    assert lowered.count("<untrusted_document") == 1
 
 
 # ---------------------------------------------------------------------------
