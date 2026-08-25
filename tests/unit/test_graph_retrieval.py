@@ -268,6 +268,28 @@ ACME_QUERY = "What did Acme acquire?"
 ENGINE_QUERY = "Which team owns the payments engine?"
 
 
+class RecordingEmbedder:
+    """Embeds to a fixed vector, recording that it was asked.
+
+    ``dimension`` and ``name`` are part of the protocol the retriever's
+    collaborators expect; only ``embed_query`` is exercised here.
+    """
+
+    name = "recording"
+    dimension = 4
+
+    def __init__(self, vector: list[float]) -> None:
+        self.vector = np.asarray(vector, dtype=np.float32)
+        self.queries: list[str] = []
+
+    async def embed_query(self, text: str) -> Any:
+        self.queries.append(text)
+        return self.vector
+
+    async def embed_documents(self, texts: Sequence[str]) -> Any:  # pragma: no cover
+        return np.asarray([self.vector for _ in texts], dtype=np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Local search
 # ---------------------------------------------------------------------------
@@ -557,7 +579,11 @@ async def test_local_survives_a_failed_traversal() -> None:
     out, detail = await retriever.expand(Query(text=ACME_QUERY), [(seed, 4.0)])
 
     assert prose(out) == ["c-acme"]
-    assert detail["degraded"] == ["neighbors"]
+    # ``no_query_embedder`` because this retriever was built without one, and the
+    # similarity term is therefore permanently unavailable rather than
+    # transiently failed. Reported alongside the traversal loss because both
+    # reduce the ranking to less than the three terms it documents.
+    assert detail["degraded"] == ["neighbors", "no_query_embedder"]
     assert detail["relations"] == 0
     assert out[1].score == pytest.approx(0.40 / 0.65), "the entity term carries the whole blend"
 
@@ -1203,3 +1229,103 @@ async def test_graph_annotation_does_not_mutate_the_store_s_own_chunk() -> None:
     after = (await store.get(["c-beta"], with_vectors=True))[0].content
     assert after == before, "the store's own copy must be untouched"
     assert "graph_context" not in (await store.get(["c-beta"]))[0].metadata
+
+
+# ---------------------------------------------------------------------------
+# The third ranking term
+# ---------------------------------------------------------------------------
+_FAN = {
+    "c-exact": [1.0, 0.0, 0.0, 0.0],
+    "c-near": [0.8, 0.6, 0.0, 0.0],
+    "c-half": [0.5, 0.8660254, 0.0, 0.0],
+}
+
+
+async def test_local_embeds_the_question_so_the_similarity_term_fires() -> None:
+    """Local search blends three signals, and the third never contributed.
+
+    ``query.dense`` is populated in exactly one place — ``QdrantStore._prepare``
+    — and the GraphRAG graph never goes through the vector store: ``classify``
+    routes straight to a graph node, which calls this retriever with the query
+    as validated. So the term was skipped, its weight was silently redistributed
+    over entity and relation signal, and the ranking that shipped was two-thirds
+    of the one this module documents.
+
+    The existing cosine test sets ``query.dense`` by hand, which is why it passed
+    throughout: it covers the arithmetic, and nothing covered whether anything
+    ever supplies the input.
+    """
+    graph, chunks = await build_fan(_FAN)
+    embedder = RecordingEmbedder([1.0, 0.0, 0.0, 0.0])
+    retriever = GraphLocalRetriever(graph, chunks, embedder=embedder, settings=graph_settings())
+
+    out = await retriever.retrieve(Query(text="ledger service latency"))
+
+    assert embedder.queries == ["ledger service latency"]
+    passages = [c for c in out if c.chunk.document_id != "graph:local"]
+    assert [c.chunk.id for c in passages] == ["c-exact", "c-near", "c-half"], (
+        "the ranking is not ordered by similarity, so the term did not contribute"
+    )
+    assert all(c.explain["similarity_available"] for c in passages)
+    assert [c.component_scores["dense"] for c in passages] == [
+        pytest.approx(1.0),
+        pytest.approx(0.8),
+        pytest.approx(0.5),
+    ]
+
+
+async def test_without_an_embedder_the_graph_terms_carry_the_whole_blend() -> None:
+    """The state this shipped in, pinned as the contrast.
+
+    Identical graph signals across three chunks and no query vector: the
+    similarity weight is redistributed, every score collapses to the same value,
+    and the term that exists to separate them cannot.
+    """
+    graph, chunks = await build_fan(_FAN)
+    retriever = GraphLocalRetriever(graph, chunks, settings=graph_settings())
+
+    out = await retriever.retrieve(Query(text="ledger service latency"))
+
+    passages = [c for c in out if c.chunk.document_id != "graph:local"]
+    assert not any(c.explain["similarity_available"] for c in passages)
+    assert len({round(c.score, 9) for c in passages}) == 1, (
+        "without the third term these chunks are indistinguishable"
+    )
+
+
+async def test_local_reuses_a_query_vector_someone_else_already_computed() -> None:
+    """DRIFT seeds from a vector search, so the vector is already on the query by
+    the time ``expand`` runs. Re-embedding would be a second model call for a
+    value we are holding."""
+    graph, chunks = await build_fan(_FAN)
+    embedder = RecordingEmbedder([1.0, 0.0, 0.0, 0.0])
+    retriever = GraphLocalRetriever(graph, chunks, embedder=embedder, settings=graph_settings())
+    query = Query(text="ledger service latency")
+    query.dense = np.asarray([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+
+    await retriever.retrieve(query)
+
+    assert embedder.queries == [], "the query was embedded twice"
+
+
+async def test_local_still_ranks_when_the_embedder_fails() -> None:
+    """A failed embedding must cost the tie-breaker, not the query: the entity and
+    relation terms are an answer on their own."""
+
+    class Broken(RecordingEmbedder):
+        async def embed_query(self, text: str) -> Any:
+            raise RuntimeError("provider down")
+
+    graph, chunks = await build_fan(_FAN)
+    retriever = GraphLocalRetriever(
+        graph, chunks, embedder=Broken([1.0, 0.0, 0.0, 0.0]), settings=graph_settings()
+    )
+
+    out, detail = await retriever.expand(
+        Query(text="ledger service latency"), [(graph.entities["ledger service"], 4.0)]
+    )
+
+    assert [c.chunk.id for c in out if c.chunk.document_id != "graph:local"], (
+        "a failed embedding must not empty the result"
+    )
+    assert "query_embedding" in detail["degraded"]

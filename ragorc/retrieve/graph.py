@@ -101,7 +101,7 @@ from ragorc.core.models import (
     ScoredChunk,
     Usage,
 )
-from ragorc.core.protocols import LLM, VectorStore
+from ragorc.core.protocols import LLM, DenseEmbedder, VectorStore
 from ragorc.core.registry import register
 from ragorc.core.schemas import MapAnswer
 from ragorc.core.settings import Settings, get_settings
@@ -397,6 +397,7 @@ class GraphLocalRetriever:
         graph: GraphSearchStore,
         chunks: ChunkStore | None = None,
         *,
+        embedder: DenseEmbedder | None = None,
         weights: tuple[float, float, float] | None = None,
         hop_decay: float = _HOP_DECAY,
         settings: Settings | None = None,
@@ -404,6 +405,7 @@ class GraphLocalRetriever:
         self.settings = settings or get_settings()
         self.graph = graph
         self.chunks = chunks
+        self.embedder = embedder
         self.weights = weights or (_W_ENTITY, _W_RELATION, _W_SIMILARITY)
         self.hop_decay = float(hop_decay)
 
@@ -464,6 +466,7 @@ class GraphLocalRetriever:
             detail["candidate_chunks"] = len(candidates)
 
             bodies = await self._load(list(candidates), detail)
+            await self._ensure_query_vector(query, detail, comparable=bool(bodies))
             scored = self._rank(query, candidates, bodies, by_name, limit)
 
         subgraph = self._subgraph_chunk(query, by_name, relations, scored)
@@ -484,6 +487,47 @@ class GraphLocalRetriever:
         return out, detail
 
     # -- steps -------------------------------------------------------------
+    async def _ensure_query_vector(
+        self, query: Query, detail: dict[str, Any], *, comparable: bool
+    ) -> None:
+        """Embed the question if nothing upstream did, so the third term can fire.
+
+        The similarity term is documented as the tie-breaker that keeps a chunk
+        which merely *mentions* the right entities from outranking one that is
+        actually about the question. It never fired on the GraphRAG path.
+
+        ``query.dense`` is populated in exactly one place — ``QdrantStore._prepare``
+        — and the GraphRAG graph does not go through the vector store: ``classify``
+        routes straight to a graph node, which calls this retriever with the
+        query as validated. So ``query.dense`` was ``None``, the term was skipped,
+        and its weight was silently redistributed over entity and relation
+        signal. The ranking that shipped was two-thirds of the one described,
+        with ``similarity_available: False`` on every result as the only trace.
+
+        Setting it on the query rather than keeping it local, which is what
+        ``_prepare`` already does: a later leg of the same fan-out reuses the
+        vector instead of paying for it again, and writing the same value twice
+        is harmless.
+
+        The embedder has to be the one that embedded the chunks being compared —
+        a cosine between two models' spaces is a number with no meaning — so it
+        is injected rather than constructed here.
+        """
+        if query.dense is not None:
+            return
+        if self.embedder is None:
+            # Only when there was something to compare against. With no chunk
+            # bodies the similarity term is moot, and reporting it as a
+            # degradation there buries the degradation that actually happened.
+            if comparable:
+                detail["degraded"].append("no_query_embedder")
+            return
+        try:
+            query.dense = await self.embedder.embed_query(query.text)
+        except Exception as exc:  # noqa: BLE001 - the other two terms still rank
+            detail["degraded"].append("query_embedding")
+            log.warning("graph_local_query_embedding_failed", error=str(exc)[:200])
+
     @staticmethod
     def _seed_weights(seeds: Sequence[tuple[Entity, float]]) -> dict[str, float]:
         """Normalize Lucene relevance into a per-seed match weight in ``(0, 1]``.

@@ -285,3 +285,31 @@ def test_the_streaming_graph_is_cached_apart_from_the_plain_one(settings: Settin
 
     assert plain is not streamed
     assert pipeline._compiled_graph("naive", streaming=True) is streamed
+
+
+async def test_builder_gives_local_graph_search_a_query_embedder(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring, asserted at the builder.
+
+    `GraphLocalRetriever` blends three signals and the third needs a query
+    vector. Removing `embedder=` from both construction sites left the whole
+    suite green — every test of the term constructs the retriever itself, so
+    none of them could see the builder not passing one. That is the same shape
+    as the bug: the retriever was fine, nothing gave it its input.
+    """
+    from ragorc.pipeline.builder import RAGPipeline
+
+    pipeline = RAGPipeline(settings=settings)
+
+    async def fake_graph_store() -> object:
+        return object()
+
+    monkeypatch.setattr(pipeline, "graph_store", fake_graph_store)
+    local = await pipeline._graph_search_retrievers()["local"]._resolve()
+
+    assert local.embedder is not None, "local search cannot use its similarity term"
+    assert local.embedder is pipeline.dense_embedder, (
+        "the query must be embedded by the model that embedded the chunks; a cosine "
+        "between two models' spaces is a number with no meaning"
+    )

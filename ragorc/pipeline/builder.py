@@ -699,7 +699,12 @@ class RAGPipeline:
             if self.settings.graph.enabled:
                 from ragorc.retrieve.graph import GraphLocalRetriever
 
-                return GraphLocalRetriever(store, self.vector_store, settings=self.settings)
+                return GraphLocalRetriever(
+                    store,
+                    self.vector_store,
+                    embedder=self.dense_embedder,
+                    settings=self.settings,
+                )
             from ragorc.retrieve.cypher import CypherRetriever
 
             return CypherRetriever(self.llm, store, settings=self.settings)
@@ -713,7 +718,10 @@ class RAGPipeline:
             from ragorc.retrieve.graph import GraphLocalRetriever
 
             return GraphLocalRetriever(
-                await self.graph_store(), self.vector_store, settings=self.settings
+                await self.graph_store(),
+                self.vector_store,
+                embedder=self.dense_embedder,
+                settings=self.settings,
             )
 
         async def global_() -> Retriever:
