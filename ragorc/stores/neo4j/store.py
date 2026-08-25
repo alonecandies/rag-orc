@@ -96,6 +96,40 @@ __all__ = ["Neo4jStore"]
 _MENTIONS = "MENTIONS"
 _IN_COMMUNITY = "IN_COMMUNITY"
 
+_SEMANTIC_EDGE = f":!{_MENTIONS}&!{_IN_COMMUNITY}"
+"""Every relationship type *except* the library's own two structural ones.
+
+Entity-to-entity types are authored by the extraction model, so they cannot be
+enumerated and the filter has to be a negation. The two excluded types are
+scaffolding rather than extracted knowledge:
+
+``MENTIONS``      ``(:Chunk)-[:MENTIONS]->(:Entity)``
+``IN_COMMUNITY``  ``(:Entity)-[:IN_COMMUNITY]->(:Community)``
+
+Written into quantified path patterns, and the **node labels in those patterns
+are what actually stops the traversal walking through a chunk** — an intermediate
+node has to be an ``Entity``, and neither structural type joins two entities. A
+plain ``-[r*1..2]-`` constrains only the *endpoint*, which is why the untyped
+version let a two-hop expansion return ``A -[:MENTIONS]- chunk -[:MENTIONS]- B``.
+That is not a weaker answer but a different claim — "A and B appear in the same
+passage" is co-occurrence, and it was being returned as an extracted
+relationship, with ``startNode(r)`` on that edge being a ``Chunk`` that
+``_entity_from_props`` then built an "entity" out of.
+
+So the type expression is, against today's schema, redundant with the labels. It
+is kept because the redundancy is free and the assumption behind it is one edge
+type away from being wrong: a resolution edge between entities (``SAME_AS``,
+``ALIAS_OF``) is a plausible addition, and it would be structural too. Stating
+"only extracted relationships" here means a new scaffolding type cannot silently
+start appearing in traversal results.
+
+Quantified path patterns require **Neo4j 5.9+** (the compose stack pins 5.26).
+The portable alternative, ``WHERE none(r IN rels ...)``, filters *after*
+expanding: on an entity that ten thousand chunks mention, a two-hop expansion
+materializes all of them before discarding them. ``MENTIONS`` is the densest
+edge type in this schema, so that is the one place the difference is not
+academic."""
+
 # The store is down / unreachable. Trips the breaker and degrades the query.
 _UNAVAILABLE = (
     ServiceUnavailable,
@@ -963,7 +997,9 @@ ORDER BY score DESC
 
         edge_cypher = f"""
 MATCH (a:`{self.node_label}`) WHERE a.name IN $names
-MATCH (a)-[rels*1..{depth}]-(:`{self.node_label}`)
+MATCH (a)
+      ((:`{self.node_label}`)-[rels{_SEMANTIC_EDGE}]-(:`{self.node_label}`)){{1,{depth}}}
+      (:`{self.node_label}`)
 UNWIND rels AS r
 WITH DISTINCT r
 ORDER BY coalesce(r.weight, 1.0) DESC
@@ -1071,7 +1107,8 @@ LIMIT $limit
 MATCH (a:`{self.node_label}`) WHERE a.name IN $start
 MATCH (b:`{self.node_label}`) WHERE b.name IN $end
 WITH a, b WHERE a <> b
-MATCH p = allShortestPaths((a)-[*..{depth}]-(b))
+MATCH p = ALL SHORTEST
+      (a) ((:`{self.node_label}`)-[{_SEMANTIC_EDGE}]-(:`{self.node_label}`)){{1,{depth}}} (b)
 WITH p,
      length(p) AS hops,
      reduce(w = 0.0, r IN relationships(p) | w + coalesce(r.weight, 1.0)) AS total_weight
@@ -1190,9 +1227,15 @@ LIMIT $limit
             return {}
         cypher = f"""
 MATCH (n:`{self.node_label}`) WHERE n.name IN $names
-RETURN n.name AS name, COUNT {{ (n)--() }} AS degree
+RETURN n.name AS name,
+       COUNT {{ (n)-[r]-(:`{self.node_label}`)
+                WHERE NOT type(r) IN [$mentions, $in_community] }} AS degree
 """
-        records = await self._records(cypher, {"names": wanted}, label="degree_centrality")
+        records = await self._records(
+            cypher,
+            {"names": wanted, "mentions": _MENTIONS, "in_community": _IN_COMMUNITY},
+            label="degree_centrality",
+        )
         centrality = dict.fromkeys(wanted, 0.0)
         if not records:
             return centrality

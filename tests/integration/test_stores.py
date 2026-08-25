@@ -312,3 +312,78 @@ async def test_all_three_stores_are_reachable(settings: Settings) -> None:
         await qdrant.close()
         await postgres.close()
         await neo4j.close()
+
+
+async def test_neo4j_traversal_does_not_walk_through_chunks_or_communities(
+    settings: Settings,
+) -> None:
+    """A graph traversal must return relationships a document asserted.
+
+    `MENTIONS` and `IN_COMMUNITY` are the library's own scaffolding, not
+    extracted knowledge. Untyped, a two-hop expansion walked straight through
+    them, and the result was not a weaker answer but a different claim:
+
+        A -[:MENTIONS]- chunk -[:MENTIONS]- B   "they appear in one passage"
+        A -[:IN_COMMUNITY]-> c <-[:IN_COMMUNITY]- B   "Leiden grouped them"
+
+    Both were returned as extracted graph relationships, and `startNode(r)` on a
+    `MENTIONS` edge is a `Chunk`, so `_entity_from_props` built an "entity" out
+    of one. `paths()` is the worse case: it is the whole answer to "how is A
+    related to B", and it was answering with co-occurrence.
+
+    Only reachable against a real server — the Cypher *is* the thing under test.
+    """
+    from ragorc.stores.neo4j.store import Neo4jStore
+
+    store = Neo4jStore(settings=settings)
+    tag = uuid.uuid4().hex[:8]
+    linked, other, isolated = f"Linked{tag}", f"Other{tag}", f"Isolated{tag}"
+    chunk_id = f"chunk-{tag}"
+    try:
+        await store.upsert_entities(
+            [
+                Entity(name=n, type="ORGANIZATION", description="d")
+                for n in (linked, other, isolated)
+            ]
+        )
+        await store.upsert_relations([Relation(linked, other, "PARTNERS_WITH", weight=2.0)])
+        # `isolated` shares a chunk with `linked` and nothing else. Co-occurrence,
+        # not a relationship. The mapping is `{entity: [chunk_ids]}` — inverted, it
+        # silently creates an *Entity* named after the chunk and the traversal has
+        # nothing to walk through, so the test would pass without the filter.
+        await store.upsert_chunk_links({linked: [chunk_id], isolated: [chunk_id]})
+
+        found, edges = await store.neighbors([linked], hops=2)
+        names = {e.name for e in found}
+        assert other in names, "the real relationship must survive the filter"
+        assert isolated not in names, "co-mention in one chunk is not a graph edge"
+        assert all(e.type not in {"MENTIONS", "IN_COMMUNITY"} for e in edges), (
+            f"structural edges leaked into the relations: {[e.type for e in edges]}"
+        )
+
+        assert await store.paths([linked], [other], max_hops=3), (
+            "the genuine path must still be found"
+        )
+        assert await store.paths([linked], [isolated], max_hops=3) == [], (
+            "'how is A related to B' must not answer with 'the same chunk mentions both'"
+        )
+
+        centrality = await store.degree_centrality([linked, other, isolated])
+        assert centrality[isolated] == 0.0, (
+            "an entity with no relationships is not central because chunks mention it"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await store._write_count(
+                f"MATCH (n:`{settings.neo4j.node_label}`) WHERE n.name ENDS WITH $tag "
+                "DETACH DELETE n RETURN count(*) AS written",
+                {"tag": tag},
+                label="cleanup",
+            )
+            await store._write_count(
+                f"MATCH (c:`{settings.neo4j.chunk_label}` {{id: $id}}) "
+                "DETACH DELETE c RETURN count(*) AS written",
+                {"id": chunk_id},
+                label="cleanup",
+            )
+        await store.close()
