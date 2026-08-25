@@ -84,7 +84,7 @@ from ragorc.core.telemetry import timed, trace_step
 from ragorc.generate.answer import AnswerGenerator
 from ragorc.llm.prompts import PROMPTS, get_prompt
 from ragorc.llm.router import ModelRouter, Task
-from ragorc.pipeline.state import RAGState, evidence, failure
+from ragorc.pipeline.state import RAGState, evidence, failure, gathered
 from ragorc.retrieve.fusion import fuse
 from ragorc.retrieve.noise import NoiseFilter
 from ragorc.security.tenancy import require_tenant
@@ -1231,7 +1231,12 @@ class PipelineNodes:
         query = state.get("query")
         if query is None:
             return {}
-        chunks = evidence(state)
+        # ``gathered``, not ``evidence``: ``hop`` writes ``candidates`` and leaves
+        # ``retrieval`` for ``collect``, so the authoritative list is still the
+        # *first* retrieval on every iteration after the first. Reading it here
+        # meant re-judging the passages already called insufficient and returning
+        # the same verdict, which made the early exit dead after hop 0.
+        chunks = gathered(state)
         prompt = get_prompt("multihop_reason")
         plan = self._budgeter.plan(system_prompt=prompt.system, question=query.text)
         pack = self._packer.build(

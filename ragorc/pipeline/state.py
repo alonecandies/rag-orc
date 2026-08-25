@@ -76,6 +76,7 @@ __all__ = [
     "RAGState",
     "evidence",
     "failure",
+    "gathered",
     "initial_state",
     "merge_store_lists",
     "total_usage",
@@ -220,6 +221,42 @@ def evidence(state: RAGState) -> list[ScoredChunk]:
     if not web:
         return corpus
     merged = dedupe_scored([*corpus, *web])
+    for rank, scored in enumerate(merged):
+        scored.rank = rank
+    return merged
+
+
+def gathered(state: RAGState) -> list[ScoredChunk]:
+    """Everything any stage has retrieved so far — the *reasoning* view.
+
+    Distinct from :func:`evidence`, and the distinction is the point.
+    ``evidence`` answers "what should the generator cite", so it reads
+    ``retrieval``, the single authoritative list. This answers "what do we know
+    already", which is a different question and has to include the parts that
+    have not been fused into the authority yet.
+
+    The multi-hop loop is why it exists. ``hop`` writes ``candidates`` and its own
+    ``per_store`` leg and deliberately leaves ``retrieval`` alone — fusing is
+    ``collect``'s job, at the end. So a sufficiency check reading ``evidence``
+    saw the *first* retrieval on every iteration, judged the same passages it had
+    already called insufficient, and returned the same verdict. The early exit
+    could therefore never fire after hop 0, and every multi-hop query paid its
+    full hop budget however quickly the answer turned up.
+
+    Deduplicated by chunk id keeping the higher score, because consecutive hops on
+    one topic overlap heavily and the same passage arriving three times asserts
+    one fact three times — which makes a model more confident rather than better
+    informed, and this is a call about confidence.
+    """
+    retrieval = state.get("retrieval")
+    authoritative = list(retrieval.chunks) if retrieval is not None else []
+    merged = dedupe_scored(
+        [
+            *authoritative,
+            *(state.get("candidates") or ()),
+            *(state.get("web_chunks") or ()),
+        ]
+    )
     for rank, scored in enumerate(merged):
         scored.rank = rank
     return merged

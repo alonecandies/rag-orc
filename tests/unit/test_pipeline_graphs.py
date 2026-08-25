@@ -615,3 +615,57 @@ async def test_agentic_abstains_when_crag_rejects_the_whole_corpus(
         f"the generator was handed {[c.chunk.id for c in retrieval.chunks]} after CRAG "
         "rejected every document"
     )
+
+
+# ---------------------------------------------------------------------------
+# The multi-hop early exit has to be able to see the hop
+# ---------------------------------------------------------------------------
+HOP_FINDING = "The founder of Acme studied at Cambridge."
+
+
+async def test_sufficiency_check_reads_what_the_last_hop_retrieved(
+    nodes: PipelineNodes, llm: StubLLM
+) -> None:
+    """``multihop_stop_on_sufficient`` was dead after hop 0.
+
+    ``hop`` writes ``candidates`` and its own ``per_store`` leg and leaves
+    ``retrieval`` for ``collect``. The check read ``evidence``, which is built
+    from ``retrieval`` — so on every iteration after the first it was handed the
+    *first* retrieval, judged passages it had already called insufficient, and
+    returned the same verdict. The loop could only ever end on the budget, and
+    every multi-hop query paid for all its hops however early the answer arrived.
+    """
+    state = initial_state("which university did Acme's founder attend?")
+    state.update(await nodes.validate(state))
+    # The state as it stands one hop in: `retrieval` is still hop 0's, and what
+    # hop 1 found is in `candidates` and nowhere else.
+    state["retrieval"] = RetrievalResult(chunks=[GOOD])
+    state["candidates"] = [
+        GOOD,
+        ScoredChunk(chunk=Chunk(id="hop1", content=HOP_FINDING, document_id="d9"), score=0.87),
+    ]
+
+    await nodes.check_sufficiency(state)
+
+    prompt = llm.calls_for("multihop_reason")[0]["prompt"]
+    assert HOP_FINDING in prompt, (
+        "the sufficiency call cannot decide the loop is done without seeing what "
+        "the last hop retrieved"
+    )
+
+
+async def test_sufficiency_check_does_not_repeat_a_passage_it_already_has(
+    nodes: PipelineNodes, llm: StubLLM
+) -> None:
+    """Consecutive hops on one topic overlap heavily, and this is a call about
+    *confidence* — the same fact asserted three times makes a model more sure
+    rather than better informed."""
+    state = initial_state("q")
+    state.update(await nodes.validate(state))
+    state["retrieval"] = RetrievalResult(chunks=[GOOD])
+    state["candidates"] = [GOOD, GOOD]
+
+    await nodes.check_sufficiency(state)
+
+    prompt = llm.calls_for("multihop_reason")[0]["prompt"]
+    assert prompt.count(POLICY) == 1
