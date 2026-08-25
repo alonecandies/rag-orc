@@ -17,10 +17,12 @@ from ragorc.core.models import (
     Answer,
     Chunk,
     DataStore,
+    GradeLabel,
     Query,
     RetrievalResult,
     RouteDecision,
     ScoredChunk,
+    Usage,
 )
 from ragorc.core.schemas import GroundednessGrade, RelevanceGrade, RouteOutput, UtilityGrade
 from ragorc.core.settings import Settings
@@ -468,3 +470,148 @@ async def test_rrr_costs_nothing_when_disabled(llm: StubLLM, settings: Settings)
     )
     assert asked == [question], "the question must reach the retriever unrewritten"
     assert usages == [], "a disabled feature must not bill anything"
+
+
+# ---------------------------------------------------------------------------
+# The agentic graph has to keep the verdict it paid for
+# ---------------------------------------------------------------------------
+GOOD = ScoredChunk(chunk=Chunk(id="good", content=POLICY, document_id="d1"), score=0.9, rank=0)
+JUNK = ScoredChunk(
+    chunk=Chunk(id="junk", content="Our office is in Berlin.", document_id="d2"),
+    score=0.88,
+    rank=1,
+)
+
+
+class StubCrag:
+    """A CRAG stage that grades everything irrelevant and returns nothing.
+
+    Shaped like the real one in the detail that matters: ``per_store`` carries
+    the *pre-grading* candidates, because that is what per-leg diagnostics are
+    (``crag.py``: ``result.per_store[self.base.name] = list(initial)``), while
+    ``chunks`` carries the verdict. Any collect step that rebuilds the ranking
+    from ``per_store`` resurrects exactly what the grader threw out.
+    """
+
+    def __init__(self, kept: list[ScoredChunk], candidates: list[ScoredChunk]) -> None:
+        self.kept = kept
+        self.candidates = candidates
+
+    async def run(self, query: Query, **kwargs: object) -> tuple[RetrievalResult, Usage]:
+        del query, kwargs
+        return (
+            RetrievalResult(
+                chunks=list(self.kept),
+                per_store={"vector": list(self.candidates)},
+                total_candidates=len(self.candidates),
+                grade=GradeLabel.INCORRECT if not self.kept else GradeLabel.CORRECT,
+            ),
+            Usage(),
+        )
+
+
+async def test_collect_keeps_crags_verdict_instead_of_the_raw_candidates(
+    nodes: PipelineNodes, settings: Settings
+) -> None:
+    """The finding, at the node that had it.
+
+    ``fuse`` was wired in as the agentic graph's collect step. It rebuilds the
+    ranking from ``per_store``, so grading five documents and discarding four
+    produced a context containing all five.
+    """
+    nodes.crag = StubCrag(kept=[], candidates=[GOOD, JUNK])
+    state = initial_state("what is the refund window?")
+    state.update(await nodes.validate(state))
+    graded = await nodes.grade(state)
+    state.update({k: v for k, v in graded.items() if k != "per_store"})
+    state["per_store"] = graded["per_store"]
+
+    collected = await nodes.collect(state)
+
+    assert [c.chunk.id for c in collected["retrieval"].chunks] == [], (
+        "the grader discarded every document; the generator must receive none"
+    )
+    assert collected["retrieval"].total_candidates == 2, (
+        "the per-leg diagnostics must still report what the store returned"
+    )
+
+
+async def test_collect_merges_hop_results_into_the_endorsed_set(
+    nodes: PipelineNodes, settings: Settings
+) -> None:
+    """Hops are additions, not replacements.
+
+    ``hop`` writes only ``candidates`` and its own ``per_store`` leg, leaving
+    ``retrieval`` alone by design — so collect has to merge them in, or the
+    evidence a hop went and fetched never reaches the answer.
+    """
+    hopped = ScoredChunk(
+        chunk=Chunk(
+            id="hopped", content="Refunds are issued to the original card.", document_id="d3"
+        ),
+        score=0.8,
+    )
+    state = initial_state("q")
+    state.update(await nodes.validate(state))
+    state["retrieval"] = RetrievalResult(chunks=[GOOD], per_store={"vector": [GOOD, JUNK]})
+    state["per_store"] = {"vector": [GOOD, JUNK], "hop_1": [hopped]}
+
+    collected = await nodes.collect(state)
+
+    ids = {c.chunk.id for c in collected["retrieval"].chunks}
+    assert ids == {"good", "hopped"}, f"expected the endorsed chunk plus the hop, got {ids}"
+
+
+async def test_collect_ignores_evidence_from_a_rejected_attempt(
+    nodes: PipelineNodes, settings: Settings
+) -> None:
+    """``per_store`` is a reducer; ``retrieval`` is not.
+
+    When Self-RAG rejects an answer the graph re-enters ``grade``, and
+    ``merge_store_lists`` concatenates the second grading's legs onto the
+    first's. Fusing from ``per_store`` therefore mixed the evidence of the
+    rejected attempt into the retry. Reading the last-written ``retrieval``
+    cannot, and this pins that.
+    """
+    state = initial_state("q")
+    state.update(await nodes.validate(state))
+    # What the channel looks like after two passes through `grade`.
+    state["per_store"] = {"vector": [JUNK, GOOD]}
+    state["retrieval"] = RetrievalResult(chunks=[GOOD], per_store={"vector": [JUNK, GOOD]})
+
+    collected = await nodes.collect(state)
+
+    assert [c.chunk.id for c in collected["retrieval"].chunks] == ["good"]
+
+
+async def test_agentic_abstains_when_crag_rejects_the_whole_corpus(
+    nodes: PipelineNodes, llm: StubLLM
+) -> None:
+    """End to end through the compiled graph.
+
+    The abstention signal is the entire reason CRAG is in this pipeline. With
+    the retrieval budget at zero the graph goes ``grade -> gate -> collect``,
+    so this isolates the collect step from the corrective loops.
+    """
+    from ragorc.pipeline.graphs import agentic
+
+    tuned = Settings(
+        security={"enforce_tenant_isolation": False},
+        cache={"enabled": False},
+        llm={"api_key": "k", "context_window": 8000},
+        generation={"rrr_max_rewrites": 0, "self_rag_max_retries": 0},
+        graph={"multihop_max_iterations": 0},
+    )
+    nodes.crag = StubCrag(kept=[], candidates=[GOOD, JUNK])
+    compiled = agentic.build(nodes, settings=tuned)
+
+    final = await compiled.ainvoke(
+        initial_state("what is the refund window?", pipeline="agentic"),
+        {"recursion_limit": agentic.recursion_limit(tuned)},
+    )
+
+    retrieval = final.get("retrieval")
+    assert retrieval is not None and list(retrieval.chunks) == [], (
+        f"the generator was handed {[c.chunk.id for c in retrieval.chunks]} after CRAG "
+        "rejected every document"
+    )

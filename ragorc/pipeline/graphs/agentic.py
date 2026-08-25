@@ -289,7 +289,7 @@ def build(
     graph.add_node(_GATE, gate)
     graph.add_node(_CHECK, nodes.check_sufficiency)
     graph.add_node(_HOP, nodes.hop)
-    graph.add_node(_COLLECT, nodes.fuse)
+    graph.add_node(_COLLECT, nodes.collect)
     graph.add_node("rerank", nodes.rerank)
     graph.add_node("compress", nodes.compress)
     graph.add_node(_GENERATE, nodes.generate)

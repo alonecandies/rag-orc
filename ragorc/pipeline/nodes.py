@@ -54,7 +54,7 @@ be a race whose symptom is a plausible wrong answer rather than a crash.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeVar
 
@@ -91,6 +91,17 @@ from ragorc.security.tenancy import require_tenant
 from ragorc.validate.input import QueryValidator
 
 log = structlog.get_logger(__name__)
+
+_HOP_LEG_PREFIX = "hop_"
+"""Names the ``per_store`` legs :meth:`PipelineNodes.hop` writes.
+
+Shared with :meth:`PipelineNodes.collect`, which has to tell a hop's addition
+apart from the legs that produced the retrieval it is adding to."""
+
+_ENDORSED_LEG = "endorsed"
+"""The synthetic leg :meth:`PipelineNodes.collect` fuses the authoritative
+retrieval under. Not a store: it is whatever survived the pipeline's own
+filtering, which is exactly what must not be re-derived from the raw legs."""
 
 __all__ = ["Node", "PipelineNodes", "resolve_prompt_name"]
 
@@ -573,28 +584,85 @@ class PipelineNodes:
         might be the SQL leg's constant, and measuring cosine similarities against
         a number that is not a similarity discards the entire dense list.
         """
-        query = state.get("query")
         contributing = {
             name: chunks for name, chunks in (state.get("per_store") or {}).items() if chunks
         }
+        return {"retrieval": self._combine(state, contributing)}
+
+    async def collect(self, state: RAGState) -> dict[str, Any]:
+        """Merge what the pipeline *endorses* with whatever the hop loop added.
+
+        The collect step for graphs where retrieval passed through a filter on its
+        way here — which today means :mod:`ragorc.pipeline.graphs.agentic`, whose
+        CRAG stage grades the candidates, refines the survivors and may discard the
+        lot.
+
+        :meth:`fuse` is the wrong node for that, and used to be the one wired in.
+        It rebuilds the ranking from ``per_store``, and CRAG publishes its
+        *pre-grading* retrieval there (``crag.py``: ``per_store[base.name] =
+        list(initial)``) because that is what per-leg diagnostics mean. So the
+        graph graded five documents, refined the survivors, and then re-fused the
+        original five — including the ones it had just judged irrelevant. With a
+        verdict of INCORRECT, ``_assemble`` returns ``[]`` and the generator was
+        still handed the full candidate list: the abstention signal, which is the
+        entire reason CRAG is in the graph, was computed, paid for and thrown away.
+
+        ``retrieval`` is the authority (see :mod:`ragorc.pipeline.state`) and it is
+        a ``LastValue`` channel, which fixes a second thing for free. ``per_store``
+        is a *reducer* — ``merge_store_lists`` concatenates on key collision — so
+        when Self-RAG rejects an answer and the graph re-enters ``grade``, the
+        second grading's legs pile on top of the first's. Fusing from ``per_store``
+        therefore mixed the evidence of the rejected attempt into the retry.
+        Reading the last-written ``retrieval`` cannot.
+
+        Hop legs are still merged in, because they are additions rather than
+        replacements: ``hop`` writes only ``candidates`` and its own
+        ``per_store`` entry, leaving ``retrieval`` untouched by design.
+        """
+        per_store = state.get("per_store") or {}
+        hops = {
+            name: chunks
+            for name, chunks in per_store.items()
+            if name.startswith(_HOP_LEG_PREFIX) and chunks
+        }
+        retrieval = state.get("retrieval")
+        endorsed = list(retrieval.chunks) if retrieval is not None else []
+        if not endorsed and not hops:
+            log.info("collect_no_evidence", errors=state.get("errors") or [])
+            return {"retrieval": retrieval if retrieval is not None else RetrievalResult()}
+        contributing = {_ENDORSED_LEG: endorsed, **hops} if endorsed else dict(hops)
+        return {"retrieval": self._combine(state, contributing)}
+
+    def _combine(
+        self, state: RAGState, contributing: Mapping[str, list[ScoredChunk]]
+    ) -> RetrievalResult:
+        """Fuse the named lists, denoise, and attach the per-leg diagnostics.
+
+        ``result.per_store`` and ``total_candidates`` are always taken from the
+        state's raw map rather than from ``contributing``, so the diagnostics keep
+        reporting what each store actually returned even when the lists being
+        fused are a filtered view of it — "retrieved 20, kept 3" stays legible.
+        """
+        query = state.get("query")
         per_store = dict(state.get("per_store") or {})
         result = RetrievalResult(
             per_store=per_store,
             errors=_recorded_leg_errors(state, list(per_store)),
             total_candidates=sum(len(v) for v in per_store.values()),
         )
-        if not contributing:
+        live = {name: chunks for name, chunks in contributing.items() if chunks}
+        if not live:
             log.info("fuse_no_contributions", errors=state.get("errors") or [])
-            return {"retrieval": result}
+            return result
 
         rs = self.settings.retrieval
-        if len(contributing) == 1:
+        if len(live) == 1:
             # Nothing to fuse. Passing through preserves the store's own score
             # scale, which ``score_threshold`` is calibrated against.
-            fused = list(next(iter(contributing.values())))
+            fused = list(next(iter(live.values())))
         else:
             fused = fuse(
-                contributing,
+                live,
                 rs.fusion,
                 weights=rs.fusion_weights,
                 settings=self.settings,
@@ -606,13 +674,13 @@ class PipelineNodes:
         result.chunks = kept
         log.info(
             "fused",
-            legs=sorted(contributing),
+            legs=sorted(live),
             candidates=result.total_candidates,
             kept=len(kept),
             removed=report.removed,
             fusion=rs.fusion.value,
         )
-        return {"retrieval": result}
+        return result
 
     # ------------------------------------------------------------------
     # 6. rerank
@@ -1238,7 +1306,7 @@ class PipelineNodes:
             "rewrites": [follow_up],
             "retrieve_iterations": iteration,
             "candidates": list(result.chunks),
-            "per_store": {f"hop_{iteration}": list(result.chunks)},
+            "per_store": {f"{_HOP_LEG_PREFIX}{iteration}": list(result.chunks)},
             "usages": _published_usage(self.retriever) + rrr_usage,
         }
 
