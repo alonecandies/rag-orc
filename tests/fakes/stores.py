@@ -176,6 +176,17 @@ class FakeVectorStore:
     async def count(self, **kwargs: Any) -> int:
         return len(self.chunks)
 
+    async def health(self) -> dict[str, Any]:
+        """Reachability, with no tenant in the question.
+
+        Modelled separately from ``count`` rather than delegating to it, because
+        the distinction is the point: the real store's ``count`` applies the
+        tenant filter and fails closed, which is why a health probe must not be a
+        count. A fake that answered both from one code path could not tell the two
+        apart.
+        """
+        return {"collection": "fake", "points": len(self.chunks), "status": "green"}
+
     async def close(self) -> None:
         return None
 

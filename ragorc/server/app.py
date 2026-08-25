@@ -1392,14 +1392,14 @@ class RagService:
         )
 
     async def _probe_qdrant(self) -> StoreHealth:
-        # ``exact=False`` reads segment statistics instead of counting points: on
-        # a large collection an exact count is a scan, and a health check must not
-        # be the most expensive query the service runs.
-        count = await self.linear.vector.count(exact=False)
-        return StoreHealth(
-            name="qdrant",
-            detail={"collection": self.settings.qdrant.collection, "points": count},
-        )
+        # Through the store's own ``health``, not ``count``. A count applies the
+        # tenant filter, which fails closed — so with tenant isolation enabled and
+        # no service-wide default tenant, this probe used to raise and report a
+        # healthy Qdrant as ``unavailable``. Collection info answers "is the server
+        # up and is the collection there" without a tenant being part of the
+        # question, and is cheaper than a count besides. Same shape as
+        # :meth:`_probe_neo4j`.
+        return StoreHealth(name="qdrant", detail=await self.linear.vector.health())
 
     async def _probe_postgres(self) -> StoreHealth:
         count = await self.linear.relational.count()

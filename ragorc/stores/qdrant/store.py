@@ -983,6 +983,43 @@ class QdrantStore:
         )
         return int(result.count)
 
+    async def health(self) -> dict[str, Any]:
+        """Reachability and collection state, with no tenant in the question.
+
+        :meth:`count` is the wrong probe and was the one being used. It applies
+        the tenant filter through :func:`~ragorc.security.tenancy.with_tenant`,
+        which fails closed — so with ``security.enforce_tenant_isolation`` on and
+        no ``settings.tenant_id`` (the normal shape of a multi-tenant deployment,
+        where the tenant arrives per request) the probe raised
+        ``GuardrailViolation`` and ``/health`` reported Qdrant **unavailable** and
+        the service **degraded** while Qdrant was perfectly healthy. The docstring
+        on the endpoint tells an orchestrator to key off the individual store
+        entries, so that is a pod taken out of rotation by its own health check.
+
+        Failing closed is right for a *read*: a query with no tenant must never
+        mean "search everything". A health check is not a read of anyone's data —
+        it asks whether the server answers and whether the collection is there,
+        and neither question has a tenant. So it asks the collection directly.
+
+        Symmetric with :meth:`~ragorc.stores.neo4j.store.Neo4jStore.health`, which
+        is what ``_probe_neo4j`` already calls, and cheaper than any count:
+        collection info is metadata the server already holds, while even
+        ``exact=False`` reads segment statistics.
+        """
+        info = await self._guard(
+            "health", lambda: self.client.get_collection(collection_name=self.collection)
+        )
+        points = getattr(info, "points_count", None)
+        # ``vectors_count`` is deliberately not reported. Recent server versions
+        # leave it unset, so it reads as 0 next to a non-zero ``points`` — a
+        # number that is wrong is worse on a health page than a number that is
+        # absent, because someone will act on it.
+        return {
+            "collection": self.collection,
+            "points": int(points) if points is not None else 0,
+            "status": str(getattr(getattr(info, "status", None), "value", "") or "unknown"),
+        }
+
     async def delete(
         self,
         ids: Sequence[str] | None = None,

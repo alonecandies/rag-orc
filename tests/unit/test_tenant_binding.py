@@ -243,3 +243,56 @@ def test_anonymous_is_never_bindable() -> None:
             bindings=tenant_bindings(settings),
             settings=settings.security,
         )
+
+
+# ---------------------------------------------------------------------------
+# The health probe is not a tenant-scoped read
+# ---------------------------------------------------------------------------
+async def test_health_is_not_refused_by_tenant_isolation() -> None:
+    """A multi-tenant deployment's own health check used to take it out of
+    rotation.
+
+    `_probe_qdrant` called `vector.count(exact=False)`, and `count` applies the
+    tenant filter through `with_tenant`, which fails closed. With
+    `enforce_tenant_isolation` on and no service-wide `tenant_id` — the normal
+    shape when the tenant arrives per request — the probe raised
+    `GuardrailViolation`, so `/health` reported Qdrant `unavailable` and the
+    service `degraded` while Qdrant was fine. `/health` documents that an
+    orchestrator should key off the individual store entries.
+
+    Failing closed is correct for a read: a query with no tenant must never mean
+    "search everything". A health check is not a read of anyone's data.
+    """
+    from ragorc.core.errors import GuardrailViolation as _GV
+
+    service = RagService(_settings())
+
+    class Refusing:
+        """Counts as the real store does: refuses an unscoped count, answers a
+        health probe."""
+
+        def __init__(self) -> None:
+            self.counts = 0
+
+        async def count(self, **kwargs: object) -> int:
+            self.counts += 1
+            raise _GV("tenant_id is required", rule="enforce_tenant_isolation")
+
+        async def health(self) -> dict[str, object]:
+            return {"collection": "c", "points": 7, "status": "green"}
+
+    class Counting:
+        async def count(self, **kwargs: object) -> int:
+            return 3
+
+    vector = Refusing()
+    service.linear.vector = vector  # type: ignore[assignment]
+    service.linear.relational = Counting()  # type: ignore[assignment]
+
+    health = await service.health()
+
+    by_name = {store.name: store for store in health.stores}
+    assert by_name["qdrant"].status == "ok", by_name["qdrant"].error
+    assert by_name["qdrant"].detail["points"] == 7
+    assert health.status == "ok", "a healthy service must not report itself degraded"
+    assert vector.counts == 0, "the probe must not go through the tenant-scoped count"
