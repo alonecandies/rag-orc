@@ -2573,6 +2573,68 @@ async def _json_body(request: Any, model: type[Any], settings: Settings) -> Any:
         ) from exc
 
 
+_UPLOAD_CHUNK_BYTES = 1 << 20
+"""How much of one upload is held in memory at a time.
+
+A megabyte, because that is Starlette's own spool threshold, so a part smaller
+than this is copied from memory and a larger one is copied from the temporary
+file it already spilled into."""
+
+
+def _capped_receive(request: Any, budget: int) -> Any:
+    """Wrap the ASGI receive channel so the body cannot exceed ``budget``.
+
+    Placed here rather than in the middleware because the middleware runs before
+    the body arrives and can only read the declared ``Content-Length``. This
+    counts what actually turns up, so a chunked upload that declares nothing is
+    bounded by the same number, and it raises on the chunk that crosses the line
+    rather than after the whole body has been spooled to disk.
+    """
+    received = 0
+
+    async def receive() -> Any:
+        nonlocal received
+        message = await request.receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > budget:
+                raise ValidationFailed(
+                    "upload exceeds server.max_body_bytes",
+                    limit_bytes=budget,
+                    received_bytes=received,
+                )
+        return message
+
+    return receive
+
+
+async def _copy_part(value: Any, destination: Path, *, budget: int, written: int) -> int:
+    """Copy one uploaded part to disk in bounded chunks, returning the new total.
+
+    ``await value.read()`` with no argument returns the whole part as one
+    ``bytes``, so the previous version materialized an entire file in memory and
+    only then compared the running total against the budget — the check fired
+    after the allocation it existed to prevent. Reading in fixed chunks makes the
+    ceiling apply to the copy as well as to the transfer, which matters as soon
+    as an operator raises ``max_body_bytes`` to take large PDFs.
+    """
+
+    def _write(handle: Any, data: bytes) -> None:
+        handle.write(data)
+
+    with destination.open("wb") as handle:
+        while chunk := await value.read(_UPLOAD_CHUNK_BYTES):
+            written += len(chunk)
+            if written > budget:
+                raise ValidationFailed(
+                    "uploaded files exceed server.max_body_bytes",
+                    limit_bytes=budget,
+                    received_bytes=written,
+                )
+            await asyncio.to_thread(_write, handle, chunk)
+    return written
+
+
 @contextlib.asynccontextmanager
 async def _staged_uploads(
     request: Any, settings: Settings
@@ -2587,8 +2649,12 @@ async def _staged_uploads(
 
     Two things are enforced here rather than trusted: the filename is reduced to
     its basename (an upload named ``../../etc/passwd`` writes ``passwd`` inside the
-    temporary directory and nothing else), and the running total is capped, since
-    ``Content-Length`` on a multipart body is a claim about the whole envelope.
+    temporary directory and nothing else), and the byte ceiling is applied at both
+    points where bytes accumulate — on the wire before the parser spools them
+    (:func:`_capped_receive`) and again as each part is copied out
+    (:func:`_copy_part`). ``Content-Length`` is a claim about the whole envelope,
+    so the middleware's check on it is a courtesy to honest clients and not a
+    bound.
 
     Yields the request *and* the staging directory, because the directory is the
     only root the resulting path is allowed to be under: the caller of this
@@ -2599,9 +2665,16 @@ async def _staged_uploads(
     """
     import tempfile
 
+    from starlette.requests import Request as _Request
+
     _require("multipart", "server")
-    form = await request.form()
     budget = settings.server.max_body_bytes
+    # Counted off the wire, before the parser sees it. The middleware's ceiling
+    # reads ``Content-Length``, which is a *claim*: a chunked request omits it
+    # and a lying one is free. Starlette's own ``max_part_size`` does not cover
+    # this either — ``on_part_data`` applies it only when ``file is None``, so a
+    # field is bounded and an uploaded file is not.
+    form = await _Request(request.scope, receive=_capped_receive(request, budget)).form()
     written = 0
     try:
         with tempfile.TemporaryDirectory(prefix="ragorc-upload-") as staging:
@@ -2614,15 +2687,7 @@ async def _staged_uploads(
                 safe = Path(str(filename)).name
                 if not safe or safe in {".", ".."}:
                     continue
-                payload = await value.read()
-                written += len(payload)
-                if written > budget:
-                    raise ValidationFailed(
-                        "uploaded files exceed server.max_body_bytes",
-                        limit_bytes=budget,
-                        received_bytes=written,
-                    )
-                await asyncio.to_thread((root / safe).write_bytes, payload)
+                written = await _copy_part(value, root / safe, budget=budget, written=written)
                 names.append(safe)
             if not names:
                 raise ValidationFailed("no files were uploaded", field="files")

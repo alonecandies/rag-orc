@@ -206,9 +206,7 @@ async def test_uploads_still_work_and_only_through_their_staging_root(
     monkeypatch.delenv(_INGEST_ROOTS_ENV, raising=False)
     service, engine = _service(settings)
 
-    async with _staged_uploads(
-        _FakeRequest([_FakeUpload("doc.md", b"# Handbook\n")]), settings
-    ) as (
+    async with _staged_uploads(_multipart_request([("doc.md", b"# Handbook\n")]), settings) as (
         body,
         staged_root,
     ):
@@ -221,38 +219,145 @@ async def test_uploads_still_work_and_only_through_their_staging_root(
 
 
 # ---------------------------------------------------------------------------
-# Multipart doubles. Starlette's form API, only the three members used.
+# A real multipart request
 # ---------------------------------------------------------------------------
-class _FakeUpload:
-    def __init__(self, filename: str, payload: bytes) -> None:
-        self.filename = filename
-        self._payload = payload
-
-    async def read(self) -> bytes:
-        return self._payload
-
-
-class _FakeForm:
-    def __init__(self, files: list[_FakeUpload]) -> None:
-        self._files = files
-        self.closed = False
-
-    def getlist(self, key: str) -> list[_FakeUpload]:
-        return self._files if key == "files" else []
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return default
-
-    async def close(self) -> None:
-        self.closed = True
+# Not a double. The doubles this replaces implemented ``form()`` directly and
+# returned canned uploads, which meant the test never reached Starlette's parser
+# — and the byte ceiling is enforced *around* that parser, on the ASGI receive
+# channel, so a double that hands back a finished form cannot observe it. It
+# would also have passed with the cap deleted.
+_BOUNDARY = "ragorc-test-boundary"
 
 
-class _FakeRequest:
-    def __init__(self, files: list[_FakeUpload]) -> None:
-        self._form = _FakeForm(files)
+def _multipart_body(files: list[tuple[str, bytes]]) -> bytes:
+    parts = []
+    for filename, payload in files:
+        parts.append(
+            f"--{_BOUNDARY}\r\n"
+            f'Content-Disposition: form-data; name="files"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n".encode()
+            + payload
+            + b"\r\n"
+        )
+    parts.append(f"--{_BOUNDARY}--\r\n".encode())
+    return b"".join(parts)
 
-    async def form(self) -> _FakeForm:
-        return self._form
+
+def _multipart_request(files: list[tuple[str, bytes]], *, chunk: int = 8192) -> Any:
+    """A real ``starlette.requests.Request`` over a real multipart body.
+
+    Deliberately sends **no** ``Content-Length``. That is the shape the
+    middleware's ceiling cannot see — it reads the declared length and a chunked
+    request declares nothing — so it is the shape the wire cap has to handle, and
+    building it any other way would test the easy case.
+    """
+    from starlette.requests import Request
+
+    body = _multipart_body(files)
+    chunks = [body[i : i + chunk] for i in range(0, len(body), chunk)] or [b""]
+    total = len(chunks)
+    served = []
+
+    async def receive() -> Any:
+        if chunks:
+            served.append(1)
+            return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks)}
+        return {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/ingest",
+        "headers": [(b"content-type", f"multipart/form-data; boundary={_BOUNDARY}".encode())],
+    }
+    built = Request(scope, receive)
+    # How much of the body the server actually pulled off the wire. The whole
+    # point of a streaming cap is that this stays small, and it is the only
+    # observable that separates "refused while it streams" from "refused after
+    # the body landed" — both of which raise, and both of which say
+    # ``max_body_bytes``.
+    built.chunks_served = served  # type: ignore[attr-defined]
+    built.chunks_total = total  # type: ignore[attr-defined]
+    return built
+
+
+async def test_an_upload_is_refused_while_it_streams_not_after_it_lands(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ceiling has to bite before the bytes are somewhere.
+
+    Three layers let this through. The middleware reads ``Content-Length``, which
+    a chunked upload never sends. Starlette's own ``max_part_size`` applies only
+    where ``file is None``, so it bounds a form *field* and not an uploaded file.
+    And ``_staged_uploads`` then called ``await value.read()`` — the whole part
+    into memory — and compared the running total to the budget afterwards, so the
+    check ran after the allocation it existed to prevent.
+    """
+    monkeypatch.delenv(_INGEST_ROOTS_ENV, raising=False)
+    tiny = Settings(**{**settings.model_dump(), "server": {"max_body_bytes": 4096}})
+    request = _multipart_request([("big.md", b"x" * 200_000)], chunk=1024)
+
+    with pytest.raises(ValidationFailed, match=r"^upload exceeds server\.max_body_bytes"):
+        async with _staged_uploads(request, tiny):
+            pass  # pragma: no cover - the body never gets this far
+
+    # The assertion that distinguishes the two caps. Both raise and both name
+    # ``max_body_bytes``, so a test that only checks for a raise passes with the
+    # wire cap deleted — the per-part check picks it up instead, after the entire
+    # body has been parsed and spooled. Refusing *while it streams* means the
+    # remaining ~195 chunks were never asked for.
+    assert request.chunks_total > 190, "the body must be large enough for this to mean something"
+    assert len(request.chunks_served) <= 8, (
+        f"read {len(request.chunks_served)} of {request.chunks_total} chunks before refusing; "
+        "the ceiling is being applied after the body landed, not while it arrives"
+    )
+
+
+async def test_an_upload_within_the_ceiling_still_lands(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: the cap must not reject what it is sized to allow."""
+    monkeypatch.delenv(_INGEST_ROOTS_ENV, raising=False)
+    payload = b"y" * 50_000
+    async with _staged_uploads(_multipart_request([("ok.md", payload)], chunk=1024), settings) as (
+        _body,
+        staged_root,
+    ):
+        assert (staged_root / "ok.md").read_bytes() == payload
+
+
+async def test_a_part_is_copied_in_bounded_chunks(tmp_path: Path) -> None:
+    """``_copy_part`` is the second layer, and it reads a bounded window.
+
+    The wire cap necessarily trips first when both are set to
+    ``max_body_bytes`` — the envelope is always larger than the parts it carries
+    — so this drives the helper directly rather than through a request that can
+    never reach it.
+    """
+    from ragorc.server.app import _copy_part
+
+    class _Part:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self.reads: list[int] = []
+            self._offset = 0
+
+        async def read(self, size: int = -1) -> bytes:
+            self.reads.append(size)
+            window = self._payload[self._offset : self._offset + size]
+            self._offset += len(window)
+            return window
+
+    part = _Part(b"z" * (3 << 20))
+    written = await _copy_part(part, tmp_path / "out.bin", budget=1 << 30, written=0)
+
+    assert written == 3 << 20
+    assert (tmp_path / "out.bin").stat().st_size == 3 << 20
+    assert max(part.reads) == 1 << 20, "the whole part must never be requested at once"
+
+    with pytest.raises(ValidationFailed, match="max_body_bytes"):
+        await _copy_part(_Part(b"z" * 4096), tmp_path / "capped.bin", budget=100, written=0)
 
 
 def test_error_detail_redacts_a_provider_body_quoted_under_a_harmless_key() -> None:
