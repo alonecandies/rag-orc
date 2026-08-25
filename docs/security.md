@@ -96,13 +96,34 @@ Three defences:
    channels, encoded payloads. Risk combines as a noisy-OR, so several weak
    signals outweigh one, and nothing saturates on a single heuristic.
 3. **Structural isolation** — the load-bearing defence. Retrieved text is wrapped
-   in delimiters whose closing tag is escaped inside the payload, so content
-   cannot terminate its own container.
+   in delimiters, and every spelling of the fence tag inside the payload is
+   escaped — case, stray whitespace, and the *opening* tag as well as the
+   closing one, since escaping only the closing tag stops break-out and leaves
+   boundary forgery. A passage's provenance line (`source: …`) is rendered
+   **inside** the fence, because it comes from `metadata` on the ingest request
+   and is therefore attacker-controlled; only the citation number `[n]`, which
+   the packer generates by counting, sits above it.
+
+Where the scan runs, and where it does not:
+
+| text | scanned | by |
+|---|---|---|
+| the user's question | yes | `validate/input.py`, stricter — a *question* has no legitimate reason to contain a role switch |
+| an ingested document | yes, at ingest | `validate/schema.py` |
+| a web search result | yes, at retrieval | `retrieve/web.py` |
+
+Documents are scanned at **ingest** rather than at retrieval: a document is
+written once and read many times, so the cost is paid per document, and `block`
+can only mean anything at the door. A blocked document is reported in
+`IngestReport.rejected` and the rest of the batch still indexes — one poisoned
+file in a bulk upload must not reject the other 9 999.
 
 The default action is `sanitize`, not `block`. The patterns have real false
 positives — a security wiki page *about* prompt injection matches all of them —
 and isolation is what actually holds. Sanitizing keeps the document available as
-evidence while defanging it.
+evidence while defanging it. Normalization applies either way, so a zero-width
+space inside a word never reaches the index; that is a retrieval fix as much as a
+security one, since it silently breaks every lexical match on that word.
 
 ```bash
 RAGORC_SECURITY__INJECTION_ACTION=sanitize   # sanitize | block | flag
@@ -121,6 +142,34 @@ to override the scope is either a bug or an attack.
 
 Qdrant additionally gets a payload index with `is_tenant=True`, which co-locates
 each tenant's vectors on disk so the filter is cheap rather than a filtered scan.
+
+### Naming a tenant is not the same as owning one
+
+`tenant_id` is a field on the request **body**, so on its own the setting above
+enforces that a request *names* a tenant — not that the caller is entitled to it.
+Bind each key to its tenant:
+
+```bash
+RAGORC_SERVER__API_KEYS='["key-acme","key-globex"]'
+RAGORC_SERVER__API_KEY_TENANTS='{"key-acme":"acme","key-globex":"globex"}'
+```
+
+A bound key may omit `tenant_id` (its own is used) and is refused if it names
+another (`rule=tenant_not_owned`, HTTP 400 — deliberately not 403, which would
+confirm to a caller probing ids which tenants exist). Reads and writes are both
+bound, since a caller able to file documents under another tenant's id is a
+caller able to have them answered back to that tenant.
+
+A key **absent** from the map stays unrestricted, so an existing deployment
+keeps working across the upgrade. That leaves the door open by default, which is
+why `/health` says so out loud whenever isolation is on and nothing is bound:
+
+> `security.enforce_tenant_isolation is on but server.api_key_tenants is empty:
+> any authenticated caller can read any tenant by naming it`
+
+That configuration is self-consistent — every query names a tenant, every store
+filter carries it — which is exactly why it has to be stated rather than
+inferred.
 
 ### Generated SQL and Cypher cannot be scoped, so they refuse
 
@@ -220,6 +269,11 @@ after redaction), `flag`.
 - [ ] `RAGORC_POSTGRES__READONLY_DSN` set to the `ragorc_ro` role
 - [ ] `RAGORC_SERVER__API_KEYS` set — empty means open
 - [ ] `RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION=true` for multi-tenant data
+- [ ] `RAGORC_SERVER__API_KEY_TENANTS` set — without it, isolation only checks
+      that a tenant was *named*, and any authenticated caller can name any tenant
+- [ ] `RAGORC_SERVER__MAX_BODY_BYTES` sized for your largest upload — it is
+      enforced on the wire, so it bounds a chunked request that declares no
+      `Content-Length`
 - [ ] `RAGORC_LLM__DATA_COLLECTION=deny` so no provider trains on your documents
 - [ ] `RAGORC_COST__MAX_COST_PER_QUERY_USD` set
 - [ ] `postgres.allowed_tables` populated — an empty allowlist means every

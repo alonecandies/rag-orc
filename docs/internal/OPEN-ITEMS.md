@@ -244,6 +244,60 @@ third-party import is either declared in an extra or guarded with a working
 fallback (`yaml`, `grpc`, `onnxruntime`), and the ones that are not declared
 cannot be missing when their parent is (`tokenizers`, `starlette`).
 
+## 11g. Closed: mechanisms that were reached but did not run
+
+Twelve findings from the pipeline/graph/server audit, all reproduced before being
+fixed. They share one shape, which is this codebase's characteristic defect and
+worth naming: **the thing is written, wired, documented, reachable — and does not
+do its job.** Every one of them was invisible to a suite that tests units in
+isolation, and in six cases the fix was verified by mutating the *call site*
+rather than the function body.
+
+Security:
+
+* `wrap_untrusted` escaped one exact string, so `</UNTRUSTED_DOCUMENT>`,
+  `</untrusted_document >` and a forged *opening* tag all passed through. The
+  Hypothesis property that was supposed to cover it counted the lowercase
+  substring, so it held while the defence did not.
+* The passage provenance line was rendered *above* the isolation fence. `source`
+  comes from `metadata` on the ingest request, so that was attacker-controlled
+  text in the region the system prompt calls instructions.
+* `tenant_id` was never bound to a principal. `require_tenant` checks that a
+  request *names* a tenant; the field is on the request body. Any authenticated
+  caller could read or write any tenant. `server.api_key_tenants` binds it, and
+  `/health` warns when isolation is on and nothing is bound.
+* The injection scanner never saw an ingested document — only questions and web
+  results, i.e. everything except the attack path its own module docstring opens
+  by describing.
+* A multipart upload was bounded three times and by nothing: the middleware reads
+  `Content-Length` (absent on a chunked request), Starlette's `max_part_size`
+  applies only where `file is None`, and `_staged_uploads` compared the total
+  *after* `await value.read()` had materialized the part.
+
+Behaviour:
+
+* The agentic graph's collect step was `nodes.fuse`, which rebuilds the ranking
+  from `per_store` — where CRAG publishes its *pre-grading* candidates. On
+  `INCORRECT`, CRAG returned `[]` and the generator was handed all five
+  documents. The abstention signal was computed, billed and discarded.
+* `check_sufficiency` read `evidence`, built from `retrieval`, which `hop` does
+  not write. So it re-judged the first retrieval on every iteration and
+  `multihop_stop_on_sufficient` could not fire after hop 0.
+* `_retrieve_for_stream` ran one fixed five-node list for every pipeline.
+  Streaming `graphrag` performed no traversal at all; streaming `multihop` took
+  no hops.
+* Entity traversal was untyped, so a two-hop expansion walked through `Chunk` and
+  `Community` nodes and returned co-occurrence as an extracted relationship —
+  including from `paths()`, which *is* the answer to "how is A related to B".
+* Community nodes were never pruned, so a changed document left its old
+  community's report in global search forever.
+* Local search's similarity term never fired: `query.dense` is set only by
+  `QdrantStore._prepare`, and the GraphRAG path does not go through the vector
+  store. The shipped ranking was two thirds of the documented one.
+* `/health` reported Qdrant `unavailable` and the service `degraded` whenever
+  `enforce_tenant_isolation` was on, because the probe was a tenant-scoped
+  `count`.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::

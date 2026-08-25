@@ -222,6 +222,17 @@ The base install has **no PyTorch**: embeddings, sparse vectors, ColBERT and
 reranking all run on ONNX Runtime via FastEmbed
 ([ADR-0004](docs/adr/0004-fastembed-onnx.md)).
 
+### Store versions
+
+`make up` pins **Qdrant v1.19**, **Postgres 16** (`pgvector/pgvector:pg16`) and
+**Neo4j 5.26**, and that combination is what the integration suite runs against.
+
+One hard floor is worth naming because it is not obvious from the driver
+requirement: **Neo4j 5.9+**. Entity traversal uses quantified path patterns,
+which is how it excludes the `MENTIONS` and `IN_COMMUNITY` scaffolding edges —
+an untyped `-[*1..2]-` constrains only the endpoint, walks through `Chunk` nodes,
+and returns co-occurrence as though it were an extracted relationship.
+
 ## Development
 
 ```bash
