@@ -387,3 +387,88 @@ async def test_neo4j_traversal_does_not_walk_through_chunks_or_communities(
                 label="cleanup",
             )
         await store.close()
+
+
+async def test_neo4j_prunes_superseded_communities_but_not_other_batches(
+    settings: Settings,
+) -> None:
+    """A rebuilt community must replace the old one, not join it.
+
+    Community ids are a hash of level plus membership — which is what makes a
+    re-ingest converge instead of duplicating, and is also why a *changed*
+    document produces a community with a new id rather than an updated node.
+    Nothing deleted the old one, so `communities()` returned both and global
+    search mapped over a report describing a partition that no longer existed.
+
+    The second half is the one that makes the fix safe. Detection runs over the
+    entities of the chunks *being ingested*, not the whole graph, so "delete
+    every community not in this build" would drop the global-search index for
+    every document already indexed.
+    """
+    from ragorc.core.models import Community
+    from ragorc.stores.neo4j.store import Neo4jStore
+
+    store = Neo4jStore(settings=settings)
+    tag = uuid.uuid4().hex[:8]
+    mine_a, mine_b, theirs = f"Mine{tag}A", f"Mine{tag}B", f"Theirs{tag}"
+    superseded, untouched, rebuilt = 990_001, 990_002, 990_003
+    try:
+        await store.upsert_entities(
+            [Entity(name=n, type="ORGANIZATION", description="d") for n in (mine_a, mine_b, theirs)]
+        )
+        await store.upsert_communities(
+            [
+                Community(
+                    id=superseded,
+                    level=0,
+                    entity_names=(mine_a, mine_b),
+                    title="old",
+                    summary="a stale report",
+                ),
+                Community(
+                    id=untouched,
+                    level=0,
+                    entity_names=(theirs,),
+                    title="another batch",
+                    summary="still live",
+                ),
+            ]
+        )
+        # The document behind {mine_a, mine_b} is re-ingested; membership shifted,
+        # so detection emits a new id for the same entities.
+        await store.upsert_communities(
+            [
+                Community(
+                    id=rebuilt,
+                    level=0,
+                    entity_names=(mine_a, mine_b),
+                    title="new",
+                    summary="a fresh report",
+                )
+            ]
+        )
+
+        assert await store.prune_communities(keep_ids=[rebuilt], entity_names=[mine_a, mine_b]) == 1
+
+        live = {c.id for c in await store.communities()}
+        assert superseded not in live, "the superseded report is still being searched"
+        assert rebuilt in live
+        assert untouched in live, (
+            "a community whose members this build never touched was deleted; that is "
+            "the global-search index of every other document"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await store._write_count(
+                f"MATCH (c:`{settings.neo4j.community_label}`) WHERE c.id IN $ids "
+                "DETACH DELETE c RETURN count(*) AS written",
+                {"ids": [superseded, untouched, rebuilt]},
+                label="cleanup",
+            )
+            await store._write_count(
+                f"MATCH (n:`{settings.neo4j.node_label}`) WHERE n.name CONTAINS $tag "
+                "DETACH DELETE n RETURN count(*) AS written",
+                {"tag": tag},
+                label="cleanup",
+            )
+        await store.close()

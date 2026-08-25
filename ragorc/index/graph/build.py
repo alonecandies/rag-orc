@@ -88,6 +88,12 @@ class GraphBuildReport:
     relations_written: int = 0
     chunk_links_written: int = 0
     communities_written: int = 0
+    communities_pruned: int = 0
+    """Community nodes this build superseded and removed. Reported because a
+    non-zero value means the previous partition of these entities is gone, which
+    is exactly what an operator wants to see after re-ingesting changed
+    documents — and a persistent zero across such a run is the symptom of the bug
+    this counter was added with."""
     schema_applied: list[str] = field(default_factory=list)
     timings_ms: dict[str, float] = field(default_factory=dict)
     usage: Usage = field(default_factory=Usage)
@@ -112,6 +118,7 @@ class GraphBuildReport:
             "relations_written": self.relations_written,
             "chunk_links_written": self.chunk_links_written,
             "communities_written": self.communities_written,
+            "communities_pruned": self.communities_pruned,
             "total_ms": round(self.total_ms, 1),
             "llm_calls": self.usage.calls,
             "cached_calls": self.usage.cached,
@@ -310,7 +317,22 @@ class GraphBuilder:
             with timed("graph_write_communities", communities=len(communities)) as timer:
                 for window in _windows(communities, batch):
                     report.communities_written += await self.store.upsert_communities(window)
+                # After the loop, not inside it: the windows are message-size
+                # slices of one partition, so "which communities does this build
+                # produce" is only answerable once every window has been written.
+                # Pruning per window would delete the communities the next window
+                # is about to write.
+                report.communities_pruned = await self.store.prune_communities(
+                    keep_ids=[c.id for c in communities],
+                    entity_names=[e.name for e in entities],
+                )
             report.timings_ms["write_communities"] = timer.elapsed_ms
+        elif entities:
+            # Detection produced nothing. That is not evidence the existing
+            # communities are stale — an extraction failure looks identical from
+            # here — so nothing is pruned, and the reason is logged rather than
+            # inferred later from an unexpectedly empty global search.
+            log.info("graph_communities_not_pruned", reason="no_communities_detected")
 
 
 def _windows(items: Sequence[Any], size: int) -> list[Sequence[Any]]:

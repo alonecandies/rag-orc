@@ -1559,3 +1559,92 @@ async def test_a_failed_run_does_not_leave_chunks_for_the_next_one_to_write() ->
     assert any(c.dense is None and c.document_id == "healthy" for c in store.chunks.values()), (
         "the healthy run's own parents must still be persisted"
     )
+
+
+# ---------------------------------------------------------------------------
+# Community pruning has to be *reached*, once, after every window
+# ---------------------------------------------------------------------------
+class _CommunityStore:
+    """Records the community writes and the prune, and nothing else.
+
+    A double rather than a live Neo4j because the question here is not what the
+    Cypher does — that is covered against a real server in the integration
+    suite — but whether `_persist` calls it at all, and with what. The whole
+    unit suite passed with the call deleted.
+    """
+
+    def __init__(self) -> None:
+        self.windows: list[list[int]] = []
+        self.prunes: list[tuple[tuple[int, ...], tuple[str, ...]]] = []
+
+    async def ensure_schema(self) -> None:
+        return None
+
+    async def upsert_entities(self, entities: object) -> int:
+        return len(list(entities))  # type: ignore[arg-type]
+
+    async def upsert_relations(self, relations: object) -> int:
+        return len(list(relations))  # type: ignore[arg-type]
+
+    async def upsert_chunk_links(self, links: object) -> int:
+        return len(dict(links))  # type: ignore[arg-type]
+
+    async def upsert_communities(self, communities: object) -> int:
+        window = list(communities)  # type: ignore[arg-type]
+        self.windows.append([c.id for c in window])
+        return len(window)
+
+    async def prune_communities(self, *, keep_ids: object, entity_names: object) -> int:
+        self.prunes.append((tuple(keep_ids), tuple(entity_names)))  # type: ignore[arg-type]
+        return 0
+
+
+async def _persist_communities(count: int, batch: int) -> _CommunityStore:
+    from ragorc.core.models import Community, Entity
+    from ragorc.core.settings import Settings
+    from ragorc.index.graph.build import GraphBuilder, GraphBuildReport
+
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        llm={"api_key": "k"},
+        indexing={"batch_size": batch},
+    )
+    store = _CommunityStore()
+    builder = GraphBuilder.__new__(GraphBuilder)
+    builder.settings = settings  # type: ignore[misc]
+    builder.store = store  # type: ignore[assignment]
+    entities = [Entity(name=f"E{i}", type="ORG", description="d") for i in range(3)]
+    communities = [
+        Community(id=1000 + i, level=0, entity_names=("E0",), title="t", summary="s")
+        for i in range(count)
+    ]
+    await builder._persist(entities, [], communities, GraphBuildReport())
+    return store
+
+
+async def test_communities_are_pruned_once_with_every_window_accounted_for() -> None:
+    """Pruning inside the window loop would delete what the next window writes.
+
+    The windows are message-size slices of *one* partition, so "which
+    communities does this build produce" is only answerable after the last one
+    has been written.
+    """
+    store = await _persist_communities(count=5, batch=2)
+
+    assert store.windows == [[1000, 1001], [1002, 1003], [1004]], "batching changed"
+    assert len(store.prunes) == 1, f"prune ran {len(store.prunes)} times, not once"
+    ((keep, names),) = store.prunes
+    assert sorted(keep) == [1000, 1001, 1002, 1003, 1004], (
+        "the prune must keep every id this build wrote, not just the last window's"
+    )
+    assert sorted(names) == ["E0", "E1", "E2"], (
+        "the prune is scoped by the entities this build re-partitioned"
+    )
+
+
+async def test_nothing_is_pruned_when_detection_produced_no_communities() -> None:
+    """An extraction failure and a corpus with no communities look identical
+    from here, so the safe reading is "no evidence", not "delete them all"."""
+    store = await _persist_communities(count=0, batch=2)
+    assert store.windows == []
+    assert store.prunes == []

@@ -47,7 +47,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -925,6 +925,62 @@ RETURN count(DISTINCT c) AS written
         written = await self._write_count(cypher, {"rows": rows}, label="upsert_communities")
         log.info("neo4j_communities_upserted", rows=len(rows), written=written)
         return written
+
+    async def prune_communities(
+        self, *, keep_ids: Collection[int], entity_names: Collection[str]
+    ) -> int:
+        """Delete community nodes this build superseded. Returns the count removed.
+
+        Community ids are a hash of level plus membership, which is what makes a
+        re-ingest converge instead of duplicating — and is also why a *changed*
+        document produces a community with a **new id** rather than an updated
+        node. Nothing deleted the old one. It kept its summary, kept its
+        ``IN_COMMUNITY`` edges (``upsert_communities`` only clears stale edges for
+        the communities it is currently writing), and kept being returned by
+        :meth:`communities` — so global search went on mapping over reports that
+        described a partition of the graph that no longer existed.
+
+        The scoping is the whole difficulty, and a naive "delete every community
+        not in this build" would be **destructive**. Community detection in
+        :class:`~ragorc.index.graph.build.GraphBuilder` runs over the entities
+        extracted from *the chunks being ingested*, not over the whole graph, so
+        one ingest legitimately knows nothing about the communities of every
+        document already indexed.
+
+        So a community is only superseded when both are true:
+
+        * this build did not re-produce its id, and
+        * every one of its members is an entity this build just re-partitioned.
+
+        A community holding even one entity from outside this batch is left alone.
+        That is deliberately conservative — partially-overlapping batches can leave
+        a stale community behind — but the failure mode of being wrong in the other
+        direction is deleting the global-search index for the rest of the corpus.
+
+        Communities with no recorded membership are left alone too. They cannot be
+        produced by detection, so one is a data anomaly, and silently deleting
+        anomalies is how they stay invisible.
+        """
+        names = _dedupe(entity_names)
+        if not names:
+            return 0
+        cypher = f"""
+MATCH (c:`{self.community_label}`)
+WHERE NOT c.id IN $keep
+  AND c.entity_names IS NOT NULL
+  AND size(c.entity_names) > 0
+  AND all(name IN c.entity_names WHERE name IN $names)
+DETACH DELETE c
+RETURN count(*) AS written
+"""
+        removed = await self._write_count(
+            cypher,
+            {"keep": [int(i) for i in keep_ids], "names": names},
+            label="prune_communities",
+        )
+        if removed:
+            log.info("neo4j_communities_pruned", removed=removed, kept=len(set(keep_ids)))
+        return removed
 
     # -- reads ------------------------------------------------------------
     async def fulltext_entities(
