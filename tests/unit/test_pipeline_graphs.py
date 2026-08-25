@@ -669,3 +669,101 @@ async def test_sufficiency_check_does_not_repeat_a_passage_it_already_has(
 
     prompt = llm.calls_for("multihop_reason")[0]["prompt"]
     assert prompt.count(POLICY) == 1
+
+
+# ---------------------------------------------------------------------------
+# Streaming has to stream the pipeline that was asked for
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("name", GRAPH_MODULES)
+async def test_streaming_variant_runs_retrieval_and_stops_before_generation(
+    name: str, nodes: PipelineNodes, llm: StubLLM, settings: Settings
+) -> None:
+    """``interrupt_before=["generate"]`` is what lets a stream run the real graph.
+
+    Both halves matter: the retrieval side must actually execute, and generation
+    must not — otherwise the answer would be produced before the first token was
+    emitted, which is a slower non-streaming request rather than a stream.
+    """
+    from ragorc.pipeline.graphs import GRAPHS, build_graph
+
+    # `crag` and `agentic` retrieve *through* their CRAG stage, so without one
+    # wired they skip grading and never retrieve at all — which would make this
+    # assertion pass for the wrong reason on the graphs it most needs to cover.
+    nodes.crag = StubCrag(kept=[GOOD], candidates=[GOOD, JUNK])
+    compiled = build_graph(name, nodes, settings=settings, interrupt_before=["generate"])
+    final = await compiled.ainvoke(
+        initial_state("what is the refund window?", pipeline=name),
+        {"recursion_limit": GRAPHS[name].recursion_limit(settings)},
+    )
+
+    assert final.get("answer") is None, "generation ran despite the interrupt"
+    assert "answer" not in llm.stages(), f"the generator was called: {llm.stages()}"
+    assert final.get("retrieval") is not None or final.get("candidates"), (
+        "the retrieval side did not run"
+    )
+
+
+@pytest.mark.parametrize("name", GRAPH_MODULES)
+def test_the_streaming_variant_is_the_same_graph(
+    name: str, nodes: PipelineNodes, settings: Settings
+) -> None:
+    """No second, hand-written approximation of the pipeline.
+
+    The bug this replaces was exactly that: a fixed five-node list stood in for
+    every graph, so it could not drift out of step with the definitions because
+    it was never in step with them.
+    """
+    from ragorc.pipeline.graphs import build_graph
+
+    streaming = build_graph(name, nodes, settings=settings, interrupt_before=["generate"])
+    plain = build_graph(name, nodes, settings=settings)
+    assert set(streaming.get_graph().nodes) == set(plain.get_graph().nodes)
+
+
+async def test_streaming_graphrag_searches_the_graph(
+    nodes: PipelineNodes, settings: Settings
+) -> None:
+    """Streaming ``graphrag`` used to perform no traversal whatsoever.
+
+    The hand-written sequence was ``validate, translate, route,
+    grade|retrieve, rerank`` — no ``classify``, and none of the local, global or
+    DRIFT nodes. A caller asking to stream GraphRAG got hybrid search under the
+    name and no way to tell.
+    """
+    from ragorc.pipeline.graphs import GRAPHS, build_graph
+
+    compiled = build_graph("graphrag", nodes, settings=settings, interrupt_before=["generate"])
+    final = await compiled.ainvoke(
+        initial_state("how is Acme related to Beta?", pipeline="graphrag"),
+        {"recursion_limit": GRAPHS["graphrag"].recursion_limit(settings)},
+    )
+
+    assert final.get("search_mode") in {"local", "global", "drift"}, (
+        f"no graph search mode was taken: {final.get('search_mode')!r}"
+    )
+    assert any(leg.startswith("graph_") for leg in (final.get("per_store") or {})), (
+        f"no graph leg contributed: {sorted(final.get('per_store') or {})}"
+    )
+
+
+async def test_streaming_multihop_consults_the_hop_loop(
+    nodes: PipelineNodes, llm: StubLLM, settings: Settings
+) -> None:
+    """And ``multihop`` used to take no hops and never touch the bridge."""
+    from ragorc.pipeline.graphs import GRAPHS, build_graph
+
+    tuned = Settings(
+        security={"enforce_tenant_isolation": False},
+        cache={"enabled": False},
+        llm={"api_key": "k", "context_window": 8000},
+        graph={"multihop_max_iterations": 3},
+    )
+    compiled = build_graph("multihop", nodes, settings=tuned, interrupt_before=["generate"])
+    await compiled.ainvoke(
+        initial_state("which university did Acme's founder attend?", pipeline="multihop"),
+        {"recursion_limit": GRAPHS["multihop"].recursion_limit(tuned)},
+    )
+
+    assert llm.calls_for("multihop_reason"), (
+        f"the sufficiency check never ran; stages were {llm.stages()}"
+    )

@@ -102,6 +102,7 @@ to need.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -253,7 +254,10 @@ def decide_after_judge(state: RAGState, *, settings: Settings) -> str:
 
 
 def build(
-    nodes: PipelineNodes, *, settings: Settings | None = None
+    nodes: PipelineNodes,
+    *,
+    settings: Settings | None = None,
+    interrupt_before: Sequence[str] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the agentic graph.
 
@@ -339,7 +343,7 @@ def build(
     # again at full price.
     graph.add_edge(_RETRY, _GRADE)
     graph.add_edge(_ABSTAIN, END)
-    return graph.compile(name=NAME)
+    return graph.compile(name=NAME, interrupt_before=list(interrupt_before or ()))
 
 
 def recursion_limit(settings: Settings) -> int:

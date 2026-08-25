@@ -59,6 +59,7 @@ over the wide candidate window that fusion produced: the retrieval stages fetche
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -121,7 +122,10 @@ def select_stores(state: RAGState) -> list[str]:
 
 
 def build(
-    nodes: PipelineNodes, *, settings: Settings | None = None
+    nodes: PipelineNodes,
+    *,
+    settings: Settings | None = None,
+    interrupt_before: Sequence[str] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the adaptive graph."""
     del settings  # topology is static; only the recursion limit reads settings
@@ -148,7 +152,7 @@ def build(
     graph.add_edge("fuse", "rerank")
     graph.add_edge("rerank", "generate")
     graph.add_edge("generate", END)
-    return graph.compile(name=NAME)
+    return graph.compile(name=NAME, interrupt_before=list(interrupt_before or ()))
 
 
 def recursion_limit(settings: Settings) -> int:

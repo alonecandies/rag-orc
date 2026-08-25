@@ -69,6 +69,7 @@ cosine similarity and a search engine's rank position are not on one scale.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -135,7 +136,10 @@ def decide_after_web(state: RAGState) -> str:
 
 
 def build(
-    nodes: PipelineNodes, *, settings: Settings | None = None
+    nodes: PipelineNodes,
+    *,
+    settings: Settings | None = None,
+    interrupt_before: Sequence[str] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the CRAG graph.
 
@@ -172,7 +176,7 @@ def build(
     graph.add_conditional_edges(_WEB, decide_after_web, [_GRADE, _GENERATE])
     graph.add_edge(_REFINE, _GENERATE)
     graph.add_edge(_GENERATE, END)
-    return graph.compile(name=NAME)
+    return graph.compile(name=NAME, interrupt_before=list(interrupt_before or ()))
 
 
 def recursion_limit(settings: Settings) -> int:

@@ -63,6 +63,7 @@ the two cannot drift apart.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -285,7 +286,10 @@ async def reduce_node(state: RAGState) -> dict[str, Any]:
 
 
 def build(
-    nodes: PipelineNodes, *, settings: Settings | None = None
+    nodes: PipelineNodes,
+    *,
+    settings: Settings | None = None,
+    interrupt_before: Sequence[str] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the GraphRAG graph."""
     del settings
@@ -316,7 +320,7 @@ def build(
     graph.add_edge("rerank", "generate")
     graph.add_edge("reduce", "generate")
     graph.add_edge("generate", END)
-    return graph.compile(name=NAME)
+    return graph.compile(name=NAME, interrupt_before=list(interrupt_before or ()))
 
 
 def recursion_limit(settings: Settings) -> int:

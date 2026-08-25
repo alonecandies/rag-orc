@@ -114,6 +114,13 @@ from ragorc.translate import build_translators
 
 log = structlog.get_logger(__name__)
 
+_GENERATE_NODE = "generate"
+"""The synthesis node, named identically in all seven graphs.
+
+:meth:`RAGPipeline._retrieve_for_stream` compiles a second copy of the selected
+graph that interrupts before it, which is how a stream runs the real pipeline's
+retrieval side and still leaves the answer-side loops out."""
+
 __all__ = ["RAGPipeline", "build_pipeline"]
 
 _DEFAULT_TRANSLATORS: tuple[str, ...] = ("multi_query",)
@@ -806,14 +813,28 @@ class RAGPipeline:
         agentic graph — and so a deployment that only uses one pipeline only ever builds
         the components that pipeline's nodes touch.
         """
-        compiled = self._compiled.get(name)
+        return self._compiled_graph(name, streaming=False)
+
+    def _compiled_graph(self, name: str, *, streaming: bool) -> Any:
+        """One compiled graph, memoized per ``(name, streaming)``.
+
+        Two variants of the same pipeline, because the streaming one is compiled
+        with ``interrupt_before=["generate"]`` and that is a compile-time property.
+        Keyed rather than rebuilt each call: compilation is not free and a
+        streaming deployment would otherwise pay it per request.
+        """
+        key = f"{name}:stream" if streaming else name
+        compiled = self._compiled.get(key)
         if compiled is None:
             if name not in GRAPHS:
                 raise ConfigError(f"unknown pipeline {name!r}", available=graph_names())
             compiled = build_graph(
-                name, self.nodes(full_translation=name == "agentic"), settings=self.settings
+                name,
+                self.nodes(full_translation=name == "agentic"),
+                settings=self.settings,
+                interrupt_before=[_GENERATE_NODE] if streaming else None,
             )
-            self._compiled[name] = compiled
+            self._compiled[key] = compiled
         return compiled
 
     @property
@@ -1081,21 +1102,43 @@ class RAGPipeline:
     async def _retrieve_for_stream(
         self, question: str, *, tenant: str | None, top_k: int | None, pipeline: str
     ) -> tuple[RAGState, PipelineNodes]:
-        """Run the retrieval-side nodes by hand, in the order the graph would.
+        """Run the selected graph's retrieval side, stopping before generation.
 
-        Graded retrieval is used when CRAG is enabled, because that decision happens
-        before the first token and is therefore compatible with streaming; the
-        answer-side loops are not, and are skipped rather than half-applied.
+        This used to drive a hand-written list of five nodes —
+        ``validate, translate, route, grade|retrieve, rerank`` — for *every*
+        pipeline. ``select_graph`` was consulted, but only to pick the translation
+        mode and to label the state, so streaming any pipeline ran the same
+        sequence. The features that define three of them never happened:
+        ``multihop`` took no hops and consulted no bridge, ``graphrag`` performed
+        no traversal at all (no ``classify``, no local/global/DRIFT node), and
+        ``adaptive``'s parallel per-store fan-out collapsed to one retriever call.
+        A caller asking to stream ``graphrag`` got hybrid search under the name.
+
+        Compiling the real graph with ``interrupt_before=["generate"]`` runs
+        exactly the retrieval side of exactly the pipeline that was selected, with
+        nothing duplicated here to drift out of step with the graph definitions.
+        Every graph names its synthesis node ``generate``, so one node name covers
+        all seven.
+
+        The answer-side loops stay excluded, and now by construction rather than
+        by omission: Self-RAG's grading, the retries and the abstention branch are
+        all downstream of ``generate``, so an interrupt that stops before it
+        cannot reach them. That is the same limitation :meth:`stream` documents —
+        you cannot un-emit a token — reached without a second implementation of
+        the pipeline.
+
+        No checkpointer is configured, which LangGraph permits precisely because
+        the run is never resumed: the state is read once and handed to the
+        generator.
         """
         name = self.select_graph(pipeline)
         nodes = self.nodes(full_translation=name == "agentic")
         state: RAGState = initial_state(question, tenant_id=tenant, top_k=top_k, pipeline=name)
-        steps = [nodes.validate, nodes.translate, nodes.route]
-        steps.append(nodes.grade if self.settings.retrieval.crag_enabled else nodes.retrieve)
-        steps.append(nodes.rerank)
-        for step in steps:
-            _merge(state, await step(state))
-        return state, nodes
+        limit = GRAPHS[name].recursion_limit(self.settings)
+        final = await self._compiled_graph(name, streaming=True).ainvoke(
+            state, {"recursion_limit": limit}
+        )
+        return cast("RAGState", final), nodes
 
     async def _collect_stream(
         self, question: str, *, tenant_id: str | None, top_k: int | None, pipeline: str

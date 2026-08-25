@@ -68,6 +68,7 @@ confident in it rather than better informed.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -167,7 +168,10 @@ def _stop_on_sufficient(state: RAGState) -> bool:
 
 
 def build(
-    nodes: PipelineNodes, *, settings: Settings | None = None
+    nodes: PipelineNodes,
+    *,
+    settings: Settings | None = None,
+    interrupt_before: Sequence[str] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the multi-hop graph."""
     resolved = settings or nodes.settings
@@ -213,7 +217,7 @@ def build(
     graph.add_edge(_COLLECT, "rerank")
     graph.add_edge("rerank", _GENERATE)
     graph.add_edge(_GENERATE, END)
-    return graph.compile(name=NAME)
+    return graph.compile(name=NAME, interrupt_before=list(interrupt_before or ()))
 
 
 def recursion_limit(settings: Settings) -> int:

@@ -39,7 +39,7 @@ from a typo.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,9 +80,23 @@ class GraphSpec:
     recursion_limit: Callable[[Settings], int]
     summary: str
 
-    def compile(self, nodes: PipelineNodes, *, settings: Settings | None = None) -> Any:
-        """Compile this graph against a component bundle."""
-        return self.build(nodes, settings=settings)
+    def compile(
+        self,
+        nodes: PipelineNodes,
+        *,
+        settings: Settings | None = None,
+        interrupt_before: Sequence[str] | None = None,
+    ) -> Any:
+        """Compile this graph against a component bundle.
+
+        ``interrupt_before`` names nodes the run must stop *before* reaching.
+        Streaming uses it to run a graph's retrieval side and hand the state back
+        without entering generation — see
+        :meth:`~ragorc.pipeline.builder.RAGPipeline.stream`. LangGraph accepts it
+        with no checkpointer as long as the run is never resumed, which is exactly
+        the usage here.
+        """
+        return self.build(nodes, settings=settings, interrupt_before=interrupt_before)
 
 
 GRAPHS: dict[str, GraphSpec] = {
@@ -133,7 +147,13 @@ def graph_names() -> list[str]:
     return list(GRAPHS)
 
 
-def build_graph(name: str, nodes: PipelineNodes, *, settings: Settings | None = None) -> Any:
+def build_graph(
+    name: str,
+    nodes: PipelineNodes,
+    *,
+    settings: Settings | None = None,
+    interrupt_before: Sequence[str] | None = None,
+) -> Any:
     """Compile one graph by name.
 
     Raises :class:`~ragorc.core.errors.ConfigError` listing the valid names, because
@@ -145,4 +165,4 @@ def build_graph(name: str, nodes: PipelineNodes, *, settings: Settings | None = 
         raise ConfigError(
             f"unknown pipeline {name!r}", available=graph_names(), hint="pipeline='auto' picks one"
         )
-    return spec.compile(nodes, settings=settings)
+    return spec.compile(nodes, settings=settings, interrupt_before=interrupt_before)

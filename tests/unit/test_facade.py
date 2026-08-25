@@ -212,3 +212,76 @@ async def test_create_treats_constructor_as_a_component_not_a_settings_path(
         assert pipeline.constructor is sentinel
     finally:
         await pipeline.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Streaming runs the pipeline that was selected
+# ---------------------------------------------------------------------------
+async def test_streaming_runs_the_selected_graph_not_a_fixed_sequence(
+    settings: Settings,
+) -> None:
+    """``_retrieve_for_stream`` drove a hand-written five-node list.
+
+    ``validate, translate, route, grade|retrieve, rerank`` — for every pipeline.
+    ``select_graph`` was consulted, but only to choose the translation mode and
+    to label the state, so streaming ``multihop`` took no hops and never asked
+    whether the evidence was sufficient. This asserts through the builder rather
+    than through ``build_graph``, because the builder is where the substitution
+    happened and a test of the graphs alone cannot see it.
+    """
+    from ragorc.core.models import Chunk, Query, RetrievalResult, ScoredChunk
+    from ragorc.generate.answer import AnswerGenerator
+    from ragorc.pipeline.builder import RAGPipeline
+    from tests.fakes import StubLLM
+
+    class OneHit:
+        name = "stub"
+
+        async def retrieve(self, query: Query, **kwargs: object) -> list[ScoredChunk]:
+            del kwargs
+            return [
+                ScoredChunk(
+                    chunk=Chunk(
+                        id="c1", content="Acme was founded in Cambridge.", document_id="d1"
+                    ),
+                    score=0.9,
+                )
+            ]
+
+        async def retrieve_detailed(self, query: Query, **kwargs: object) -> RetrievalResult:
+            chunks = await self.retrieve(query)
+            return RetrievalResult(chunks=chunks, per_store={"vector": chunks})
+
+    llm = StubLLM()
+    pipeline = RAGPipeline(
+        settings=settings,
+        llm=llm,
+        retriever=OneHit(),
+        generator=AnswerGenerator(llm, settings),
+    )
+
+    state, _nodes = await pipeline._retrieve_for_stream(
+        "which university did Acme's founder attend?",
+        tenant=None,
+        top_k=5,
+        pipeline="multihop",
+    )
+
+    assert llm.calls_for("multihop_reason"), (
+        f"streaming multihop took no hops; the stages were {llm.stages()}"
+    )
+    assert state.get("answer") is None, "generation ran before the first token was streamed"
+
+
+def test_the_streaming_graph_is_cached_apart_from_the_plain_one(settings: Settings) -> None:
+    """Two compilations of one pipeline, because ``interrupt_before`` is a
+    compile-time property. Keyed rather than rebuilt per request: compilation is
+    not free and a streaming deployment would otherwise pay it every time."""
+    from ragorc.pipeline.builder import RAGPipeline
+
+    pipeline = RAGPipeline(settings=settings)
+    plain = pipeline._compiled_graph("naive", streaming=False)
+    streamed = pipeline._compiled_graph("naive", streaming=True)
+
+    assert plain is not streamed
+    assert pipeline._compiled_graph("naive", streaming=True) is streamed
