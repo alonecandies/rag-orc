@@ -977,14 +977,21 @@ def evaluate(
         tenant_id=tenant or base.tenant_id,
     )
 
+    # The operator typed this path, so it is trusted the way any argument to a
+    # local command is. `load_eval_items` defaults to the server's ingest
+    # allowlist — right for a caller-supplied path over HTTP, and it confined
+    # `make eval` out of existence here. Resolved out here rather than in the
+    # coroutine: it is a syscall, and this is request setup, not loop work.
+    dataset_roots = [Path(dataset).expanduser().resolve().parent]
+
     async def run() -> None:
         # Validate the dataset before building anything: a typo in the file costs
         # nothing to find and an ONNX model load to find late.
-        cases = await load_eval_items(request)
+        cases = await load_eval_items(request, roots=dataset_roots)
         err.print(f"loaded [bold]{len(cases)}[/bold] case(s) from {dataset}")
 
         async with _service(base) as service:
-            baseline = await service.evaluate(request)
+            baseline = await service.evaluate(request, dataset_roots=dataset_roots)
 
         variant = None
         if compare and compare_pipeline is None:
@@ -992,7 +999,7 @@ def evaluate(
             settings = _settings(**overrides)
             err.print(f"[cyan]variant[/cyan] {compare}: {', '.join(sorted(overrides))}")
             async with _service(settings) as service:
-                variant = await service.evaluate(request)
+                variant = await service.evaluate(request, dataset_roots=dataset_roots)
 
         if as_json:
             _print_json(
@@ -1066,7 +1073,18 @@ def _load_overrides(path: Path) -> dict[str, Any]:
     return dict(payload)
 
 
-_HEADLINE_RETRIEVAL = ("recall@10", "recall@50", "ndcg@10", "mrr")
+_HEADLINE_RETRIEVAL = (
+    "recall@10",
+    "recall@50",
+    "ndcg@10",
+    "mrr",
+    # The same four at document granularity. A dataset labelled by source
+    # document rather than chunk id — which the shipped one is — produces only
+    # these, and without a column for them the table showed nothing at all.
+    "doc_recall@10",
+    "doc_ndcg@10",
+    "doc_mrr",
+)
 """The four retrieval numbers worth a terminal column.
 
 The harness reports every metric at every *k* — six ``k``s times four families

@@ -358,3 +358,43 @@ def test_document_level_retrieval_metrics_reach_the_report() -> None:
     assert any(name.startswith("doc_") for name in report.series_names()), (
         f"--compare cannot A/B a metric it does not list: {report.series_names()}"
     )
+
+
+def test_the_api_row_reports_document_level_labels_and_metrics() -> None:
+    """`to_dict`, `to_markdown` and `series_names` learned to carry document-level
+    retrieval; the API/CLI projection did not, so the surface an operator actually
+    reads still said nothing was labelled.
+
+    On the shipped dataset that is the whole story: 18 of 20 cases are graded at
+    document level, and the eval table printed `labelled 0` under a caption
+    reading "labelled cases only".
+    """
+    from ragorc.server.app import _metrics_of
+    from ragorc.server.schemas import PipelineName
+
+    report = _report_with_document_labels()
+    row = _metrics_of(PipelineName.AUTO, report)
+
+    assert row.labelled == 2, f"document-labelled cases must count as labelled: {row.labelled}"
+    assert any(key.startswith("doc_") for key in row.retrieval), (
+        f"the row carries no document-level metric: {sorted(row.retrieval)}"
+    )
+
+
+def test_the_eval_quality_table_shows_a_document_level_column() -> None:
+    """A metric the row carries but the table has no column for is still invisible."""
+    import io
+
+    from rich.console import Console
+
+    from ragorc.cli import _metrics_tables
+    from ragorc.server.app import _metrics_of
+    from ragorc.server.schemas import PipelineName
+
+    row = _metrics_of(PipelineName.AUTO, _report_with_document_labels())
+    console = Console(file=io.StringIO(), width=160)
+    for table in _metrics_tables([("auto", row)]):
+        console.print(table)
+    out = console.file.getvalue()  # type: ignore[attr-defined]
+
+    assert "doc_" in out, f"no document-level column in the quality table:\n{out}"

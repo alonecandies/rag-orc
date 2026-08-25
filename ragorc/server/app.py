@@ -1220,7 +1220,13 @@ class RagService:
             return response
 
     # -- eval --------------------------------------------------------------
-    async def evaluate(self, request: EvalRequest, *, request_id: str = "") -> EvalResponse:
+    async def evaluate(
+        self,
+        request: EvalRequest,
+        *,
+        request_id: str = "",
+        dataset_roots: Sequence[Path] | None = None,
+    ) -> EvalResponse:
         """Score one or more pipelines over the same dataset.
 
         The harness itself is :class:`ragorc.eval.runner.EvalRunner`, which already
@@ -1242,7 +1248,12 @@ class RagService:
         from ragorc.eval.runner import EvalRunner, compare_runs
 
         request_id = request_id or _new_request_id()
-        items = await load_eval_items(request)
+        # `dataset_roots` is the caller saying who supplied the path. Left unset —
+        # which is what the HTTP handler does — the loader confines it to the
+        # ingest allowlist, because over HTTP the path is caller-supplied and the
+        # response quotes the dataset back. The CLI passes the directory the
+        # operator named, since there the path came from their own shell.
+        items = await load_eval_items(request, roots=dataset_roots)
         if request.limit:
             items = items[: request.limit]
         if not items:
@@ -1553,7 +1564,9 @@ async def _probe(name: str, coro: Awaitable[StoreHealth]) -> StoreHealth:
 # ---------------------------------------------------------------------------
 # Dataset plumbing for the eval harness
 # ---------------------------------------------------------------------------
-async def load_eval_items(request: EvalRequest) -> list[EvalItem]:
+async def load_eval_items(
+    request: EvalRequest, *, roots: Sequence[Path] | None = None
+) -> list[EvalItem]:
     """Read a dataset from disk, or take the inline one.
 
     Both JSONL (one case per line, as :class:`ragorc.eval.dataset.EvalDataset`
@@ -1582,12 +1595,20 @@ async def load_eval_items(request: EvalRequest) -> list[EvalItem]:
         # answer one question, with a race between the check and the read for free.
         #
         # Confined to the same roots as POST /ingest, and for the same reason:
-        # `dataset` is a caller-supplied server-side path, and an eval response
-        # quotes the dataset's contents back. Without this it was an arbitrary
+        # over HTTP, `dataset` is a caller-supplied server-side path and an eval
+        # response quotes the dataset's contents back, which made it an arbitrary
         # local file read with a read-back channel — the exact hole /ingest was
         # fixed for, reachable through a different door. An empty allowlist
         # refuses every path rather than allowing every path.
-        (path,) = _resolve_paths([location], roots=_ingest_roots())
+        #
+        # `roots` is explicit because that reasoning is about *who supplied the
+        # path*, and it does not transfer to the CLI: there the path came from the
+        # operator's own shell and they can already read their own files.
+        # Defaulting it to the environment allowlist confined `ragorc eval` too,
+        # which made `make eval` — a documented headline command — fail every
+        # time. The default stays server-shaped so a new HTTP caller is safe by
+        # omission; the CLI passes the dataset's own directory.
+        (path,) = _resolve_paths([location], roots=_ingest_roots() if roots is None else roots)
         if not path.is_file():
             raise ValidationFailed("eval dataset is not a file", path=str(path))
         size = path.stat().st_size
@@ -1668,10 +1689,19 @@ def _metrics_of(pipeline: PipelineName, report: Any) -> EvalMetrics:
         return round(float(operational.get(key, 0.0)), 6)
 
     retrieval = report.retrieval
+    documents = report.document_retrieval
+    # Chunk- and document-labelled cases are disjoint: the document pass grades
+    # exactly the cases that carry a source document and no chunk ids. Summing
+    # them is the count that makes the rest interpretable, and reading only the
+    # chunk one reported `labelled 0` on the shipped dataset — where 18 of 20
+    # cases are graded — under a caption saying "labelled cases only".
+    labelled = int(getattr(retrieval, "n_labelled", 0) or 0) + int(
+        getattr(documents, "n_labelled", 0) or 0
+    )
     return EvalMetrics(
         pipeline=pipeline,
         items=int(value("items")),
-        labelled=int(getattr(retrieval, "n_labelled", 0) or 0),
+        labelled=labelled,
         errors=int(value("errors")),
         abstain_rate=value("abstain_rate"),
         grounded_rate=value("grounded_rate"),
@@ -1684,7 +1714,7 @@ def _metrics_of(pipeline: PipelineName, report: Any) -> EvalMetrics:
         cost_usd_per_query=value("cost_usd_per_query"),
         llm_calls_total=int(value("llm_calls_total")),
         cache_hit_rate=value("cache_hit_rate"),
-        retrieval=report.retrieval_metrics(),
+        retrieval={**report.retrieval_metrics(), **report.document_retrieval_metrics()},
         answer=report.answer_metrics(),
     )
 

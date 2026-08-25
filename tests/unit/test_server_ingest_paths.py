@@ -383,3 +383,68 @@ async def test_a_body_within_the_bound_is_returned_whole() -> None:
             yield b"1}"
 
     assert await _read_bounded(_Streaming(), 4096) == b'{"a":1}'
+
+
+# ---------------------------------------------------------------------------
+# The CLI is not a remote caller
+# ---------------------------------------------------------------------------
+async def test_a_local_eval_dataset_loads_without_configuring_ingest_roots(tmp_path) -> None:  # noqa: ANN001
+    """`ragorc eval <file>` — the exact command in `make eval`, the README and
+    docs/modules/eval.md — failed with "ingesting a server-side path is disabled".
+
+    The allowlist exists because `POST /eval` takes a *caller-supplied* path and
+    quotes the dataset back, which made it an arbitrary file read. That reasoning
+    does not transfer to a CLI: the path came from the operator's own shell, and
+    they can already read their own files. Confining it there turned a security
+    fix for the HTTP surface into a broken headline command.
+    """
+    from ragorc.server.app import load_eval_items
+    from ragorc.server.schemas import EvalRequest
+
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text('{"id": "q1", "question": "how long do refunds take?"}\n')
+    request = EvalRequest(dataset=str(dataset))
+
+    cases = await load_eval_items(request, roots=[tmp_path])
+
+    assert len(cases) == 1
+    assert cases[0].question == "how long do refunds take?"
+
+
+async def test_the_http_surface_still_refuses_an_unconfined_dataset(tmp_path) -> None:  # noqa: ANN001
+    """The confinement must survive for the caller it was written for: with no
+    roots configured, a server-side path is still refused."""
+    from ragorc.core.errors import ValidationFailed
+    from ragorc.server.app import load_eval_items
+    from ragorc.server.schemas import EvalRequest
+
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text('{"id": "q1", "question": "anything"}\n')
+
+    with pytest.raises(ValidationFailed) as caught:
+        await load_eval_items(EvalRequest(dataset=str(dataset)), roots=[])
+    assert "server-side path" in str(caught.value)
+
+
+def test_the_eval_command_trusts_the_path_its_operator_typed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The loader's `roots` is an argument with a safe default, so a CLI that
+    forgets to pass it silently gets the server's policy back. Asserted here for
+    the same reason the packer's `shares` wiring is."""
+    from typer.testing import CliRunner
+
+    from ragorc import cli
+
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text('{"id": "q1", "question": "anything"}\n')
+    seen: dict[str, object] = {}
+
+    async def _recording(request, *, roots=None):  # noqa: ANN001, ANN202
+        seen["roots"] = roots
+        raise RuntimeError("stop here — the wiring is what is under test")
+
+    monkeypatch.setattr(cli, "load_eval_items", _recording)
+    CliRunner().invoke(cli.app, ["eval", str(dataset)])
+
+    roots = seen.get("roots")
+    assert roots, f"the CLI passed no roots, so the server policy applies: {roots!r}"
+    assert tmp_path.resolve() in [p.resolve() for p in roots]  # type: ignore[union-attr]
