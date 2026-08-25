@@ -398,3 +398,52 @@ def test_the_eval_quality_table_shows_a_document_level_column() -> None:
     out = console.file.getvalue()  # type: ignore[attr-defined]
 
     assert "doc_" in out, f"no document-level column in the quality table:\n{out}"
+
+
+def test_a_case_naming_a_file_matches_a_chunk_carrying_its_full_path() -> None:
+    """The shipped dataset names files — `02-expenses-policy.md` — while the
+    loader puts an absolute path in `source`. Compared as strings those never
+    match, so every document-level metric read 0.000 no matter how good retrieval
+    was, and the run looked like a total retrieval failure.
+
+    `_document_of`'s docstring already warned about this shape: comparing against
+    something the case author could not have known "would score every case zero
+    and look like a retrieval failure". It guarded the content-hash uuid and not
+    the absolute path, which is what the loader actually writes.
+    """
+    from ragorc.core.models import Chunk
+    from ragorc.eval.runner import _document_key
+
+    chunk = Chunk(
+        id="c1",
+        content="Expense claims above 500 EUR need director approval.",
+        document_id="8f14e45fceea167a5a36dedd4bea2543",
+        metadata={"source": "/Users/someone/rag-orc/examples/corpus/02-expenses-policy.md"},
+    )
+    assert _document_key(chunk) == "02-expenses-policy.md"
+
+
+def test_a_case_naming_a_relative_path_still_matches_it() -> None:
+    """Only the directory part is dropped, so a case that names a bare file and a
+    chunk loaded from anywhere agree — which is the whole point."""
+    from ragorc.core.models import Chunk
+    from ragorc.eval.runner import _document_key
+
+    for source in (
+        "examples/corpus/02-expenses-policy.md",
+        "./02-expenses-policy.md",
+        "02-expenses-policy.md",
+    ):
+        chunk = Chunk(id="c", content="x", metadata={"source": source})
+        assert _document_key(chunk) == "02-expenses-policy.md", source
+
+
+def test_a_document_without_a_path_is_left_alone() -> None:
+    """A title or an id is not a path and must survive untouched."""
+    from ragorc.core.models import Chunk
+    from ragorc.eval.runner import _document_key
+
+    assert _document_key(Chunk(id="c", content="x", metadata={"title": "Expenses Policy"})) == (
+        "Expenses Policy"
+    )
+    assert _document_key(Chunk(id="c", content="x", document_id="doc-42")) == "doc-42"

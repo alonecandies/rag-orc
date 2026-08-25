@@ -139,8 +139,29 @@ def _document_key(chunk: Any) -> str:
     for key in ("source_document", "source", "path", "title"):
         value = metadata.get(key)
         if value:
-            return str(value)
+            return _basename_key(str(value))
     return str(getattr(chunk, "document_id", "") or "")
+
+
+def _basename_key(value: str) -> str:
+    """Reduce a document reference to the part an eval case can name.
+
+    The loader writes an *absolute path* into ``source``
+    (`/home/me/corpus/02-expenses-policy.md`) and a hand-written case names the
+    file (`02-expenses-policy.md`). Compared as strings those never match, so
+    every document-level metric read 0.000 however good retrieval was — the exact
+    failure the note above warns about, arriving through the path rather than the
+    uuid it guarded.
+
+    Only the directory is dropped, and only when there is one: a title or an id is
+    not a path and passes through untouched. Two corpus files sharing a basename
+    in different directories therefore collapse to one document, which is the
+    semantics a dataset that names files is already assuming.
+    """
+    trimmed = value.strip().rstrip("/\\")
+    if not trimmed or ("/" not in trimmed and "\\" not in trimmed):
+        return value.strip()
+    return trimmed.replace("\\", "/").rsplit("/", 1)[-1] or value.strip()
 
 
 def as_answer_fn(target: Any, *, state: Mapping[str, Any] | None = None) -> AnswerFn:
