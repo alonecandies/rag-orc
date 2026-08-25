@@ -18,7 +18,7 @@ from __future__ import annotations
 import functools
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ragorc.core.models import ChunkingStrategy, FusionMethod
@@ -733,8 +733,39 @@ class ServerSettings(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     api_keys: list[str] = Field(default_factory=list)
     """Empty = open. Set at least one before exposing the service."""
+    api_key_tenants: dict[str, str] = Field(default_factory=dict)
+    """Bind an API key to the one tenant it may read: ``{key: tenant_id}``.
+
+    Without a binding, ``security.enforce_tenant_isolation`` only enforces that a
+    request *names* a tenant — not that it owns it — so any authenticated caller
+    can read any tenant by putting a different id in the request body. A key
+    listed here may use its own tenant and no other; a key absent from this map
+    stays unrestricted, which is what keeps an existing single-tenant deployment
+    working unchanged.
+
+    Keys are written out in full because that is what the operator has in hand;
+    they are hashed to the same principal form the audit log uses before being
+    compared, and never logged.
+    """
     request_timeout_s: float = 120.0
     max_body_bytes: int = 10_000_000
+
+    @model_validator(mode="after")
+    def _bindings_reference_known_keys(self) -> ServerSettings:
+        """A binding for a key that cannot authenticate is a typo, not a policy.
+
+        It fails open in the most misleading way available — the operator reads
+        the config and sees the tenant restricted, while the key that is actually
+        in use is unbound — so it is rejected at load rather than at the first
+        cross-tenant read.
+        """
+        unknown = sorted(set(self.api_key_tenants) - set(self.api_keys))
+        if unknown:
+            raise ValueError(
+                f"server.api_key_tenants binds {len(unknown)} key(s) that are not in "
+                "server.api_keys, so they can never authenticate"
+            )
+        return self
 
 
 class Settings(BaseSettings):

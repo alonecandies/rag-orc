@@ -9,6 +9,12 @@ So isolation is enforced by construction:
 
 * ``require_tenant`` refuses a query with no tenant when isolation is on. Failing
   closed is the only safe default; a missing tenant must never mean "all".
+* ``resolve_tenant`` refuses a tenant the *caller* does not own. ``require_tenant``
+  only checks that a tenant was named, and ``tenant_id`` arrives in the request
+  **body** — so on its own it stops an unscoped query and not a cross-tenant one:
+  an authenticated caller could read any tenant by naming it. The binding comes
+  from ``server.api_key_tenants``, keyed by the same principal the audit log
+  records.
 * ``scope_filter`` injects the tenant predicate into every store filter, and is
   the *only* sanctioned way to build one.
 * Qdrant additionally gets a payload index with ``is_tenant=True`` so the filter
@@ -17,22 +23,113 @@ So isolation is enforced by construction:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import structlog
 
 from ragorc.core.errors import GuardrailViolation
+from ragorc.core.ids import content_hash
 from ragorc.core.settings import SecuritySettings, Settings, get_settings
 
 log = structlog.get_logger(__name__)
 
 __all__ = [
+    "principal_for_key",
     "require_generated_query_isolation",
     "require_tenant",
+    "resolve_tenant",
     "scope_cypher_where",
     "scope_filter",
     "scope_sql_where",
+    "tenant_bindings",
 ]
+
+ANONYMOUS = "anonymous"
+"""The principal an unauthenticated deployment reports. Never bindable: with no
+credential there is no identity to bind, and treating it as one would let the
+absence of a key select a tenant."""
+
+
+def principal_for_key(key: str) -> str:
+    """The audit-log identity of an API key: a hash prefix, never the key.
+
+    Defined here rather than inline at the authentication dependency because two
+    call sites now have to agree on it — the dependency that mints a principal
+    per request, and :func:`tenant_bindings`, which has to look one up from the
+    configured key. A format string copied into both is a format string that
+    drifts, and the failure would be silent: every binding would simply stop
+    matching and every key would go back to being unrestricted.
+    """
+    return f"key:{content_hash(key, size=6)}"
+
+
+def tenant_bindings(settings: Settings | None = None) -> dict[str, str]:
+    """``principal -> tenant`` for every key ``server.api_key_tenants`` binds.
+
+    Built once at service construction. Doing it per request would hash every
+    configured key on every call for a lookup that cannot change without a
+    restart.
+    """
+    s = settings or get_settings()
+    return {
+        principal_for_key(key): tenant for key, tenant in s.server.api_key_tenants.items() if key
+    }
+
+
+def resolve_tenant(
+    requested: str | None,
+    *,
+    principal: str,
+    bindings: Mapping[str, str],
+    settings: SecuritySettings | None = None,
+) -> str | None:
+    """The tenant this request may actually use.
+
+    Three cases, and the middle one is the hole this closes:
+
+    * the principal is **bound** and named nothing — it gets its own tenant, so a
+      single-tenant client never has to repeat what its credential already says;
+    * the principal is **bound** and named someone else's — refused. This is the
+      cross-tenant read that ``require_tenant`` waved through, because naming a
+      tenant was the whole of its check;
+    * the principal is **unbound** — unchanged behaviour, so a deployment that
+      has not configured bindings keeps working. It is the operator's decision to
+      make, and :func:`unbound_principals_warning` is what makes it a visible one.
+    """
+    bound = bindings.get(principal)
+    if bound is None:
+        return require_tenant(requested, settings)
+    if requested is not None and requested != bound:
+        # Deliberately does not say which tenant the principal owns, and the
+        # error maps to 400 rather than 403: both would confirm to a caller
+        # probing tenant ids which ones exist.
+        log.warning("tenant_not_owned", principal=principal, requested=requested)
+        raise GuardrailViolation(
+            "tenant_id is not the tenant this credential is bound to",
+            rule="tenant_not_owned",
+            hint="omit tenant_id and the credential's own tenant is used",
+        )
+    return require_tenant(bound, settings)
+
+
+def unbound_principals_warning(settings: Settings | None = None) -> str | None:
+    """The warning for "isolation is on, but nothing binds a caller to a tenant".
+
+    Surfaced on ``/health`` next to the unauthenticated-service warning. This
+    configuration is *self-consistent* — every query names a tenant and every
+    store filter carries it — which is exactly why it needs saying out loud: it
+    looks isolated and reads across tenants on request.
+    """
+    s = settings or get_settings()
+    if not s.security.enforce_tenant_isolation or not s.server.api_keys:
+        return None
+    if s.server.api_key_tenants:
+        return None
+    return (
+        "security.enforce_tenant_isolation is on but server.api_key_tenants is "
+        "empty: any authenticated caller can read any tenant by naming it"
+    )
 
 
 def require_tenant(tenant_id: str | None, settings: SecuritySettings | None = None) -> str | None:

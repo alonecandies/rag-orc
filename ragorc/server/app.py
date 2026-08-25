@@ -125,7 +125,14 @@ from ragorc.core.telemetry import (
 )
 from ragorc.security.audit import AuditLog
 from ragorc.security.ratelimit import KeyedRateLimiter
-from ragorc.security.tenancy import require_tenant, scope_filter
+from ragorc.security.tenancy import (
+    ANONYMOUS,
+    principal_for_key,
+    resolve_tenant,
+    scope_filter,
+    tenant_bindings,
+    unbound_principals_warning,
+)
 from ragorc.server.schemas import (
     MAX_QUESTION_CHARS,
     ErrorResponse,
@@ -779,6 +786,7 @@ class RagService:
         self.validator = QueryValidator(self.settings)
         self.audit = AuditLog(self.settings)
         self.limiter = KeyedRateLimiter.from_settings(self.settings.security)
+        self.tenant_bindings = tenant_bindings(self.settings)
         self.semantic: Any = None
         self.warnings: list[str] = []
         self._built = False
@@ -1120,12 +1128,23 @@ class RagService:
         Order matters and it is cheapest-first: length and encoding checks reject
         for free, tenancy is a dict lookup, and only a request that survived both
         is worth writing to the audit log.
+
+        Scoping is :func:`resolve_tenant`, not ``require_tenant``: ``tenant_id``
+        is a request-*body* field, so checking only that one was named leaves any
+        authenticated caller able to read any tenant by naming it. The principal
+        is already here for the audit line — it just was not being used for the
+        decision the audit line records.
         """
         validated = self.validator.validate(
             request.question, tenant_id=request.tenant_id, top_k=request.top_k
         )
         query = validated.query
-        tenant = require_tenant(query.tenant_id, self.settings.security)
+        tenant = resolve_tenant(
+            query.tenant_id,
+            principal=principal,
+            bindings=self.tenant_bindings,
+            settings=self.settings.security,
+        )
         query.tenant_id = tenant
         query.filters = scope_filter(request.filters, tenant, self.settings.security)
         self.audit.query(tenant_id=tenant, principal=principal, length=len(request.question))
@@ -1184,6 +1203,7 @@ class RagService:
         request: IngestRequest,
         *,
         request_id: str = "",
+        principal: str = ANONYMOUS,
         staged_root: Path | None = None,
     ) -> IngestResponse:
         """Index inline text and/or server-side paths.
@@ -1204,8 +1224,14 @@ class RagService:
         """
         request_id = request_id or _new_request_id()
         with self._request_context(request_id):
-            tenant = require_tenant(
-                request.tenant_id or self.settings.tenant_id, self.settings.security
+            # Writes are bound to the credential for the same reason reads are:
+            # unbound, a caller could file documents under another tenant's id and
+            # have them answered back to that tenant.
+            tenant = resolve_tenant(
+                request.tenant_id or self.settings.tenant_id,
+                principal=principal,
+                bindings=self.tenant_bindings,
+                settings=self.settings.security,
             )
             targets: list[Any] = []
             if request.text:
@@ -1225,6 +1251,7 @@ class RagService:
         request: EvalRequest,
         *,
         request_id: str = "",
+        principal: str = ANONYMOUS,
         dataset_roots: Sequence[Path] | None = None,
     ) -> EvalResponse:
         """Score one or more pipelines over the same dataset.
@@ -1269,7 +1296,7 @@ class RagService:
         reports = []
         for pipeline in _unique([request.pipeline, *request.compare]):
             runner = EvalRunner(
-                self.answer_fn(pipeline, request),
+                self.answer_fn(pipeline, request, principal=principal),
                 self.settings,
                 concurrency=request.concurrency,
             )
@@ -1294,7 +1321,7 @@ class RagService:
         )
 
     def answer_fn(
-        self, pipeline: PipelineName, request: EvalRequest
+        self, pipeline: PipelineName, request: EvalRequest, *, principal: str
     ) -> Callable[[str], Awaitable[Answer]]:
         """Bind one pipeline into the ``question -> Answer`` shape the runner wants.
 
@@ -1314,7 +1341,7 @@ class RagService:
                 pipeline=pipeline,
             )
             with new_request_context(request_id=_new_request_id()):
-                query, _warnings = self.prepare(body, principal="eval")
+                query, _warnings = self.prepare(body, principal=principal)
                 result, _pipeline, _notes = await self._dispatch(body, query)
                 return result
 
@@ -1348,6 +1375,9 @@ class RagService:
         warnings = list(self.warnings)
         if not self.settings.server.api_keys:
             warnings.append("server.api_keys is empty: this service is unauthenticated")
+        unbound = unbound_principals_warning(self.settings)
+        if unbound:
+            warnings.append(unbound)
 
         return HealthResponse(
             status="degraded" if degraded else "ok",
@@ -2151,9 +2181,16 @@ def create_app(settings: Settings | None = None) -> Any:
             # and an upload's temporary directory is by definition not one of
             # them. See :func:`_resolve_paths`.
             async with _staged_uploads(request, resolved) as (body, staged_root):
-                return await service.ingest(body, request_id=request_id, staged_root=staged_root)
+                return await service.ingest(
+                    body,
+                    request_id=request_id,
+                    principal=principal,
+                    staged_root=staged_root,
+                )
         return await service.ingest(
-            await _json_body(request, IngestRequest, resolved), request_id=request_id
+            await _json_body(request, IngestRequest, resolved),
+            request_id=request_id,
+            principal=principal,
         )
 
     @app.post(
@@ -2169,7 +2206,7 @@ def create_app(settings: Settings | None = None) -> Any:
         principal: str = Depends(guard),
     ) -> EvalResponse:
         """Run the eval harness. Long-running and deliberately untimed."""
-        return await service.evaluate(body, request_id=_request_id(request))
+        return await service.evaluate(body, request_id=_request_id(request), principal=principal)
 
     @app.get("/health", response_model=HealthResponse, summary="Store health and configuration.")
     async def health(service: RagService = Depends(service_dependency)) -> HealthResponse:
@@ -2443,7 +2480,11 @@ def _api_key_dependency(settings: Settings, http_exception: Any, status: Any) ->
             return "anonymous"
         presented = _presented_key(request)
         if presented and any(hmac.compare_digest(presented, candidate) for candidate in keys):
-            return f"key:{content_hash(presented, size=6)}"
+            # Through the shared helper, not an inline format string: the tenant
+            # bindings look a principal up from the *configured* key, so the two
+            # have to agree. If they drifted, every binding would quietly stop
+            # matching and every key would go back to being unrestricted.
+            return principal_for_key(presented.decode())
         log.info("auth_failed", path=request.url.path, presented=bool(presented))
         raise http_exception(
             status_code=status.HTTP_401_UNAUTHORIZED,
