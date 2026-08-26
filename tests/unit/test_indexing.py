@@ -1648,3 +1648,90 @@ async def test_nothing_is_pruned_when_detection_produced_no_communities() -> Non
     store = await _persist_communities(count=0, batch=2)
     assert store.windows == []
     assert store.prunes == []
+
+
+# ---------------------------------------------------------------------------
+# The commit marker must mean "indexed", not "started"
+# ---------------------------------------------------------------------------
+def _flaky_vector() -> Any:
+    """A vector store that is down until told otherwise.
+
+    Built inside a function, like every other fake in this module, because the
+    fakes are imported per test rather than at module scope.
+    """
+    from tests.fakes import FakeVectorStore
+
+    class FlakyVector(FakeVectorStore):  # type: ignore[misc, valid-type]
+        def __init__(self) -> None:
+            super().__init__()
+            self.down = True
+
+        async def upsert(self, chunks: Any) -> int:
+            if self.down:
+                raise RuntimeError("qdrant down")
+            return await super().upsert(chunks)
+
+    return FlakyVector()
+
+
+def _ingest_pipeline(vector: Any, relational: Any) -> Any:
+    from ragorc.core.settings import Settings
+    from ragorc.index.pipeline import IngestPipeline
+
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        cache={"enabled": False},
+        llm={"api_key": "k"},
+        embedding={"dense_dimension": 32},
+        indexing={"skip_unchanged": True},
+    )
+    return IngestPipeline(settings=settings, vector_store=vector, relational_store=relational)
+
+
+async def test_a_failed_vector_write_does_not_mark_the_document_indexed() -> None:
+    """`_select_changed` skips a document whose stored checksum matches, so the
+    checksum *is* the "indexed" marker — and it was written before a single
+    vector existed.
+
+    Before: run 1 raised with the document row committed, and run 2 against a
+    healthy store reported `skipped=1, indexed=0` and wrote nothing. The document
+    was permanently unsearchable and the report said success.
+
+    A comment in `_run` blamed chunk rows for this and moved the deferred flush
+    later. `_existing_checksums` reads the *documents* table, so that narrowed the
+    window without closing it.
+    """
+    from ragorc.core.models import Document
+    from tests.fakes import FakeDocumentStore
+
+    vector, relational = _flaky_vector(), FakeDocumentStore()
+    pipeline = _ingest_pipeline(vector, relational)
+    doc = Document(id="d1", content="Refunds take fourteen days. " * 40, source="policy.md")
+
+    with pytest.raises(RuntimeError, match="qdrant down"):
+        await pipeline.ingest([doc])
+    assert len(vector.chunks) == 0
+
+    vector.down = False
+    report = await pipeline.ingest([doc])
+
+    assert report.documents_skipped == 0, "the retry skipped a document that was never indexed"
+    assert report.documents_indexed == 1
+    assert len(vector.chunks) == 1, "the retry must actually land the vectors"
+
+
+async def test_an_unchanged_document_is_still_skipped_on_re_ingest() -> None:
+    """The other half. Deferring the checksum must not disable the skip that
+    makes re-ingesting a large corpus cheap."""
+    from ragorc.core.models import Document
+    from tests.fakes import FakeDocumentStore, FakeVectorStore
+
+    vector, relational = FakeVectorStore(), FakeDocumentStore()
+    pipeline = _ingest_pipeline(vector, relational)
+    doc = Document(id="d1", content="Refunds take fourteen days. " * 40, source="policy.md")
+
+    first = await pipeline.ingest([doc])
+    second = await pipeline.ingest([doc])
+
+    assert (first.documents_indexed, first.documents_skipped) == (1, 0)
+    assert (second.documents_indexed, second.documents_skipped) == (0, 1)

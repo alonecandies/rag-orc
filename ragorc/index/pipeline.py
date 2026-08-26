@@ -113,7 +113,7 @@ import importlib
 import inspect
 import time
 from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
@@ -1116,6 +1116,7 @@ class IngestPipeline:
         window = max(1, self.config.max_concurrent_documents)
         batch = max(1, self.config.batch_size)
         pending: list[Chunk] = []
+        landed: list[Document] = []
 
         # Bulk-load mode is owned by `ingest`, which is the only scope that spans
         # the whole corpus; entering it here made it once-per-document-window.
@@ -1131,6 +1132,7 @@ class IngestPipeline:
             if stale:
                 await self._purge(stale, report)
             await self._write_documents(ready, report)
+            landed.extend(ready)
 
             pending.extend(chunks)
             while len(pending) >= batch:
@@ -1149,6 +1151,11 @@ class IngestPipeline:
         # vector write left parents behind, and the retry then skipped the
         # document as already done with none of its searchable content indexed.
         await self._flush_deferred(report)
+        # The commit marker, written last and deliberately. Everything above can
+        # fail, and a failure that leaves the marker behind is worse than the
+        # failure: the retry skips the document and reports success over an index
+        # that never received it.
+        await self._stamp_checksums(landed, report)
 
     async def _process_window(
         self,
@@ -1542,14 +1549,46 @@ class IngestPipeline:
     # g. writes
     # ------------------------------------------------------------------
     async def _write_documents(self, documents: Sequence[Document], report: IngestReport) -> None:
-        """Document rows first: ``chunks.document_id`` is a foreign key."""
+        """Document rows first: ``chunks.document_id`` is a foreign key.
+
+        Written **without their checksums**, which is the whole point of the pass
+        that stamps them later. ``_select_changed`` skips a document whose stored
+        checksum matches, so the checksum *is* the "this document is indexed"
+        marker — and writing it here, before a single vector exists, made the
+        marker a lie the moment anything downstream failed. Reproduced: with the
+        vector store down, run 1 raised and left the document row committed; run 2
+        with a healthy store reported ``skipped=1, indexed=0`` and never wrote a
+        vector. The document was permanently unsearchable and nothing said so.
+
+        Deferring the checksum rather than deleting the row on failure, because a
+        crash is not an exception anyone catches: on restart the stored checksum is
+        absent or stale, so the retry re-ingests by construction.
+
+        A comment in :meth:`_run` used to claim chunk rows were the marker.
+        ``_existing_checksums`` reads the *documents* table, so moving the deferred
+        chunk flush later — the fix that comment justifies — narrowed this window
+        without closing it.
+        """
         if self.relational is None:
             return
         started = time.perf_counter()
-        await self.relational.upsert_documents(documents)
+        await self.relational.upsert_documents([_without_checksum(d) for d in documents])
         report.timings_ms["write_documents"] = report.timings_ms.get(
             "write_documents", 0.0
         ) + _elapsed_ms(started)
+
+    async def _stamp_checksums(self, documents: Sequence[Document], report: IngestReport) -> None:
+        """Record the checksums that mean "fully indexed". Last write of the run."""
+        if self.relational is None or not documents:
+            return
+        started = time.perf_counter()
+        stamped = [doc for doc in documents if doc.checksum]
+        if stamped:
+            await self.relational.upsert_documents(stamped)
+        report.timings_ms["stamp_checksums"] = report.timings_ms.get(
+            "stamp_checksums", 0.0
+        ) + _elapsed_ms(started)
+        log.debug("checksums_stamped", documents=len(stamped))
 
     async def _write_chunks(self, chunks: Sequence[Chunk], report: IngestReport) -> None:
         """Write one batch to both stores concurrently.
@@ -1608,6 +1647,17 @@ class IngestPipeline:
 # ---------------------------------------------------------------------------
 # Chunk-list plumbing
 # ---------------------------------------------------------------------------
+def _without_checksum(doc: Document) -> Document:
+    """A shallow copy with the checksum cleared.
+
+    A copy, not a mutation: the caller holds these documents, the report quotes
+    them, and :meth:`IngestPipeline._stamp_checksums` needs the real checksum a
+    moment later. Clearing it in place would erase the value the stamping pass
+    exists to write.
+    """
+    return replace(doc, checksum=None)
+
+
 class _DeferredDocstore:
     """Collects docstore writes so the *pipeline* decides when they land.
 
