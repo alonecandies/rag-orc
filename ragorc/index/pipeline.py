@@ -492,7 +492,6 @@ class IngestPipeline:
         self._strategy: ChunkingStrategy | None = None
         self._enricher: Any | None = None
         self._colbert_indexer: Any | None = None
-        self._deferred: list[Chunk] = []
         self._stages: list[tuple[_Plugin, Any]] = []
         self._embedding_cache: Any | None = None
         self._owns_stores = False
@@ -517,25 +516,20 @@ class IngestPipeline:
         """
         report = IngestReport()
         run_started = time.perf_counter()
-        # A run owns its buffer, and gives it up on the way out however it leaves.
-        # `_deferred` is instance state and the server reuses one pipeline for
-        # every `POST /ingest`, so a run that died after a stage buffered its
-        # docstore writes — a store failure, a cancelled request — used to leave
-        # them queued for the *next* run to flush against an unrelated document
-        # set. That is the write-ordering bug the buffer exists to prevent,
-        # arriving by a different door. Discarding is right: the failed run's
-        # leaves were never written either, so its work is void and a retry
+        # The docstore buffer is a *local* of `_run`, not instance state, and that
+        # is load-bearing rather than tidiness. The server reuses one pipeline for
+        # every `POST /ingest`, so as an attribute it was shared by concurrent
+        # runs: whichever finished first flushed the other's buffered parents
+        # against its own document set — before those rows existed, which is the
+        # foreign-key violation the buffer exists to prevent — or discarded them
+        # on the way out, leaving a successful ingest with parents that were never
+        # written and nothing saying so.
+        #
+        # As a local it also cleans itself up: a run that dies before its flush
+        # drops its buffer with its frame, and discarding is right because that
+        # run's leaves were never written either. Its work is void and a retry
         # rebuilds it from content-derived ids.
-        try:
-            return await self._ingest(target, report, run_started, force=force)
-        finally:
-            if self._deferred:
-                log.warning(
-                    "discarding_orphaned_docstore_writes",
-                    chunks=len(self._deferred),
-                    reason="the run did not reach its flush",
-                )
-                self._deferred = []
+        return await self._ingest(target, report, run_started, force=force)
 
     async def _ingest(
         self, target: Any, report: IngestReport, run_started: float, *, force: bool
@@ -1117,11 +1111,12 @@ class IngestPipeline:
         batch = max(1, self.config.batch_size)
         pending: list[Chunk] = []
         landed: list[Document] = []
+        deferred: list[Chunk] = []
 
         # Bulk-load mode is owned by `ingest`, which is the only scope that spans
         # the whole corpus; entering it here made it once-per-document-window.
         for group in _windows(list(documents), window):
-            ready, chunks = await self._process_window(group, strategy, report)
+            ready, chunks = await self._process_window(group, strategy, report, deferred)
             if not ready:
                 continue
 
@@ -1150,7 +1145,7 @@ class IngestPipeline:
         # document is ingested. Flushed before the leaves, a run that died on the
         # vector write left parents behind, and the retry then skipped the
         # document as already done with none of its searchable content indexed.
-        await self._flush_deferred(report)
+        await self._flush_deferred(deferred, report)
         # The commit marker, written last and deliberately. Everything above can
         # fail, and a failure that leaves the marker behind is worse than the
         # failure: the retry skips the document and reports success over an index
@@ -1162,9 +1157,10 @@ class IngestPipeline:
         group: Sequence[Document],
         strategy: ChunkingStrategy,
         report: IngestReport,
+        deferred: list[Chunk],
     ) -> tuple[list[Document], list[Chunk]]:
         outcomes = await bounded_gather(
-            (self._process_document(doc, strategy, report) for doc in group),
+            (self._process_document(doc, strategy, report, deferred) for doc in group),
             limit=max(1, self.config.max_concurrent_documents),
             return_exceptions=True,
         )
@@ -1219,7 +1215,11 @@ class IngestPipeline:
     # c-f. per-document: split, embed, enrich
     # ------------------------------------------------------------------
     async def _process_document(
-        self, document: Document, strategy: ChunkingStrategy, report: IngestReport
+        self,
+        document: Document,
+        strategy: ChunkingStrategy,
+        report: IngestReport,
+        deferred_sink: list[Chunk],
     ) -> list[Chunk]:
         started = time.perf_counter()
         chunks, docstore_only = await self._split(document)
@@ -1251,7 +1251,7 @@ class IngestPipeline:
             # 2048/256 sizes would store the corpus eight to ten times over in the
             # payload. `expand_parents` reads them back after ranking.
             await deferred.upsert_chunks(docstore_only)
-        self._deferred.extend(deferred.take())
+        deferred_sink.extend(deferred.take())
         log.debug(
             "document_indexed",
             document_id=document.id,
@@ -1345,16 +1345,19 @@ class IngestPipeline:
                 f"{report.chunks_created} chunks"
             )
 
-    async def _flush_deferred(self, report: IngestReport) -> None:
+    async def _flush_deferred(self, deferred: list[Chunk], report: IngestReport) -> None:
         """Write the chunks nothing will search, now that their rows exist.
 
         Called from `_run` after `_write_documents` and after the stale purge, the
         only point at which both are true: the foreign key is satisfied and no
         cascade is still coming.
+
+        Takes the buffer as an argument rather than reading it off ``self``, which
+        is what keeps concurrent runs from flushing each other's parents.
         """
-        if not self._deferred:
+        if not deferred:
             return
-        pending, self._deferred = self._deferred, []
+        pending, deferred[:] = list(deferred), []
         if self.relational is None:
             report.warnings.append(
                 "parent_document_enabled and the multi-representation stages need a "

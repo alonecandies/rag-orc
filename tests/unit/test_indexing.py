@@ -928,16 +928,17 @@ async def test_parent_document_replaces_the_split_and_persists_the_parents(
     from ragorc.index.pipeline import IngestReport
 
     report = IngestReport()
-    children = await pipeline._process_document(document, ChunkingStrategy.EARLY, report)
+    deferred: list[Any] = []
+    children = await pipeline._process_document(document, ChunkingStrategy.EARLY, report, deferred)
 
     assert children, "the children are what gets indexed"
     assert all(c.parent_id for c in children), "every child must point at its parent"
     assert persisted == [], (
         "nothing may reach the chunks table while the document row does not exist"
     )
-    assert pipeline._deferred, "the parents must be queued for the flush"
+    assert deferred, "the parents must be queued for the flush"
 
-    await pipeline._flush_deferred(report)
+    await pipeline._flush_deferred(deferred, report)
 
     assert persisted, "the parents must be persisted for query-time expansion"
     parent_ids = {p.id for batch in persisted for p in batch}
@@ -947,7 +948,7 @@ async def test_parent_document_replaces_the_split_and_persists_the_parents(
     assert all(p.dense is None for batch in persisted for p in batch), (
         "a parent carries no vector: nothing ever searches one"
     )
-    assert pipeline._deferred == [], "a flushed buffer must not write the same rows twice"
+    assert deferred == [], "a flushed buffer must not write the same rows twice"
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1093,7 @@ async def test_ingest_colbert_vectors_are_pruned_and_carry_the_prefix(
     )
 
     document = Document(id="d1", content="Refunds are processed within five days. " * 40)
-    chunks = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport())
+    chunks = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport(), [])
 
     assert chunks, "the fixture must produce chunks to have anything to assert on"
     assert all(c.multi is not None for c in chunks), "late interaction is on"
@@ -1204,7 +1205,7 @@ async def test_derived_units_carry_every_vector_the_collection_declares() -> Non
     assert pipeline._stages, "the multirep stage must be loadable for this to test anything"
 
     document = Document(id="d1", content="Refunds are processed within five business days. " * 60)
-    chunks = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport())
+    chunks = await pipeline._process_document(document, ChunkingStrategy.EARLY, IngestReport(), [])
 
     derived = [c for c in chunks if c.metadata.get("representation") == "summary"]
     assert derived, "the stage must have produced summary units to assert on"
@@ -1509,15 +1510,19 @@ async def test_a_small_ingest_does_not_pay_for_bulk_load_mode() -> None:
 
 
 async def test_a_failed_run_does_not_leave_chunks_for_the_next_one_to_write() -> None:
-    """`_deferred` is instance state on a pipeline the server reuses.
+    """The docstore buffer used to be instance state on a reused pipeline.
 
     `_LinearEngine` builds one `IngestPipeline` and calls `ingest()` on it for
-    every `POST /ingest`. A run that dies after a stage has buffered its docstore
-    writes — a vector-store failure, a cancelled request — leaves them in
-    `_deferred`, and the *next* run flushes them after its own `_write_documents`.
-    The result is chunks from a failed run appearing in a later one, attached to a
-    document set that has nothing to do with them, which is exactly the class of
-    write-ordering bug the buffer was introduced to prevent.
+    every `POST /ingest`. A run that died after a stage buffered its docstore
+    writes — a vector-store failure, a cancelled request — left them queued, and
+    the *next* run flushed them after its own `_write_documents`: chunks from a
+    failed run appearing in a later one, attached to a document set that has
+    nothing to do with them, which is the write-ordering bug the buffer exists to
+    prevent.
+
+    The buffer is now a local of `_run`, so it cannot outlive its run. This
+    asserts the observable consequence rather than the absent attribute, because
+    the attribute is what changed and the guarantee is not.
     """
     from tests.fakes import FakeDocumentStore, FakeVectorStore
 
@@ -1539,11 +1544,6 @@ async def test_a_failed_run_does_not_leave_chunks_for_the_next_one_to_write() ->
 
     with pytest.raises(RuntimeError, match="qdrant went away"):
         await pipeline.ingest([Document(id="doomed", content=body)])
-
-    assert pipeline._deferred == [], (
-        "a failed run must not leave its buffered writes queued on a pipeline the "
-        "server will reuse for the next request"
-    )
 
     await pipeline.ingest([Document(id="healthy", content=body)])
 
@@ -1735,3 +1735,38 @@ async def test_an_unchanged_document_is_still_skipped_on_re_ingest() -> None:
 
     assert (first.documents_indexed, first.documents_skipped) == (1, 0)
     assert (second.documents_indexed, second.documents_skipped) == (0, 1)
+
+
+async def test_concurrent_ingests_do_not_flush_each_others_parents() -> None:
+    """Two `POST /ingest` requests share one `IngestPipeline`.
+
+    With the docstore buffer as instance state, whichever run reached its flush
+    first took the other's buffered parents with it — writing them against its
+    own document set, before those rows existed — or its exit discarded them,
+    leaving a *successful* ingest whose parents were never written and nothing
+    saying so. The buffer is a local of `_run` now, so each run flushes exactly
+    what it buffered.
+
+    Asserted through the store: every parent row must belong to a document in the
+    same run, which is the invariant the foreign key would have enforced if the
+    rows had arrived in the wrong order.
+    """
+    import asyncio
+
+    from tests.fakes import FakeDocumentStore
+
+    store = FakeDocumentStore()
+    pipeline = _fk_pipeline(store, parent_document_enabled=True)
+    body = "\n\n".join(f"Section {i}. " + "Refund policy detail. " * 40 for i in range(3))
+
+    await asyncio.gather(
+        pipeline.ingest([Document(id=f"alpha-{i}", content=body) for i in range(2)]),
+        pipeline.ingest([Document(id=f"beta-{i}", content=body) for i in range(2)]),
+    )
+
+    known = set(store.documents)
+    orphans = [c.id for c in store.chunks.values() if c.document_id not in known]
+    assert orphans == [], f"chunks written against documents that do not exist: {orphans}"
+
+    parents = [c for c in store.chunks.values() if c.parent_id is None and c.level == 0]
+    assert parents, "the parent-document stage wrote nothing, so this proves nothing"
