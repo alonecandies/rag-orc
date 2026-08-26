@@ -143,6 +143,35 @@ to override the scope is either a bug or an attack.
 Qdrant additionally gets a payload index with `is_tenant=True`, which co-locates
 each tenant's vectors on disk so the filter is cheap rather than a filtered scan.
 
+### The knowledge graph cannot be scoped, so it refuses
+
+```bash
+RAGORC_SECURITY__GRAPH_TENANT_ISOLATION=reject    # default
+RAGORC_SECURITY__GRAPH_TENANT_ISOLATION=trusted   # one graph per tenant
+```
+
+Nothing in Neo4j carries a tenant. Entities merge on `name`, communities on a
+membership hash, chunk links on a chunk id — none namespaced — so two tenants
+writing about the same company converge on one node and a traversal from it
+reaches both. With `reject` (the default) local, global, DRIFT and bridge search
+all refuse while `enforce_tenant_isolation` is on, `auto` will not select
+`graphrag`, and `/health` says so.
+
+`trusted` asserts that the graph holds one tenant's data — a Neo4j instance or
+database per tenant. It is an explicit assertion because the consequence of it
+being untrue is that entity names, descriptions and relationships cross tenants
+in the verbalized subgraph, *stamped with the querying tenant's id*.
+
+There is deliberately no `rls`-equivalent. Making the graph multi-tenant means
+entity identity becomes `(tenant, name)`, which changes every MERGE, every
+traversal predicate and the fulltext index, and needs a migration for graphs
+already built. A filter added at query time would provide the appearance of
+isolation.
+
+By-id chunk reads (`QdrantStore.get`, `PostgresStore.get_chunks`) are scoped
+independently, so a foreign chunk id resolves to nothing even under `trusted`.
+An id is not a filter, and those two reads were the one unscoped door.
+
 ### Naming a tenant is not the same as owning one
 
 `tenant_id` is a field on the request **body**, so on its own the setting above
@@ -271,6 +300,8 @@ after redaction), `flag`.
 - [ ] `RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION=true` for multi-tenant data
 - [ ] `RAGORC_SERVER__API_KEY_TENANTS` set — without it, isolation only checks
       that a tenant was *named*, and any authenticated caller can name any tenant
+- [ ] `RAGORC_SECURITY__GRAPH_TENANT_ISOLATION` left at `reject` unless you run
+      one graph per tenant — the graph stores no tenant and cannot be filtered
 - [ ] `RAGORC_SERVER__MAX_BODY_BYTES` sized for your largest upload — it is
       enforced on the wire, so it bounds a chunked request that declares no
       `Content-Length`

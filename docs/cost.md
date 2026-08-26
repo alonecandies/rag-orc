@@ -186,3 +186,23 @@ One caveat on the two fields. `answer.usage` is always populated; `metadata["cos
 comes from the ledger the LLM client writes to, so an injected third-party client
 that satisfies the protocol without writing to the ledger leaves it at zero while
 `answer.usage` — summed from what the nodes reported — still holds the total.
+
+
+## Ceilings are reserved, not merely checked
+
+`cost.max_llm_calls_per_query`, `max_cost_per_query_usd` and
+`max_tokens_per_query` are enforced by `CostLedger.reserve()`, which claims the
+budget *before* a provider request is issued and releases it when the call
+finishes however it finishes.
+
+A plain pre-flight check is not enough under a fan-out. A call is recorded only
+after its round trip, so every coroutine in a `gather` reads a ledger that still
+says zero and every one of them passes. Measured with 40 prompts against a
+five-call ceiling: 40 requests served, the ceiling read forty times and enforced
+none. The overshoot was the full fan-out width rather than `llm.max_concurrency`,
+because the check preceded the semaphore.
+
+`max_tokens` is reserved exactly, being the most a call can spend and known
+before it is made. Cost is reserved at zero, so the cost ceiling is bounded
+transitively by the call ceiling — which is why clearing
+`max_llm_calls_per_query` while keeping a cost ceiling reopens the window.

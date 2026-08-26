@@ -298,6 +298,61 @@ Behaviour:
   `enforce_tenant_isolation` was on, because the probe was a tenant-scoped
   `count`.
 
+## 11h. Closed: two cross-tenant leaks, and state shared by concurrent requests
+
+Round nine, with four lenses not previously applied: concurrency, cache tenancy,
+the relational store, and resource lifecycle. Nineteen findings, sixteen
+surviving adversarial verification, three refuted. Both leaks were reproduced
+end to end against the live stack.
+
+**Cross-tenant reads.** The knowledge graph had no concept of a tenant at all —
+`grep -c tenant ragorc/stores/neo4j/store.py` returned 0 — and the by-id chunk
+reads in both stores were unscoped, so a query scoped to one tenant returned
+another's chunk verbatim. The graph's *own* output leaked too, with forged
+provenance: a subgraph chunk stamped with the querying tenant's id whose body was
+a third party's private entity and description, with none of that tenant's chunks
+even indexed. Separately, `RAGPipeline.query` consulted the semantic cache
+*before* `require_tenant` ran (the guard lives in the graph's first node), and
+with no tenant resolvable the cache drops its tenant predicate — so a request
+that should have been refused returned another tenant's cached answer.
+
+The same asymmetry `require_generated_query_isolation` was written for, one path
+over: that guard covers Cypher an LLM *wrote*, and these legs run parameterized
+traversals. Its docstring even names the mechanism — "`tenant_id` reached the SQL
+path only to *stamp the resulting chunk*, never to filter the query" — which is
+exactly what `graph.py:779` and `:940` do with it.
+
+**Ceilings that were read and not enforced.** `CostLedger.check()` reads what has
+been *recorded*, and a call records after its round trip, so all N pre-checks in
+a fan-out passed against a zero ledger: 40 provider requests against a five-call
+"hard ceiling". Replaced with a reservation. Worth recording that the first
+measurement of this said the ceiling held — an artifact of a mock transport that
+returned without yielding, which serialized the interleaving the bug needs.
+
+**Data loss on retry.** `_select_changed` skips a document whose stored checksum
+matches, so the checksum is the "indexed" marker — and it was written before any
+vector existed. With the vector store down, run 1 raised with the row committed
+and run 2 reported `skipped=1, indexed=0` over an index that never received the
+document. A comment in `_run` described this failure and blamed chunk rows;
+`_existing_checksums` reads the documents table, so the fix it justified narrowed
+the window and left the cause.
+
+**State shared by concurrent requests.** The docstore buffer was an attribute on
+a pipeline the server reuses, so concurrent ingests flushed or discarded each
+other's parents. `CircuitBreaker`'s documented "single probe" was every caller in
+the window. `ingest(**kwargs)`, documented as "this run only", assigned
+`self.settings`. `GraphGlobalRetriever` accumulated bills across requests,
+reporting `[3, 6, 9]` calls for identical work.
+
+**Configured and not connected.** The relational store failed open when told to
+isolate. The Qdrant client cache's dead-loop eviction could not fire, because the
+key contains `id(loop)`. `cache_rerank` reached no backend under `RAGPipeline`.
+The HTTP cache stored degraded answers, omitted the pipeline from its key, and
+kept full chunk bodies.
+
+Six of these were only caught by mutating a *call site* rather than a function
+body — the gap named in 11g, still the most productive place to look.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
