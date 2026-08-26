@@ -1010,6 +1010,7 @@ class RAGPipeline:
         *,
         tenant_id: str | None = None,
         top_k: int | None = None,
+        filters: dict[str, Any] | None = None,
         pipeline: str = "auto",
         stream: bool = False,
     ) -> Answer:
@@ -1046,14 +1047,16 @@ class RAGPipeline:
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
 
-            hit = await self._cache_get(question, tenant, top_k)
+            hit = await self._cache_get(question, tenant, top_k, filters)
             if hit is not None:
                 return hit
 
             name = self.select_graph(pipeline)
             spec = GRAPHS[name]
             final: RAGState = await self.graph(name).ainvoke(
-                initial_state(question, tenant_id=tenant, top_k=top_k, pipeline=name),
+                initial_state(
+                    question, tenant_id=tenant, top_k=top_k, filters=filters, pipeline=name
+                ),
                 # The recursion limit is the safety net above each graph's own iteration
                 # counters; it is derived per graph so raising a retry budget cannot turn
                 # the net into the primary bound.
@@ -1062,7 +1065,7 @@ class RAGPipeline:
             answer = self._finish(
                 final, name=name, request_id=request_id, trace=trace, ledger=ledger
             )
-            await self._cache_set(question, tenant, answer, final, top_k)
+            await self._cache_set(question, tenant, answer, final, top_k, filters)
             return answer
 
     async def stream(
@@ -1071,6 +1074,7 @@ class RAGPipeline:
         *,
         tenant_id: str | None = None,
         top_k: int | None = None,
+        filters: dict[str, Any] | None = None,
         pipeline: str = "auto",
     ) -> AsyncIterator[str]:
         """Stream the answer's tokens as they are produced.
@@ -1107,7 +1111,7 @@ class RAGPipeline:
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
             state, nodes = await self._retrieve_for_stream(
-                question, tenant=tenant, top_k=top_k, pipeline=pipeline
+                question, tenant=tenant, top_k=top_k, filters=filters, pipeline=pipeline
             )
             query = state.get("query")
             if query is None:  # pragma: no cover - validate raises before this
@@ -1122,7 +1126,13 @@ class RAGPipeline:
                 yield delta
 
     async def _retrieve_for_stream(
-        self, question: str, *, tenant: str | None, top_k: int | None, pipeline: str
+        self,
+        question: str,
+        *,
+        tenant: str | None,
+        top_k: int | None,
+        pipeline: str,
+        filters: dict[str, Any] | None = None,
     ) -> tuple[RAGState, PipelineNodes]:
         """Run the selected graph's retrieval side, stopping before generation.
 
@@ -1155,7 +1165,9 @@ class RAGPipeline:
         """
         name = self.select_graph(pipeline)
         nodes = self.nodes(full_translation=name == "agentic")
-        state: RAGState = initial_state(question, tenant_id=tenant, top_k=top_k, pipeline=name)
+        state: RAGState = initial_state(
+            question, tenant_id=tenant, top_k=top_k, filters=filters, pipeline=name
+        )
         limit = GRAPHS[name].recursion_limit(self.settings)
         final = await self._compiled_graph(name, streaming=True).ainvoke(
             state, {"recursion_limit": limit}
@@ -1295,15 +1307,22 @@ class RAGPipeline:
         return require_tenant(tenant_id or self.settings.tenant_id, self.settings.security)
 
     async def _cache_get(
-        self, question: str, tenant: str | None, top_k: int | None = None
+        self,
+        question: str,
+        tenant: str | None,
+        top_k: int | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> Answer | None:
         cache = self.semantic_cache
         if cache is None:
             return None
-        # `top_k` is part of the identity: it changes how much evidence the
-        # answer was built from. This path takes no filters, so the scope is
-        # top_k alone; the HTTP path passes both.
-        hit = await cache.get(question, tenant_id=tenant, scope=scope_key(None, top_k))
+        # Both are part of the identity, for the reason ``scope_key`` gives:
+        # ``top_k`` changes how much evidence the answer was built from, and
+        # filters narrow which passages were admissible. Keying on ``None``
+        # filters — which this path did, because it accepted none — would serve
+        # the unfiltered answer to a filtered request as soon as the parameter
+        # existed.
+        hit = await cache.get(question, tenant_id=tenant, scope=scope_key(filters, top_k))
         if hit is None:
             return None
         answer = _answer_from_payload(hit.answer)
@@ -1325,6 +1344,7 @@ class RAGPipeline:
         answer: Answer,
         state: RAGState,
         top_k: int | None = None,
+        filters: dict[str, Any] | None = None,
     ) -> None:
         """Populate the cache, with two refusals.
 
@@ -1347,7 +1367,7 @@ class RAGPipeline:
             question,
             _answer_to_payload(answer),
             tenant_id=tenant,
-            scope=scope_key(None, top_k),
+            scope=scope_key(filters, top_k),
         )
 
     # ------------------------------------------------------------------

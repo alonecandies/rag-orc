@@ -87,7 +87,7 @@ from ragorc.llm.router import ModelRouter, Task
 from ragorc.pipeline.state import RAGState, evidence, failure, gathered
 from ragorc.retrieve.fusion import fuse
 from ragorc.retrieve.noise import NoiseFilter
-from ragorc.security.tenancy import require_tenant
+from ragorc.security.tenancy import require_tenant, scope_filter
 from ragorc.validate.input import QueryValidator
 
 log = structlog.get_logger(__name__)
@@ -341,6 +341,14 @@ class PipelineNodes:
             state["question"], tenant_id=tenant, top_k=state.get("top_k")
         )
         require_tenant(validated.query.tenant_id or tenant, self.settings.security)
+        # Scoped here, which is where the linear engine's ``prepare`` does it too.
+        # The graph path used to build a Query with no filters at all: the tenant
+        # predicate still reached the stores as a separate argument, but a
+        # caller's own metadata filters were dropped between the HTTP boundary
+        # and retrieval.
+        validated.query.filters = scope_filter(
+            state.get("filters"), validated.query.tenant_id or tenant, self.settings.security
+        )
 
         out: dict[str, Any] = {"query": validated.query}
         if validated.warnings:

@@ -123,6 +123,14 @@ class RAGState(TypedDict, total=False):
     the rewrites, and the final answer is graded against this."""
     tenant_id: str | None
     top_k: int | None
+    filters: dict[str, Any] | None
+    """Metadata predicates the caller asked to be restricted to.
+
+    Seeded on the request rather than derived, because they are the caller's
+    statement about which passages are admissible — ``docs/security.md`` describes
+    filters as "how a caller restricts themselves to a subset they are entitled to
+    see". The orchestrated path had no channel for them at all, so they were
+    accepted at the HTTP boundary and dropped before retrieval."""
     pipeline: str
     """Which graph was selected, for the trace and the answer metadata."""
     prompt_name: str | None
@@ -177,6 +185,7 @@ def initial_state(
     *,
     tenant_id: str | None = None,
     top_k: int | None = None,
+    filters: dict[str, Any] | None = None,
     pipeline: str = "auto",
     prompt_name: str | None = None,
 ) -> RAGState:
@@ -191,6 +200,7 @@ def initial_state(
         question=question,
         tenant_id=tenant_id,
         top_k=top_k,
+        filters=filters,
         pipeline=pipeline,
         prompt_name=prompt_name,
         retrieve_iterations=0,

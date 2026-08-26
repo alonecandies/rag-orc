@@ -7,6 +7,8 @@ databases running is not a facade a new user can try.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from ragorc.core.settings import Settings
@@ -313,3 +315,79 @@ async def test_builder_gives_local_graph_search_a_query_embedder(
         "the query must be embedded by the model that embedded the chunks; a cosine "
         "between two models' spaces is a number with no meaning"
     )
+
+
+# ---------------------------------------------------------------------------
+# Caller-supplied filters have to survive the trip to retrieval
+# ---------------------------------------------------------------------------
+async def test_caller_filters_reach_the_query_the_retrievers_see(
+    settings: Settings,
+) -> None:
+    """`_engine_kwargs` supplied `filters`; `RAGPipeline.query` declared no such
+    parameter; `_accepted` drops every kwarg the target does not declare. So on
+    the default (orchestrated) HTTP path a caller's filters were accepted at the
+    boundary and discarded before retrieval, silently.
+
+    `docs/security.md` describes filters as "how a caller restricts themselves to
+    a subset they are entitled to see", which is what makes a silent drop worse
+    than a rejection.
+    """
+    from ragorc.core.models import Query, RetrievalResult
+    from ragorc.generate.answer import AnswerGenerator
+    from ragorc.pipeline.builder import RAGPipeline
+    from tests.fakes import StubLLM
+
+    seen: list[dict[str, Any] | None] = []
+
+    class Recording:
+        name = "stub"
+
+        async def retrieve(self, query: Query, **kwargs: object) -> list[Any]:
+            seen.append(dict(query.filters) if query.filters else None)
+            return []
+
+        async def retrieve_detailed(self, query: Query, **kwargs: object) -> RetrievalResult:
+            await self.retrieve(query)
+            return RetrievalResult()
+
+    llm = StubLLM()
+    pipeline = RAGPipeline(
+        settings=settings, llm=llm, retriever=Recording(), generator=AnswerGenerator(llm, settings)
+    )
+
+    await pipeline.query("what is the refund window?", filters={"dept": "legal"})
+
+    assert seen, "the retriever was never reached"
+    assert seen[0] is not None and seen[0].get("dept") == "legal", (
+        f"the caller's filters did not reach retrieval: {seen[0]!r}"
+    )
+
+
+def test_the_engine_accepts_the_filters_the_service_offers_it() -> None:
+    """The seam where they were lost. `_accepted` is deliberately permissive —
+    it exists so the call sites stay stable while the target is written — which
+    means a missing parameter is a silent drop rather than a TypeError."""
+    from ragorc.pipeline.builder import RAGPipeline
+    from ragorc.server.app import _accepted
+
+    offered = {
+        "question": "q",
+        "query": object(),
+        "tenant_id": "t",
+        "top_k": 5,
+        "pipeline": "auto",
+        "filters": {"dept": "legal"},
+    }
+    assert "filters" in _accepted(RAGPipeline.query, offered)
+
+
+async def test_a_filtered_question_does_not_get_the_unfiltered_cached_answer(
+    settings: Settings,
+) -> None:
+    """Filters are part of the cache identity, per `scope_key`'s own reasoning:
+    they narrow which passages were admissible, so an answer computed without
+    them is not the answer to the same question asked with them."""
+    from ragorc.cache.semantic import scope_key
+
+    assert scope_key({"dept": "legal"}, 5) != scope_key(None, 5)
+    assert scope_key({"dept": "legal"}, 5) == scope_key({"dept": "legal"}, 5)
