@@ -251,7 +251,26 @@ class OpenRouterLLM:
         before any configuration existed, so `llm.max_retries`,
         `retry_base_delay_s` and `retry_max_delay_s` were three documented knobs
         that could not move anything.
+
+        The budget is *reserved* here rather than only checked at the top of
+        :meth:`complete`. This is the one place a provider request is actually
+        issued, so it is the only place a claim can be made that a concurrent
+        sibling will see. A check at method entry passed for every coroutine in a
+        fan-out before any of them recorded — 40 requests against a five-call
+        ceiling, measured — because a call is recorded only after its round trip.
+        Reserving here bounds the in-flight calls by the ceiling itself.
+
+        Placed outside the retry so one logical call holds one reservation, not
+        one per attempt: a retry is the same call again, and the usage it
+        eventually records is counted once.
         """
+        ledger = current_ledger()
+        if ledger is None:
+            return await self._retrying_post(body)
+        with ledger.reserve(tokens=int(body.get("max_tokens") or 0)):
+            return await self._retrying_post(body)
+
+    async def _retrying_post(self, body: dict[str, Any]) -> dict[str, Any]:
         return await retry_async(
             max_attempts=max(1, self.settings.max_retries),
             base_delay=self.settings.retry_base_delay_s,

@@ -133,3 +133,104 @@ async def test_a_structured_repair_keeps_the_caller_s_token_cap() -> None:
     assert len(bodies) >= 2, "the test needs a repair round trip to say anything"
     caps = [b.get("max_tokens") for b in bodies]
     assert caps == [64] * len(bodies), f"every attempt must carry the caller's cap, saw {caps}"
+
+
+# ---------------------------------------------------------------------------
+# The per-request ceilings, under fan-out
+# ---------------------------------------------------------------------------
+def _yielding_client(served: list[int], *, fail_after: int | None = None, **overrides: object):
+    """A client whose transport actually awaits.
+
+    This is the load-bearing detail. `MockTransport` with a synchronous handler
+    returns without yielding, which serializes the coroutines and hides the
+    defect entirely: the first measurement of this bug read "ceiling held" for
+    exactly that reason. A real provider always yields.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        served.append(1)
+        await asyncio.sleep(0.01)
+        if fail_after is not None and len(served) > fail_after:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(200, json=_CHAT)
+
+    settings = LLMSettings(api_key="k", max_retries=1, **overrides)  # type: ignore[arg-type]
+    llm = OpenRouterLLM(settings=settings)
+    llm._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://provider.invalid"
+    )
+    return llm
+
+
+async def test_the_call_ceiling_bounds_a_fan_out_not_just_a_sequence() -> None:
+    """`check()` reads what has been *recorded*, and a call records only after its
+    round trip — so every coroutine in a fan-out passed the gate against a ledger
+    still reading zero. Measured before the fix: 40 requests against a five-call
+    ceiling. The ceiling was read forty times and enforced none."""
+    from ragorc.core.telemetry import new_request_context
+
+    served: list[int] = []
+    llm = _yielding_client(served, max_concurrency=64)
+    try:
+        with new_request_context(request_id="r", max_calls=5, trace=False):
+            await llm.batch([f"p{i}" for i in range(40)])
+        assert len(served) == 5, f"{len(served)} provider requests against a ceiling of 5"
+    finally:
+        await llm.aclose()
+
+
+async def test_the_ceiling_still_admits_exactly_what_it_permits() -> None:
+    """The other half: a reservation that never releases would strangle the
+    request instead of bounding it."""
+    from ragorc.core.telemetry import new_request_context
+
+    served: list[int] = []
+    llm = _yielding_client(served, max_concurrency=8)
+    try:
+        with new_request_context(request_id="r", max_calls=10, trace=False):
+            results = await llm.batch([f"p{i}" for i in range(6)])
+        assert len(served) == 6
+        assert [r for r in results if r] and len(results) == 6
+    finally:
+        await llm.aclose()
+
+
+async def test_a_failed_call_returns_its_reservation() -> None:
+    """Released in a `finally`, so a failure gives the budget back rather than
+    wedging the ceiling for the rest of the request."""
+    from ragorc.core.telemetry import new_request_context
+
+    served: list[int] = []
+    llm = _yielding_client(served, fail_after=0, max_concurrency=4)
+    try:
+        with new_request_context(request_id="r", max_calls=3, trace=False) as (_t, ledger):
+            await llm.batch(["a", "b"])
+            assert ledger._reserved_calls == 0, "a failed call kept its claim"
+    finally:
+        await llm.aclose()
+
+
+def test_reservations_count_as_spent_while_in_flight() -> None:
+    """A call that has passed the gate and not yet returned is money committed.
+    Treating it as zero is precisely what let the fan-out through."""
+    from ragorc.core.errors import BudgetExceeded
+    from ragorc.core.telemetry import CostLedger
+
+    ledger = CostLedger(max_calls=2)
+    with ledger.reserve():
+        ledger.check()  # one claimed, one left
+        with ledger.reserve(), pytest.raises(BudgetExceeded, match="call budget"):
+            ledger.check()
+    ledger.check()  # both released
+
+
+def test_the_token_ceiling_is_reserved_from_max_tokens() -> None:
+    """`max_tokens` is the most a call can spend and is known before it is made,
+    so it can be claimed exactly rather than discovered afterwards."""
+    from ragorc.core.errors import BudgetExceeded
+    from ragorc.core.telemetry import CostLedger
+
+    ledger = CostLedger(max_tokens=100)
+    with ledger.reserve(tokens=90), pytest.raises(BudgetExceeded, match="token budget"):
+        ledger.check(projected_tokens=20)
+    ledger.check(projected_tokens=20)

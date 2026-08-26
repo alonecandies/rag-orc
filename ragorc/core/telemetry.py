@@ -201,8 +201,26 @@ class CostLedger:
 
     The ceilings are the important part. A pipeline with retries, loops and
     fan-out has no natural upper bound on spend; a runaway CRAG loop on a
-    frontier model can cost dollars per query. ``check()`` is called before
-    every LLM request so the ceiling is enforced *before* the money is spent.
+    frontier model can cost dollars per query.
+
+    Why checking is not enough, and reservations exist
+    -------------------------------------------------
+    ``check()`` reads what has been *recorded*, and a call is recorded only after
+    its round trip. Under a fan-out, every coroutine runs to its first ``await``
+    before any of them completes, so N pre-checks all read a ledger that still
+    says zero and all pass. Measured with 40 prompts against a five-call ceiling
+    and a transport that yields, as any real provider does: 40 requests served.
+    The ceiling was read forty times and enforced none.
+
+    :meth:`reserve` closes that window by claiming the budget *synchronously* —
+    ``check`` and the increment happen with no ``await`` between them, which on a
+    single-threaded event loop is atomic — and releasing it when the call
+    finishes, however it finishes. So the bound becomes the number of calls
+    permitted rather than the width of the fan-out.
+
+    An earlier measurement of this suggested the ceiling held; that was an
+    artifact of a mock transport that returned without yielding, which serialized
+    the very interleaving the bug needs.
     """
 
     max_cost_usd: float | None = None
@@ -210,6 +228,9 @@ class CostLedger:
     max_tokens: int | None = None
     by_model: dict[str, Usage] = field(default_factory=dict)
     by_stage: dict[str, Usage] = field(default_factory=dict)
+    _reserved_calls: int = 0
+    _reserved_cost: float = 0.0
+    _reserved_tokens: int = 0
 
     def record(self, usage: Usage, *, stage: str = "unknown") -> None:
         model = usage.model or "unknown"
@@ -220,24 +241,56 @@ class CostLedger:
     def total(self) -> Usage:
         return Usage.sum(self.by_model.values())
 
-    def check(self, *, projected_cost: float = 0.0) -> None:
+    def check(self, *, projected_cost: float = 0.0, projected_tokens: int = 0) -> None:
+        """Raise if this request cannot proceed. Counts in-flight reservations.
+
+        Spend already claimed by :meth:`reserve` is counted as spent, because it
+        is about to be: a call that has passed the gate and not yet returned is
+        money committed, and treating it as zero is what let a fan-out through.
+        """
         from ragorc.core.errors import BudgetExceeded
 
         total = self.total
-        if self.max_calls is not None and total.calls >= self.max_calls:
-            raise BudgetExceeded(
-                "LLM call budget exhausted", calls=total.calls, limit=self.max_calls
-            )
-        if self.max_cost_usd is not None and total.cost_usd + projected_cost > self.max_cost_usd:
+        calls = total.calls + self._reserved_calls
+        if self.max_calls is not None and calls >= self.max_calls:
+            raise BudgetExceeded("LLM call budget exhausted", calls=calls, limit=self.max_calls)
+        cost = total.cost_usd + self._reserved_cost + projected_cost
+        if self.max_cost_usd is not None and cost > self.max_cost_usd:
             raise BudgetExceeded(
                 "cost budget exhausted",
                 spent_usd=round(total.cost_usd, 6),
+                committed_usd=round(cost, 6),
                 limit_usd=self.max_cost_usd,
             )
-        if self.max_tokens is not None and total.total_tokens >= self.max_tokens:
-            raise BudgetExceeded(
-                "token budget exhausted", tokens=total.total_tokens, limit=self.max_tokens
-            )
+        tokens = total.total_tokens + self._reserved_tokens + projected_tokens
+        if self.max_tokens is not None and tokens >= self.max_tokens:
+            raise BudgetExceeded("token budget exhausted", tokens=tokens, limit=self.max_tokens)
+
+    @contextlib.contextmanager
+    def reserve(self, *, cost: float = 0.0, tokens: int = 0) -> Iterator[None]:
+        """Claim one call's budget for the duration of that call.
+
+        The check and the claim are adjacent with no ``await`` between them, which
+        is what makes this atomic on an event loop and what a bare ``check()``
+        could never be. Released in a ``finally``, so a failed or cancelled call
+        gives its budget back instead of wedging the ceiling for the rest of the
+        request.
+
+        ``tokens`` is the caller's ``max_tokens`` — the most the call can spend,
+        known before it is made. ``cost`` is an estimate when one is available;
+        with a call ceiling configured the overshoot is bounded by that ceiling
+        regardless, which is the common case.
+        """
+        self.check(projected_cost=cost, projected_tokens=tokens)
+        self._reserved_calls += 1
+        self._reserved_cost += cost
+        self._reserved_tokens += tokens
+        try:
+            yield
+        finally:
+            self._reserved_calls -= 1
+            self._reserved_cost -= cost
+            self._reserved_tokens -= tokens
 
     def report(self) -> dict[str, Any]:
         total = self.total
