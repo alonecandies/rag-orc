@@ -435,6 +435,16 @@ class _LinearEngine:
             ("postgres", getattr(self.relational, "close", None)),
             ("neo4j", getattr(self.graph, "close", None)),
             ("cache", getattr(self.cache, "close", None)),
+            # The embedders and the reranker were omitted, on a method whose
+            # docstring is about shutting the engine down completely. A local
+            # ONNX session leaks little at process exit, but a *hosted* embedding
+            # provider holds an httpx pool and its own connections, and the
+            # orchestration layer closes this engine while the process keeps
+            # running — so the leak is per-swap, not per-process.
+            ("dense_embedder", getattr(self.dense, "aclose", None)),
+            ("sparse_embedder", getattr(self.sparse, "aclose", None)),
+            ("late_embedder", getattr(self.colbert, "aclose", None)),
+            ("reranker", getattr(self.reranker, "aclose", None)),
         ):
             if closer is None:
                 continue
@@ -912,7 +922,7 @@ class RagService:
         with self._request_context(request_id) as ledger:
             query, warnings = self.prepare(request, principal=principal)
 
-            cached = await self._cache_get(query, request_id=request_id)
+            cached = await self._cache_get(query, request_id=request_id, pipeline=request.pipeline)
             if cached is not None:
                 return cached
 
@@ -927,7 +937,7 @@ class RagService:
             response.metadata["cost"] = ledger.report()
             response.metadata.setdefault("orchestrator", "graph" if self.orchestrated else "linear")
 
-            await self._cache_set(query, response)
+            await self._cache_set(query, response, answer=answer, pipeline=request.pipeline)
             self.audit.answered(
                 tenant_id=query.tenant_id,
                 cost_usd=ledger.total.cost_usd,
@@ -1157,13 +1167,15 @@ class RagService:
             )
         return query, list(validated.warnings)
 
-    async def _cache_get(self, query: Query, *, request_id: str) -> QueryResponse | None:
+    async def _cache_get(
+        self, query: Query, *, request_id: str, pipeline: PipelineName | None = None
+    ) -> QueryResponse | None:
         if self.semantic is None:
             return None
         hit = await self.semantic.get(
             query.text,
             tenant_id=query.tenant_id,
-            scope=scope_key(query.filters, query.top_k),
+            scope=scope_key(query.filters, query.top_k, pipeline=pipeline),
         )
         if hit is None:
             return None
@@ -1185,17 +1197,51 @@ class RagService:
         log.info("query_cache_hit", request_id=request_id, score=round(hit.score, 4))
         return response
 
-    async def _cache_set(self, query: Query, response: QueryResponse) -> None:
+    async def _cache_set(
+        self,
+        query: Query,
+        response: QueryResponse,
+        *,
+        answer: Answer | None = None,
+        pipeline: PipelineName | None = None,
+    ) -> None:
+        """Store an answer, unless something about it makes it unrepeatable.
+
+        ``SemanticCache.set`` declines abstentions itself, and that is the right
+        place for that rule: an abstention is a statement about the index at one
+        moment, and replaying it later hides content that has since been added.
+
+        Three things it could not know, all of which this layer can:
+
+        * **A degraded answer.** ``RAGPipeline._cache_set`` already refuses one —
+          "the answer produced while a store was unreachable is not the answer this
+          question has, it is the answer it had during an outage" — and the HTTP
+          path implemented no such rule, so it served the outage for the whole
+          TTL, long after the store came back.
+        * **The pipeline.** ``graphrag`` and ``naive`` answer the same question
+          differently *on purpose*; that is the entire reason a caller names one.
+          Keyed without it, whichever ran first answered for both, so a benchmark
+          comparing two pipelines measured one of them twice. Keyed on the
+          *requested* pipeline rather than the resolved one, because that is what
+          the read side knows — resolution happens after dispatch — and ``auto``
+          resolves identically for identical settings.
+        * **The chunk bodies.** ``chunks`` carries the retrieved passages in full.
+          Storing them puts the whole retrieved context in the cache payload for
+          every entry — the cost the payload projection exists to avoid — and
+          re-serves passages whose source may since have been deleted. The text is
+          reconstructible by re-running the query; the answer is the expensive part.
+        """
         if self.semantic is None or response.cached:
             return
-        # ``SemanticCache.set`` declines abstentions itself, and that is the right
-        # place for the rule: an abstention is a statement about the index at one
-        # moment, and replaying it later hides content that has since been added.
+        if answer is not None and answer.metadata.get("errors"):
+            log.info("semantic_cache_skipped", reason="degraded_answer")
+            return
+        payload = response.model_dump(mode="json", exclude={"chunks", "trace"})
         await self.semantic.set(
             query.text,
-            response.model_dump(mode="json"),
+            payload,
             tenant_id=query.tenant_id,
-            scope=scope_key(query.filters, query.top_k),
+            scope=scope_key(query.filters, query.top_k, pipeline=pipeline),
         )
 
     # -- ingest ------------------------------------------------------------

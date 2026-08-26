@@ -351,3 +351,89 @@ async def test_the_semantic_cache_cannot_answer_before_the_tenant_guard() -> Non
     with pytest.raises(GuardrailViolation):
         pipeline._scoped_tenant(None)
     assert scope_key(None, None)  # the key the leak reproduction needed
+
+
+# ---------------------------------------------------------------------------
+# What the HTTP cache is allowed to store
+# ---------------------------------------------------------------------------
+async def test_the_http_cache_refuses_a_degraded_answer(service: RagService) -> None:
+    """`RAGPipeline._cache_set` already refuses one — "the answer produced while
+    a store was unreachable is not the answer this question has, it is the answer
+    it had during an outage" — and the HTTP path implemented no such rule, so it
+    served the outage for the whole TTL, long after the store came back."""
+    from ragorc.core.models import Answer, Query
+    from ragorc.server.schemas import PipelineName, QueryResponse
+
+    stored: list[Any] = []
+
+    class Recording:
+        async def set(self, question: str, payload: Any, **kwargs: Any) -> None:
+            stored.append((question, payload, kwargs))
+
+    service.semantic = Recording()
+    query = Query(text="q", tenant_id="acme")
+    answer = Answer(text="an answer during an outage", grounded=True, groundedness=0.9)
+    response = QueryResponse.from_answer(
+        answer, request_id="r", question="q", pipeline=PipelineName.NAIVE
+    )
+
+    answer.metadata["errors"] = ["qdrant: StoreUnavailable"]
+    await service._cache_set(query, response, answer=answer, pipeline=PipelineName.NAIVE)
+    assert stored == [], "a degraded answer was cached"
+
+    answer.metadata["errors"] = []
+    await service._cache_set(query, response, answer=answer, pipeline=PipelineName.NAIVE)
+    assert len(stored) == 1, "a healthy answer must still be cached"
+
+
+async def test_the_http_cache_does_not_store_the_retrieved_passages(
+    service: RagService,
+) -> None:
+    """`chunks` carries the retrieved passages in full. Storing them puts the
+    whole context in the payload for every entry — the cost the payload
+    projection exists to avoid — and re-serves text whose source may since have
+    been deleted. The answer is the expensive part; the passages are
+    reconstructible by re-running the query."""
+    from ragorc.core.models import Answer, Chunk, Query, ScoredChunk
+    from ragorc.server.schemas import PipelineName, QueryResponse
+
+    stored: list[Any] = []
+
+    class Recording:
+        async def set(self, question: str, payload: Any, **kwargs: Any) -> None:
+            stored.append(payload)
+
+    service.semantic = Recording()
+    answer = Answer(
+        text="an answer",
+        grounded=True,
+        groundedness=0.9,
+        chunks=[ScoredChunk(chunk=Chunk(id="c1", content="SECRET BODY"), score=0.9)],
+    )
+    response = QueryResponse.from_answer(
+        answer, request_id="r", question="q", pipeline=PipelineName.NAIVE
+    )
+
+    await service._cache_set(
+        Query(text="q", tenant_id="acme"), response, answer=answer, pipeline=PipelineName.NAIVE
+    )
+
+    (payload,) = stored
+    assert "chunks" not in payload
+    assert "SECRET BODY" not in str(payload)
+
+
+def test_the_pipeline_is_part_of_the_cache_identity() -> None:
+    """`graphrag` and `naive` answer the same question differently on purpose,
+    which is the entire reason a caller names one. Keyed without it, whichever
+    ran first answered for both — so a benchmark comparing two pipelines measured
+    one of them twice."""
+    from ragorc.cache.semantic import scope_key
+    from ragorc.server.schemas import PipelineName
+
+    naive = scope_key(None, 5, pipeline=PipelineName.NAIVE)
+    graph = scope_key(None, 5, pipeline=PipelineName.GRAPHRAG)
+    assert naive != graph
+    assert naive == scope_key(None, 5, pipeline=PipelineName.NAIVE)
+    # Callers with no pipeline concept keep their existing keys.
+    assert scope_key(None, 5) == scope_key(None, 5, pipeline=None)

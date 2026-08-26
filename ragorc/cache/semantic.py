@@ -36,7 +36,7 @@ log = structlog.get_logger(__name__)
 __all__ = ["SemanticCache", "SemanticHit"]
 
 
-def scope_key(filters: Any | None = None, top_k: int | None = None) -> str:
+def scope_key(filters: Any | None = None, top_k: int | None = None, *, pipeline: Any = None) -> str:
     """A stable identity for the retrieval scope a question was answered under.
 
     Two requests with the same text are not the same request. `filters` narrows
@@ -49,7 +49,13 @@ def scope_key(filters: Any | None = None, top_k: int | None = None) -> str:
     Sorted before hashing so key order in a filter dict cannot split the cache.
     """
     normalized = orjson.dumps(filters or {}, option=orjson.OPT_SORT_KEYS).decode()
-    return content_hash("semscope", normalized, str(top_k or ""), size=16)
+    # The pipeline belongs here for the same reason the other two do: ``graphrag``
+    # and ``naive`` answer the same question differently on purpose, which is the
+    # whole reason a caller names one. Without it, whichever ran first answered
+    # for both — so a benchmark comparing two pipelines measured one of them twice.
+    # Optional, so callers with no pipeline concept keep their existing keys.
+    selected = getattr(pipeline, "value", pipeline) or ""
+    return content_hash("semscope", normalized, str(top_k or ""), str(selected), size=16)
 
 
 class SemanticHit:
