@@ -12,30 +12,88 @@ reconcile against the provider's reported usage after each call anyway.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
-__all__ = ["TokenBudget", "count_tokens", "count_tokens_batch", "truncate_to_tokens"]
+import structlog
+
+__all__ = [
+    "TokenBudget",
+    "count_tokens",
+    "count_tokens_batch",
+    "load_encoder",
+    "truncate_to_tokens",
+]
 
 _DEFAULT_ENCODING = "o200k_base"
 
+log = structlog.get_logger(__name__)
 
-@functools.lru_cache(maxsize=32)
-def _encoder(model: str | None = None):  # noqa: ANN202
+_ENCODERS: dict[str | None, Any] = {}
+"""Successfully loaded encoders, by model.
+
+A plain dict rather than ``functools.lru_cache`` because only *successes* may be
+cached. ``lru_cache`` memoizes the ``None`` a failed load returns, so one
+transient network blip at first use pinned the four-chars-per-token estimate for
+the rest of the process — silently, and permanently, even after the network came
+back. ``count_tokens``'s docstring framed that estimate as "if tiktoken is
+absent", so the symptom read as a missing dependency rather than a cached
+failure."""
+
+_LOAD_FAILURES = 0
+"""How many times the encoder failed to load. Only used to log the first one:
+a per-call warning on a hot path is its own outage."""
+
+
+def load_encoder(model: str | None = None) -> Any:
+    """The tokenizer for ``model``, or ``None`` if it cannot be loaded.
+
+    ``tiktoken.get_encoding`` downloads a ~1.6 MB BPE file over a **synchronous,
+    blocking** socket the first time it is asked. Every caller of
+    :func:`count_tokens` in this library is reached from ``async def`` request
+    code with no ``to_thread`` hop — the context budgeter, the packer, the
+    generator — so on a cold cache the first query stalled the whole event loop,
+    and with it every other in-flight request including the health probe.
+
+    :meth:`~ragorc.pipeline.builder.RAGPipeline._warmup` now loads it in a thread
+    at startup, which is where the docstring said the one-time costs get paid.
+    This function stays synchronous because that is what a token count is; what
+    changed is that a failure is no longer permanent.
+    """
+    global _LOAD_FAILURES
+    if model in _ENCODERS:
+        return _ENCODERS[model]
     try:
         import tiktoken
     except ImportError:  # pragma: no cover - tiktoken is a base dependency
         return None
+    encoder = None
     if model:
         try:
-            return tiktoken.encoding_for_model(model)
+            encoder = tiktoken.encoding_for_model(model)
         except (KeyError, ValueError):
-            pass
-    try:
-        return tiktoken.get_encoding(_DEFAULT_ENCODING)
-    except Exception:  # pragma: no cover
-        return None
+            encoder = None
+    if encoder is None:
+        try:
+            encoder = tiktoken.get_encoding(_DEFAULT_ENCODING)
+        except Exception as exc:  # noqa: BLE001 - fall back to the estimate
+            _LOAD_FAILURES += 1
+            if _LOAD_FAILURES == 1:
+                log.warning(
+                    "tokenizer_unavailable",
+                    error=str(exc)[:200],
+                    effect="token counts fall back to a 4-chars-per-token estimate",
+                    retried="on every call until it succeeds",
+                )
+            return None
+    _ENCODERS[model] = encoder
+    return encoder
+
+
+def _encoder(model: str | None = None):  # noqa: ANN202
+    """Backwards-compatible alias for :func:`load_encoder`."""
+    return load_encoder(model)
 
 
 def count_tokens(text: str, model: str | None = None) -> int:

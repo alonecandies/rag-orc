@@ -97,6 +97,7 @@ from ragorc.core.protocols import (
 from ragorc.core.registry import resolve
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import configure_logging, current_trace, new_request_context
+from ragorc.core.tokens import load_encoder
 from ragorc.generate.answer import AnswerGenerator
 from ragorc.generate.self_rag import SelfRAG
 from ragorc.llm.cache import LLMCache
@@ -400,6 +401,15 @@ class RAGPipeline:
         if callable(warmup):
             with contextlib.suppress(Exception):
                 await warmup()
+        # The tokenizer, in a thread. ``tiktoken.get_encoding`` downloads ~1.6 MB
+        # over a blocking socket on first use, and every caller of
+        # ``count_tokens`` in this library is reached from async request code with
+        # no ``to_thread`` hop — so on a cold cache the first query stalled the
+        # loop and starved every other in-flight request, health probe included.
+        # Best-effort like the rest: failing to load it costs count *accuracy*,
+        # not correctness, and ``load_encoder`` retries on the next call.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(load_encoder)
         # A local table takes precedence over the network: a deployment that pins
         # its prices wants the pinned numbers, and it also wants a cost estimate
         # without an outbound call at startup. `cost.price_table_path` was

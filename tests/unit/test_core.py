@@ -851,3 +851,52 @@ async def test_bounded_gather_still_collects_exceptions_when_asked() -> None:
     assert results[0] == "ok"
     assert isinstance(results[1], ValueError)
     assert results[2] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# A failed tokenizer load must not be permanent
+# ---------------------------------------------------------------------------
+def test_a_transient_tokenizer_failure_is_retried_not_memoized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`lru_cache` memoized the `None` a failed load returned, so one network
+    blip at first use pinned the 4-chars-per-token estimate for the whole
+    process — silently, and even after the network recovered.
+
+    `count_tokens`'s docstring framed that estimate as "if tiktoken is absent",
+    so the symptom read as a missing dependency rather than a cached failure.
+    """
+    import tiktoken
+
+    from ragorc.core import tokens as mod
+
+    monkeypatch.setattr(mod, "_ENCODERS", {})
+    monkeypatch.setattr(mod, "_LOAD_FAILURES", 0)
+
+    calls: list[int] = []
+    real = tiktoken.get_encoding
+
+    def flaky(name: str) -> object:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient network failure")
+        return real(name)
+
+    monkeypatch.setattr(tiktoken, "get_encoding", flaky)
+
+    assert mod.load_encoder() is None, "the first attempt fails"
+    assert mod.load_encoder() is not None, "the second attempt must be made at all"
+    assert len(calls) == 2
+
+    # And once it succeeds it is cached, so the hot path is not paying for it.
+    assert mod.load_encoder() is not None
+    assert len(calls) == 2, "a successful load must be memoized"
+
+
+def test_counting_still_works_without_a_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The estimate is a real fallback, not a crash — that part was always true
+    and must stay true."""
+    from ragorc.core import tokens as mod
+
+    monkeypatch.setattr(mod, "load_encoder", lambda model=None: None)
+    assert mod.count_tokens("a" * 400) == 100
