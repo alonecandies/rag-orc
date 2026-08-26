@@ -266,3 +266,131 @@ async def test_text_to_cypher_refuses_before_the_graph_is_traversed(
         "bounded Cypher both reach the store, in that order"
     )
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# State shared by concurrent requests
+# ---------------------------------------------------------------------------
+def test_the_breaker_admits_one_probe_not_every_concurrent_caller() -> None:
+    """`CircuitBreaker` documents that "`half_open` lets a single probe through
+    after the cooldown". The cooldown check set the flag and returned False
+    without closing the gate, so every in-flight request became a probe — a
+    thundering herd at exactly the moment the dependency was most fragile.
+    """
+    import time
+
+    from ragorc.core.concurrency import CircuitBreaker
+
+    breaker = CircuitBreaker(name="qdrant", failure_threshold=2, reset_timeout_s=30.0)
+    breaker.record_failure()
+    breaker.record_failure()
+    assert breaker.is_open, "the breaker must open on the threshold"
+    # The cooldown has elapsed. Rewound rather than slept, so the test is not a
+    # timing race, and left well inside the probe deadline.
+    breaker._opened_at = time.monotonic() - 31.0
+
+    admitted = [not breaker.is_open for _ in range(5)]
+    assert admitted == [True, False, False, False, False], (
+        f"{sum(admitted)} of 5 concurrent callers were admitted as the single probe"
+    )
+
+
+def test_an_abandoned_probe_does_not_hold_the_gate_shut_forever() -> None:
+    """A probe that never reports — a crash, a cancelled request, a caller that
+    forgot to record — would otherwise turn a transient outage into a permanent
+    one."""
+    from ragorc.core.concurrency import CircuitBreaker
+
+    breaker = CircuitBreaker(name="qdrant", failure_threshold=1, reset_timeout_s=0.0)
+    breaker.record_failure()
+    assert not breaker.is_open, "the first caller is the probe"
+    assert not breaker.is_open, "with a zero cooldown the abandoned probe is immediately replaced"
+
+
+def test_a_successful_probe_closes_the_breaker() -> None:
+    import time
+
+    from ragorc.core.concurrency import CircuitBreaker
+
+    breaker = CircuitBreaker(name="qdrant", failure_threshold=1, reset_timeout_s=30.0)
+    breaker.record_failure()
+    breaker._opened_at = time.monotonic() - 31.0
+    assert not breaker.is_open
+    breaker.record_success()
+    assert not breaker.is_open
+    assert breaker._failures == 0
+
+
+async def test_ingest_overrides_do_not_outlive_the_call() -> None:
+    """The docstring says "settings overrides applied to *this run only*"; the code
+    assigned `self.settings`. So `ingest("./docs", chunk_size=256)` changed
+    chunking for every later ingest — and because `**kwargs` takes any section
+    prefix, it could change `retrieval` or `generation` under concurrent
+    `query()` calls reading the same attribute."""
+    from ragorc.core.models import Document
+    from ragorc.core.settings import Settings
+    from ragorc.pipeline.builder import RAGPipeline
+    from tests.fakes import FakeDocumentStore, FakeVectorStore
+
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        cache={"enabled": False},
+        llm={"api_key": "k"},
+        embedding={"dense_dimension": 32},
+    )
+    before = settings.indexing.chunk_size
+    pipeline = RAGPipeline(
+        settings=settings, vector_store=FakeVectorStore(), relational_store=FakeDocumentStore()
+    )
+
+    await pipeline.ingest(
+        [Document(id="d1", content="Refund policy detail. " * 60)], chunk_size=128
+    )
+
+    assert pipeline.settings.indexing.chunk_size == before, (
+        "an override scoped to one run changed the pipeline's own settings"
+    )
+    assert before != 128, "the test needs the override to differ from the default"
+
+
+async def test_concurrent_global_searches_do_not_share_a_bill() -> None:
+    """`retrieve` reset `self.usage` and accumulated into it, on a retriever built
+    once and shared. Two concurrent queries reset each other's counter and summed
+    into one field, so each reported a bill containing the other's calls.
+
+    Cost attribution that silently mixes requests is worse than absent, because
+    it is still reported.
+    """
+    import asyncio
+
+    from ragorc.core.models import Community, Query
+    from ragorc.core.settings import Settings
+    from ragorc.retrieve.graph import GraphGlobalRetriever
+    from tests.fakes import FakeGraphStore, StubLLM
+
+    class Reports(FakeGraphStore):
+        async def communities(self, *, level=None, limit=None):  # type: ignore[no-untyped-def]
+            del level, limit
+            return [
+                Community(id=i, level=0, entity_names=("E",), title="t", summary="s")
+                for i in range(3)
+            ]
+
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        cache={"enabled": False},
+        llm={"api_key": "k"},
+        graph={"enabled": True},
+    )
+    retriever = GraphGlobalRetriever(StubLLM(), Reports(), settings=settings)
+
+    async def one() -> Usage:
+        await retriever.retrieve(Query(text="what are the themes?"))
+        return retriever.usage
+
+    bills = await asyncio.gather(*(one() for _ in range(3)))
+    calls = [b.calls for b in bills]
+    assert len(set(calls)) == 1, f"bills differ across identical requests: {calls}"
+    assert all(c == calls[0] for c in calls)
+    assert calls[0] > 0, "no calls were billed, so this proves nothing"
+    assert calls[0] <= 3, f"one request was billed for {calls[0]} community calls, not 3"

@@ -997,9 +997,35 @@ class RAGPipeline:
         if target is None:
             raise ConfigError("ingest needs a source or documents=", hint="rag.ingest('./docs')")
         if kwargs:
-            self.settings = _resolve_settings(self.settings, self._normalize_ingest_kwargs(kwargs))
-            self._ingest = None
+            # Scoped to this call, which is what the docstring above promises and
+            # what the previous version did not do: it assigned ``self.settings``,
+            # so ``ingest("./docs", chunk_size=256)`` changed chunking for every
+            # later ingest — and, because ``**kwargs`` accepts any section prefix,
+            # could change ``retrieval`` or ``generation`` for concurrent
+            # ``query()`` calls reading the same attribute mid-flight.
+            scoped = _resolve_settings(self.settings, self._normalize_ingest_kwargs(kwargs))
+            return await self._scoped_ingest_pipeline(scoped).ingest(target)
         return await self.ingest_pipeline.ingest(target)
+
+    def _scoped_ingest_pipeline(self, settings: Settings) -> Any:
+        """An ingest orchestrator for one call, on this pipeline's components.
+
+        Not memoized: it exists for the duration of one ``ingest`` and the whole
+        point is that it does not outlive it. The components are shared, which is
+        what keeps the query and ingest paths embedding in the same space — the
+        reason :attr:`ingest_pipeline` shares them too.
+        """
+        from ragorc.index.pipeline import IngestPipeline
+
+        return IngestPipeline(
+            vector_store=self.vector_store,
+            relational_store=self._relational,
+            dense_embedder=self.dense_embedder,
+            sparse_embedder=self.sparse_embedder,
+            late_embedder=self.late_embedder,
+            llm=self.llm,
+            settings=settings,
+        )
 
     @staticmethod
     def _normalize_ingest_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:

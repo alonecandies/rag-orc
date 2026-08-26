@@ -320,13 +320,37 @@ class CircuitBreaker:
     _failures: int = field(default=0, init=False)
     _opened_at: float = field(default=0.0, init=False)
     _half_open: bool = field(default=False, init=False)
+    _probe_started: float = field(default=0.0, init=False)
+    """When the in-flight probe was admitted, so an abandoned one cannot hold the
+    gate shut for the rest of the process."""
 
     @property
     def is_open(self) -> bool:
+        """Whether calls should be refused. Admits exactly one probe.
+
+        The "single probe" this class documents was every concurrent request in
+        the window: the cooldown check set ``_half_open`` and returned ``False``
+        without closing the gate behind it, so N in-flight requests all read
+        ``is_open == False`` and all hit a store that was very likely still down.
+        That is the thundering herd a breaker exists to prevent, and it arrived
+        precisely when the dependency was at its most fragile.
+
+        The probe has its own deadline. A probe that never reports — a crash, a
+        cancelled request, a caller that forgot to call ``record_*`` — would
+        otherwise hold the gate shut forever, converting a transient outage into a
+        permanent one.
+        """
         if self._failures < self.failure_threshold:
             return False
-        if time.monotonic() - self._opened_at >= self.reset_timeout_s:
+        now = time.monotonic()
+        if self._half_open:
+            if now - self._probe_started < self.reset_timeout_s:
+                return True
+            log.warning("circuit_probe_abandoned", name=self.name)
+            self._half_open = False
+        if now - self._opened_at >= self.reset_timeout_s:
             self._half_open = True
+            self._probe_started = now
             return False
         return True
 

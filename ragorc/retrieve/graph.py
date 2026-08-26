@@ -79,6 +79,7 @@ instead of penalizing every candidate equally.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -825,6 +826,22 @@ class GraphLocalRetriever:
 # ---------------------------------------------------------------------------
 # Global search
 # ---------------------------------------------------------------------------
+_GLOBAL_USAGE: ContextVar[Usage] = ContextVar("ragorc_graph_global_usage")
+"""This request's global-search bill.
+
+A context variable rather than an instance attribute. ``PipelineNodes`` reads
+``retriever.usage`` immediately after awaiting ``retrieve`` — same task, so a
+value set inside ``retrieve`` is visible — while a *concurrent* request runs in
+its own task with its own context and cannot see or clobber it.
+
+As an attribute it was neither. ``retrieve`` reset ``self.usage`` at the top and
+accumulated into it, and the retriever is built once and shared, so two
+concurrent queries reset each other's counter and then summed into one field:
+each request reported a bill containing the other's calls, or lost its own.
+Cost attribution that silently mixes requests is worse than absent, because it
+is still reported."""
+
+
 @register("retriever", "graph_global")
 class GraphGlobalRetriever:
     """Map-reduce over community summaries.
@@ -862,7 +879,11 @@ class GraphGlobalRetriever:
         encodes importance."""
         self.router = router or ModelRouter(self.settings.llm)
         self.prompt = get_prompt("global_map")
-        self.usage = Usage()
+
+    @property
+    def usage(self) -> Usage:
+        """This request's bill. Empty before the first retrieval in this task."""
+        return _GLOBAL_USAGE.get(Usage())
 
     async def retrieve(
         self, query: Query, *, top_k: int | None = None, **kwargs: Any
@@ -872,7 +893,7 @@ class GraphGlobalRetriever:
         require_graph_tenant_isolation("global search", self.settings)
         cfg = self.settings.graph
         cap = int(cfg.global_search_top_communities)
-        self.usage = Usage()
+        _GLOBAL_USAGE.set(Usage())
 
         communities = [
             c for c in await self.graph.communities(level=self.level, limit=cap) if c.summary
@@ -898,8 +919,9 @@ class GraphGlobalRetriever:
             )
 
         partials: list[ScoredChunk] = []
+        spent = Usage()
         for community, answer, usage in results:
-            self.usage = self.usage + usage
+            spent = spent + usage
             # A zero score is the prompt's explicit "this community contributes
             # nothing". Keeping it would poison the reduce step with confident
             # irrelevance, which is the failure mode the map prompt is written to
@@ -914,10 +936,11 @@ class GraphGlobalRetriever:
         for rank, item in enumerate(partials):
             item.rank = rank
 
+        _GLOBAL_USAGE.set(spent)
         trace_step(
             "retrieve.graph_global",
             duration_ms=timer.elapsed_ms,
-            usage=self.usage,
+            usage=spent,
             communities=len(communities),
             partials=len(partials),
             failed=len(errors),
@@ -928,7 +951,7 @@ class GraphGlobalRetriever:
             partials=len(partials),
             dropped=len(results) - len(partials),
             failed=len(errors),
-            cost_usd=round(self.usage.cost_usd, 6),
+            cost_usd=round(spent.cost_usd, 6),
         )
         return partials
 
