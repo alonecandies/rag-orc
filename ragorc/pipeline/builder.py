@@ -110,6 +110,7 @@ from ragorc.retrieve.hybrid import HybridRetriever
 from ragorc.retrieve.rerank import build_reranker
 from ragorc.security.audit import AuditLog
 from ragorc.security.ratelimit import KeyedRateLimiter
+from ragorc.security.tenancy import graph_legs_refused
 from ragorc.translate import build_translators
 
 log = structlog.get_logger(__name__)
@@ -892,7 +893,20 @@ class RAGPipeline:
         s = self.settings
         crag = s.retrieval.crag_enabled
         self_rag = s.generation.self_rag_enabled
-        graph_on = s.graph.enabled
+        graph_on = s.graph.enabled and not graph_legs_refused(s)
+        # ``auto`` must not select a pipeline that is guaranteed to be refused.
+        # With tenant isolation on and ``graph_tenant_isolation='reject'`` every
+        # graph leg raises, so choosing ``graphrag`` here would turn a
+        # configuration decision into a 400 on every query. An explicitly
+        # requested ``graphrag`` still reaches the guard and still refuses —
+        # asking for it by name deserves the real error, not a silent
+        # substitution.
+        if s.graph.enabled and not graph_on:
+            log.warning(
+                "graph_pipeline_not_selectable",
+                reason="tenant isolation is enforced and security.graph_tenant_isolation='reject'",
+                hint="set security.graph_tenant_isolation='trusted' for one graph per tenant",
+            )
 
         if crag and self_rag:
             name, reason = "agentic", "crag and self_rag both enabled"

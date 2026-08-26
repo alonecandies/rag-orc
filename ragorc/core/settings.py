@@ -424,11 +424,46 @@ class SecuritySettings(BaseModel):
     silently searching every tenant's data.
 
     Covers the vector store by construction (every filter is built through
-    :func:`~ragorc.security.tenancy.scope_filter`). It cannot cover *generated*
-    SQL or Cypher the same way: those run against the operator's own schema, and
+    :func:`~ragorc.security.tenancy.scope_filter`). It does **not** cover the
+    knowledge graph: nothing written to Neo4j carries a tenant, so
+    ``graph_tenant_isolation`` governs that leg. Nor can it cover *generated*
+    SQL or Cypher: those run against the operator's own schema, and
     this library cannot know which column of ``orders`` carries a tenant — or
     whether the concept exists there at all. So those legs **fail closed** unless
     ``generated_query_isolation`` declares how isolation is enforced."""
+
+    graph_tenant_isolation: Literal["reject", "trusted"] = "reject"
+    """How tenant isolation is enforced for the **knowledge graph** legs.
+
+    A separate setting from ``generated_query_isolation``, because it is a
+    separate problem with the same shape. That one covers Cypher an LLM *wrote*;
+    this covers the parameterized traversals in
+    :class:`~ragorc.stores.neo4j.store.Neo4jStore` that GraphRAG local, global
+    and DRIFT search, and the multi-hop bridge, all run.
+
+    Neo4j holds no tenant at all. Entities are merged on ``name``, communities on
+    a membership hash, and chunk links on a chunk id — none of them namespaced —
+    so two tenants writing about the same company converge on one node and a
+    traversal from it reaches both. The chunk ids it yields then went through an
+    unscoped by-id fetch, and the verbalized subgraph it returns is built from
+    every tenant's entity descriptions while being *stamped* with the querying
+    tenant's id.
+
+    ``reject``   — refuse the graph legs while tenant isolation is on. The
+                   default, because it is the only setting that is true without
+                   the operator having done something.
+    ``trusted``  — the graph holds one tenant's data: a Neo4j instance or
+                   database per tenant, or a single-tenant deployment that has
+                   isolation on for other reasons. An explicit assertion, so it
+                   cannot be arrived at by accident.
+
+    There is deliberately no ``rls``-equivalent. Making the graph multi-tenant is
+    a schema change — entity identity has to become ``(tenant, name)``, which
+    changes every MERGE, every traversal predicate and the fulltext index, and
+    needs a migration for graphs already built — not a filter this library can
+    add at query time. Pretending otherwise would provide the appearance of
+    isolation, which is worse than a refusal an operator can see.
+    """
 
     generated_query_isolation: Literal["reject", "database", "rls", "trusted"] = "reject"
     """How tenant isolation is enforced for *generated* SQL and Cypher.

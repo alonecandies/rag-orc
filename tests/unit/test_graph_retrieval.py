@@ -122,15 +122,23 @@ class ChunkBodies(FakeVectorStore):
         super().__init__()
         self.fail = False
         self.requested: list[list[str]] = []
+        self.requested_tenants: list[str | None] = []
 
-    async def get(self, ids: Sequence[str], *, with_vectors: bool = False) -> list[Chunk]:
+    async def get(
+        self,
+        ids: Sequence[str],
+        *,
+        with_vectors: bool = False,
+        tenant_id: str | None = None,
+    ) -> list[Chunk]:
         if self.fail:
             raise StoreUnavailable("qdrant", "chunk store offline")
         self.requested.append(list(ids))
+        self.requested_tenants.append(tenant_id)
         # Forwarded, not swallowed. Ignoring it made a real bug untestable: code
         # that stops asking for vectors still got them here, so removing the
         # similarity term left every test green.
-        return await super().get(ids, with_vectors=with_vectors)
+        return await super().get(ids, with_vectors=with_vectors, tenant_id=tenant_id)
 
 
 def graph_settings(**graph: Any) -> Settings:

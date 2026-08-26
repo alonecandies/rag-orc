@@ -475,8 +475,13 @@ class PostgresStore:
     # ------------------------------------------------------------------
     # Reads by key
     # ------------------------------------------------------------------
-    async def get_chunks(self, ids: Sequence[str]) -> list[Chunk]:
+    async def get_chunks(self, ids: Sequence[str], *, tenant_id: str | None = None) -> list[Chunk]:
         """Fetch by id, preserving the caller's order.
+
+        Scoped like every other read here. It was the exception: ``= ANY(array)``
+        with no tenant predicate, so naming a chunk id fetched its body whoever
+        owned it — and the ids on the GraphRAG path come out of Neo4j, which
+        stores no tenant at all.
 
         ``= ANY(array)`` is one index scan over a passed-in array rather than N
         statements or an ``IN`` list that changes shape per call and therefore
@@ -487,15 +492,18 @@ class PostgresStore:
         wanted = list(dict.fromkeys(ids))
         if not wanted:
             return []
+        params: dict[str, Any] = {"ids": wanted}
+        clauses = self._filter_clauses(None, tenant_id, alias="c", params=params)
+        clauses.append(SQL("c.id = ANY({ids})").format(ids=Placeholder("ids")))
         statement = SQL(
-            "SELECT {cols} FROM {tbl} AS c WHERE c.id = ANY({ids}) "
-            "ORDER BY array_position({ids}, c.id)"
+            "SELECT {cols} FROM {tbl} AS c {where} ORDER BY array_position({ids}, c.id)"
         ).format(
             cols=_qualified_columns("c"),
             tbl=self._chunks,
+            where=_where(clauses),
             ids=Placeholder("ids"),
         )
-        rows = await self._fetch(statement, {"ids": wanted})
+        rows = await self._fetch(statement, params)
         return [_row_to_chunk(row) for row in rows]
 
     async def get_children(self, parent_id: str, *, tenant_id: str | None = None) -> list[Chunk]:

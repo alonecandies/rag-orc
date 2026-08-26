@@ -96,6 +96,7 @@ from ragorc.retrieve.graph import (
     max_scale,
     verbalize_relations,
 )
+from ragorc.security.tenancy import require_graph_tenant_isolation
 
 log = structlog.get_logger(__name__)
 
@@ -496,6 +497,7 @@ class BridgeEntityRetriever:
             # A single call: the store's path query matches every start against
             # every end with ``a <> b``, so all pairs are covered in one round trip
             # instead of one per pair.
+            require_graph_tenant_isolation("bridge search", self.settings)
             paths = await self.graph.paths(
                 names,
                 names,
@@ -533,6 +535,7 @@ class BridgeEntityRetriever:
         noise rather than a second subject.
         """
         cap = max(2, self.settings.graph.multihop_beam_width)
+        require_graph_tenant_isolation("bridge search", self.settings)
         hits = await self.graph.fulltext_entities(query.text, limit=cap * 2)
         if not hits:
             return []

@@ -82,6 +82,7 @@ from ragorc.core.protocols import DenseEmbedder, LateInteractionEmbedder, Sparse
 from ragorc.core.registry import register
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import timed
+from ragorc.security.tenancy import require_tenant
 from ragorc.stores.qdrant.client import build_client, release_client
 from ragorc.stores.qdrant.collections import (
     COLBERT_VECTOR,
@@ -929,15 +930,38 @@ class QdrantStore:
         if multi:
             chunk.multi = np.asarray(multi, dtype=np.float32)
 
-    async def get(self, ids: Sequence[str], *, with_vectors: bool = False) -> list[Chunk]:
+    async def get(
+        self,
+        ids: Sequence[str],
+        *,
+        with_vectors: bool = False,
+        tenant_id: str | None = None,
+    ) -> list[Chunk]:
         """Fetch chunks by id, in the order requested.
 
         Missing ids are skipped rather than returned as ``None``: the parent
         retriever's expansion set routinely names chunks that a later ingest
         replaced, and a hole in the list is not useful to any caller.
+
+        A chunk belonging to another tenant is skipped the same way. This read
+        used to be the one unscoped door into the collection: ``search`` builds
+        every filter through :func:`~ragorc.security.tenancy.with_tenant`, but an
+        id is not a filter, so naming a chunk fetched it. That matters because the
+        ids handed here are not always the caller's own — GraphRAG resolves them
+        out of Neo4j, which stores no tenant at all.
+
+        Filtered after the fetch rather than in the request because
+        ``client.retrieve`` takes no filter. The payload is the authority on
+        ownership (it is what ``search`` filters on), so this is the same
+        predicate applied one layer later, and the cost is bounded by the number
+        of ids asked for.
         """
         if not ids:
             return []
+        # ``require_tenant`` rather than a bare ``or``: with isolation on and no
+        # tenant resolvable this must fail closed, exactly as a filtered read
+        # would, instead of quietly fetching across every tenant.
+        scope = require_tenant(tenant_id or self.settings.tenant_id, self.settings.security)
         point_ids = [_point_id(i) for i in ids]
         records = await self._guard(
             "get",
@@ -957,6 +981,13 @@ class QdrantStore:
             # Reconstruct with the id the caller asked for, which is the id the
             # rest of the pipeline (and Postgres, and Neo4j) knows.
             chunk = _chunk_from_payload(original, record.payload)
+            if scope is not None and chunk.tenant_id != scope:
+                log.warning(
+                    "qdrant_get_cross_tenant_skipped",
+                    requested=scope,
+                    owner=chunk.tenant_id,
+                )
+                continue
             if with_vectors:
                 self._attach_vectors(chunk, record.vector)
             out.append(chunk)

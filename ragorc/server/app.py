@@ -127,6 +127,7 @@ from ragorc.security.audit import AuditLog
 from ragorc.security.ratelimit import KeyedRateLimiter
 from ragorc.security.tenancy import (
     ANONYMOUS,
+    graph_isolation_warning,
     principal_for_key,
     resolve_tenant,
     scope_filter,
@@ -1378,6 +1379,9 @@ class RagService:
         unbound = unbound_principals_warning(self.settings)
         if unbound:
             warnings.append(unbound)
+        refused = graph_isolation_warning(self.settings)
+        if refused:
+            warnings.append(refused)
 
         return HealthResponse(
             status="degraded" if degraded else "ok",

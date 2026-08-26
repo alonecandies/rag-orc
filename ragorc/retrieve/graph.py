@@ -108,6 +108,7 @@ from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import Timer, timed, trace_step
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.tenancy import require_graph_tenant_isolation
 
 log = structlog.get_logger(__name__)
 
@@ -240,9 +241,18 @@ class ChunkStore(Protocol):
 
 
 async def load_chunks(
-    source: ChunkStore | Any, ids: Sequence[str], *, with_vectors: bool = False
+    source: ChunkStore | Any,
+    ids: Sequence[str],
+    *,
+    with_vectors: bool = False,
+    tenant_id: str | None = None,
 ) -> list[Chunk]:
     """Resolve chunk ids to chunk bodies from either store.
+
+    ``tenant_id`` is the chokepoint. The ids reaching here come from the graph,
+    which stores no tenant, so they can name any tenant's chunk; both stores'
+    by-id reads were unfiltered, and the bodies came back. Scoping the fetch
+    means a foreign id resolves to nothing instead of to content.
 
     Qdrant spells this ``get`` (the :class:`~ragorc.core.protocols.VectorStore`
     protocol); Postgres spells it ``get_chunks`` and has no vectors to hand back
@@ -255,7 +265,7 @@ async def load_chunks(
         return []
     getter = getattr(source, "get", None)
     if getter is not None:
-        return await getter(wanted, with_vectors=with_vectors)
+        return await getter(wanted, with_vectors=with_vectors, tenant_id=tenant_id)
     getter = getattr(source, "get_chunks", None)
     if getter is None:
         raise RetrievalError(
@@ -419,6 +429,7 @@ class GraphLocalRetriever:
         question, and it is the case DRIFT exists to cover; failing here would
         take down a fan-out that the vector leg was going to answer anyway.
         """
+        require_graph_tenant_isolation("local search", self.settings)
         cfg = self.settings.graph
         seeds = await self.graph.fulltext_entities(query.text, limit=cfg.local_search_top_entities)
         if not seeds:
@@ -441,6 +452,10 @@ class GraphLocalRetriever:
         identical. Returns the chunks plus a diagnostics dict, so a composite
         retriever can report what the traversal found and what it lost.
         """
+        # Guarded here as well as in :meth:`retrieve`, because this is the shared
+        # entry point: DRIFT seeds with a vector search and then calls ``expand``
+        # directly, so a guard on ``retrieve`` alone leaves that path open.
+        require_graph_tenant_isolation("local search", self.settings)
         cfg = self.settings.graph
         limit = int(top_k or cfg.local_search_top_chunks)
         seed_weights = self._seed_weights(seeds)
@@ -465,7 +480,9 @@ class GraphLocalRetriever:
             candidates = self._candidates(by_name, relations, weights, limit)
             detail["candidate_chunks"] = len(candidates)
 
-            bodies = await self._load(list(candidates), detail)
+            bodies = await self._load(
+                list(candidates), detail, tenant_id=query.tenant_id or self.settings.tenant_id
+            )
             await self._ensure_query_vector(query, detail, comparable=bool(bodies))
             scored = self._rank(query, candidates, bodies, by_name, limit)
 
@@ -622,19 +639,26 @@ class GraphLocalRetriever:
             for cid in ranked
         }
 
-    async def _load(self, ids: Sequence[str], detail: dict[str, Any]) -> dict[str, Chunk]:
+    async def _load(
+        self, ids: Sequence[str], detail: dict[str, Any], *, tenant_id: str | None
+    ) -> dict[str, Chunk]:
         """Fetch chunk bodies, degrading to the verbalized subgraph if we cannot.
 
         Vectors are requested because the similarity term needs them; a store that
         does not carry them simply makes that term unavailable and its weight is
         redistributed over the other two.
+
+        ``tenant_id`` is a required keyword rather than a lookup on ``detail``:
+        these ids came from the graph, which stores no tenant, so this fetch is
+        the last place a foreign chunk can be stopped. A parameter that must be
+        supplied is harder to forget than a dict key that defaults to ``None``.
         """
         if not ids or self.chunks is None:
             if ids and self.chunks is None:
                 detail["degraded"].append("no_chunk_store")
             return {}
         try:
-            bodies = await load_chunks(self.chunks, ids, with_vectors=True)
+            bodies = await load_chunks(self.chunks, ids, with_vectors=True, tenant_id=tenant_id)
         except StoreUnavailable as exc:
             detail["degraded"].append("chunk_store")
             log.warning("graph_local_chunk_load_degraded", error=str(exc)[:200])
@@ -843,6 +867,9 @@ class GraphGlobalRetriever:
     async def retrieve(
         self, query: Query, *, top_k: int | None = None, **kwargs: Any
     ) -> list[ScoredChunk]:
+        # Community ids are a hash of level plus membership with no tenant in
+        # them, so ``communities()`` returns every tenant's reports.
+        require_graph_tenant_isolation("global search", self.settings)
         cfg = self.settings.graph
         cap = int(cfg.global_search_top_communities)
         self.usage = Usage()

@@ -162,9 +162,17 @@ class RecordingChunkStore:
         self.unavailable = unavailable
         self.asked: list[list[str]] = []
         self.asked_with_vectors: list[bool] = []
+        self.asked_tenants: list[str | None] = []
 
-    async def get(self, ids: Sequence[str], *, with_vectors: bool = False) -> list[Chunk]:
+    async def get(
+        self,
+        ids: Sequence[str],
+        *,
+        with_vectors: bool = False,
+        tenant_id: str | None = None,
+    ) -> list[Chunk]:
         self.asked.append(list(ids))
+        self.asked_tenants.append(tenant_id)
         self.asked_with_vectors.append(with_vectors)
         if self.unavailable:
             raise StoreUnavailable("qdrant")

@@ -147,17 +147,30 @@ class FakeVectorStore:
             item.component_scores = {"dense": item.score}
         return out
 
-    async def get(self, ids: Sequence[str], *, with_vectors: bool = False) -> list[Chunk]:
-        """Chunk bodies by id, modelling Qdrant's ``with_vectors``.
+    async def get(
+        self,
+        ids: Sequence[str],
+        *,
+        with_vectors: bool = False,
+        tenant_id: str | None = None,
+    ) -> list[Chunk]:
+        """Chunk bodies by id, modelling Qdrant's ``with_vectors`` and its scope.
 
         The flag is honoured rather than accepted-and-ignored, because ignoring it
         makes a whole class of bug untestable: production code that stops asking
         for vectors gets them anyway from the fake, so a change that silently
         deletes a similarity term against real Qdrant leaves every test green.
         Asked without vectors, a real point comes back without them.
+
+        ``tenant_id`` is enforced for the same reason, and it is the newer of the
+        two lessons: a by-id read that accepted a tenant and ignored it would let
+        the cross-tenant leak this parameter exists to close reappear with every
+        test still passing.
         """
         self.get_calls.append((list(ids), with_vectors))
         found = [self.chunks[i] for i in ids if i in self.chunks]
+        if tenant_id is not None:
+            found = [c for c in found if c.tenant_id == tenant_id]
         if with_vectors:
             return found
         return [replace(chunk, dense=None, sparse=None, multi=None) for chunk in found]

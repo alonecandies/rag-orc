@@ -472,3 +472,61 @@ async def test_neo4j_prunes_superseded_communities_but_not_other_batches(
                 label="cleanup",
             )
         await store.close()
+
+
+async def test_by_id_chunk_reads_are_scoped_in_both_stores(settings: Settings) -> None:
+    """An id is not a filter, and both by-id reads used to prove it.
+
+    `search` builds every filter through `with_tenant`/`_filter_clauses`, so the
+    query paths were scoped. `QdrantStore.get` issued a bare `client.retrieve`
+    and `PostgresStore.get_chunks` a bare `= ANY(array)`, so *naming* a chunk
+    fetched its body whoever owned it. That is reachable because the ids on the
+    GraphRAG path are resolved out of Neo4j, which stores no tenant at all.
+
+    Both stores, against the live servers, because this is a filter-generation
+    claim and the fakes cannot settle it.
+    """
+    from ragorc.stores.postgres.store import PostgresStore
+    from ragorc.stores.qdrant.store import QdrantStore
+
+    dim = settings.embedding.dense_dimension
+    tag = uuid.uuid4().hex[:8]
+    mine, theirs = f"mine-{tag}", f"theirs-{tag}"
+
+    def chunk(cid: str, tenant: str, text: str) -> Chunk:
+        c = Chunk(id=cid, content=text, document_id=f"doc-{tenant}-{tag}", tenant_id=tenant)
+        c.dense = np.ones(dim, dtype=np.float32) / np.sqrt(dim)
+        return c
+
+    rows = [chunk(mine, "globex", "globex public note"), chunk(theirs, "acme", "ACME CONFIDENTIAL")]
+
+    vector = QdrantStore(settings=settings)
+    relational = PostgresStore(settings=settings)
+    try:
+        await vector.ensure_collection()
+        await relational.ensure_schema()
+        await vector.upsert(rows)
+        await relational.upsert_documents(
+            [Document(id=f"doc-{t}-{tag}", content="x", tenant_id=t) for t in ("globex", "acme")]
+        )
+        await relational.upsert_chunks(rows)
+
+        for name, got in (
+            ("qdrant", await vector.get([mine, theirs], tenant_id="globex")),
+            ("postgres", await relational.get_chunks([mine, theirs], tenant_id="globex")),
+        ):
+            ids = [c.id for c in got]
+            assert theirs not in ids, f"{name} returned another tenant's chunk by id: {ids}"
+            assert ids == [mine], f"{name} lost the caller's own chunk: {ids}"
+
+        # Unscoped, both are still reachable — the parameter is what scopes it,
+        # so a caller that omits it (single-tenant, isolation off) is unaffected.
+        assert len(await vector.get([mine, theirs])) == 2
+    finally:
+        with contextlib.suppress(Exception):
+            await vector.drop_collection()
+        with contextlib.suppress(Exception):
+            for t in ("globex", "acme"):
+                await relational.delete_document(f"doc-{t}-{tag}")
+        await vector.close()
+        await relational.close()

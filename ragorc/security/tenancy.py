@@ -35,8 +35,10 @@ from ragorc.core.settings import SecuritySettings, Settings, get_settings
 log = structlog.get_logger(__name__)
 
 __all__ = [
+    "graph_legs_refused",
     "principal_for_key",
     "require_generated_query_isolation",
+    "require_graph_tenant_isolation",
     "require_tenant",
     "resolve_tenant",
     "scope_cypher_where",
@@ -179,6 +181,84 @@ def scope_cypher_where(tenant_id: str | None, *, var: str = "n") -> tuple[str, d
     if not tenant:
         return "true", {}
     return f"{var}.tenant_id = $tenant_id", {"tenant_id": tenant}
+
+
+def graph_legs_refused(settings: Settings | None = None) -> bool:
+    """Would a graph leg be refused right now?
+
+    The predicate behind :func:`require_graph_tenant_isolation`, exposed so
+    callers that need to *decide* rather than *enforce* — pipeline auto-selection,
+    the ``/health`` warning — can ask without catching an exception. Control flow
+    through a guard's exception is how a guard ends up being caught and ignored.
+    """
+    from ragorc.core.settings import get_settings as _get_settings
+
+    resolved = settings or _get_settings()
+    return (
+        resolved.security.enforce_tenant_isolation
+        and resolved.security.graph_tenant_isolation == "reject"
+    )
+
+
+def graph_isolation_warning(settings: Settings | None = None) -> str | None:
+    """The ``/health`` line for "the graph is configured but cannot be used"."""
+    resolved = settings or _settings_for_warning(settings)
+    if not resolved.graph.enabled or not graph_legs_refused(resolved):
+        return None
+    return (
+        "graph.enabled is on but every graph leg is refused: tenant isolation is "
+        "enforced and security.graph_tenant_isolation='reject' (the graph stores "
+        "no tenant, so a traversal cannot be scoped)"
+    )
+
+
+def _settings_for_warning(settings: Settings | None) -> Settings:
+    from ragorc.core.settings import get_settings as _get_settings
+
+    return settings or _get_settings()
+
+
+def require_graph_tenant_isolation(target: str, settings: Settings | None = None) -> None:
+    """Refuse a knowledge-graph leg that cannot honour tenant isolation.
+
+    The same asymmetry :func:`require_generated_query_isolation` closes, one path
+    over, and it survived that fix because the graph *retrieval* legs run
+    parameterized Cypher rather than generated Cypher — so the guard written for
+    generated statements never covered them.
+
+    Nothing in Neo4j carries a tenant. Entities merge on ``name``, communities on
+    a membership hash, chunk links on a chunk id; none is namespaced. Two tenants
+    writing about the same company converge on one node, and a traversal from it
+    reaches both. Reproduced end to end: a query scoped to one tenant returned
+    another tenant's chunk body verbatim, and the verbalized subgraph carried a
+    third party's entity descriptions while being *stamped* with the querying
+    tenant's id — which is worse than an unlabelled leak, because the label says
+    the content is yours.
+
+    Refusing is the honest default, for the reason the sibling guard gives:
+    scoping this properly is a schema change (entity identity becomes
+    ``(tenant, name)``, with a migration for existing graphs), and a filter
+    bolted on at query time would provide the appearance of isolation.
+    """
+    from ragorc.core.settings import get_settings as _get_settings
+
+    resolved = settings or _get_settings()
+    if not resolved.security.enforce_tenant_isolation:
+        return
+    if resolved.security.graph_tenant_isolation != "reject":
+        log.debug(
+            "graph_tenant_isolation", target=target, mode=resolved.security.graph_tenant_isolation
+        )
+        return
+    raise GuardrailViolation(
+        f"graph {target} is disabled while tenant isolation is enforced",
+        rule="graph_tenant_isolation",
+        hint=(
+            "the knowledge graph stores no tenant, so a traversal cannot be scoped; "
+            "run one graph per tenant and set security.graph_tenant_isolation='trusted', "
+            "or leave the graph legs off"
+        ),
+    )
 
 
 def require_generated_query_isolation(target: str, settings: Settings | None = None) -> None:
