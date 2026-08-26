@@ -97,6 +97,7 @@ from ragorc.core.protocols import Cache
 from ragorc.core.registry import register
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import timed
+from ragorc.security.tenancy import require_tenant
 from ragorc.stores.postgres.ddl import (
     CHUNK_COLUMNS,
     CHUNK_READ_COLUMNS,
@@ -731,23 +732,27 @@ class PostgresStore:
         operation the ``jsonb_path_ops`` index can answer and therefore the only
         metadata predicate worth generating.
 
-        Tenant resolution falls back to ``Settings.tenant_id``. When
-        ``security.enforce_tenant_isolation`` is on and no tenant is resolvable
-        the query still runs but is logged: rejecting it belongs to the guard
-        layer, which sees the request, while this layer only sees a filter dict —
-        and a store that refuses to answer by default is a store nobody can boot.
+        Tenant resolution falls back to ``Settings.tenant_id``, and then
+        **refuses**. This used to log a warning and emit no predicate — deferring
+        to the guard layer, "which sees the request, while this layer only sees a
+        filter dict". That reasoning holds only for as long as every path reaches
+        the guard, which is a property of the callers rather than of this code,
+        and the graph path turned out not to. A store that answers unscoped when
+        told to isolate is the one thing tenancy cannot afford to leave to a
+        convention.
+
+        The boot argument it replaced does not apply: ``enforce_tenant_isolation``
+        is off by default, so nothing refuses until an operator asks for it.
         """
         clauses: list[Composable] = []
-        tenant = tenant_id if tenant_id is not None else self.settings.tenant_id
+        tenant = require_tenant(
+            tenant_id if tenant_id is not None else self.settings.tenant_id,
+            self.settings.security,
+        )
         if tenant:
             params["tenant"] = tenant
             clauses.append(
                 SQL("{col} = {ph}").format(col=_col(alias, "tenant_id"), ph=Placeholder("tenant"))
-            )
-        elif self.settings.security.enforce_tenant_isolation:
-            log.warning(
-                "pg_query_without_tenant",
-                hint="security.enforce_tenant_isolation is on but no tenant_id was supplied",
             )
 
         metadata: dict[str, Any] = {}

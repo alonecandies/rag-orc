@@ -116,6 +116,11 @@ from ragorc.translate import build_translators
 
 log = structlog.get_logger(__name__)
 
+_MISSING = object()
+"""Distinguishes "declares no such attribute" from "declares it as None".
+``getattr(x, "cache", None)`` cannot tell those apart, and only the second
+is an invitation to fill it in."""
+
 _GENERATE_NODE = "generate"
 """The synthesis node, named identically in all seven graphs.
 
@@ -541,6 +546,15 @@ class RAGPipeline:
     def reranker(self) -> Any:
         if self._reranker is None:
             self._reranker = build_reranker(llm=self.llm, settings=self.settings)
+            # Same post-attach the HTTP engine does. Without it
+            # ``cache.cache_rerank`` was on by default and reached nothing on this
+            # path: ``CrossEncoderReranker.cache_enabled`` requires a backend, the
+            # factory takes none, and nobody supplied one afterwards. Attached
+            # here rather than threaded through the factory for the reason the
+            # HTTP engine gives — restating the factory's alias table would stop
+            # matching the day a spelling is added.
+            if getattr(self._reranker, "cache", _MISSING) is None:
+                self._reranker.cache = self.cache  # type: ignore[attr-defined]
         return self._reranker
 
     @property

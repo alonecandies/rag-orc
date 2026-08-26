@@ -113,6 +113,17 @@ def build_client(settings: Settings | QdrantSettings | None = None) -> AsyncQdra
         content_hash(api_key or "", size=8),
     )
 
+    # Sweep first. Eviction below only fires on a *lookup of the same key*, and
+    # the key contains ``id(loop)`` — so a client whose loop has finished is
+    # looked up under a different key forever and is never reached. The check the
+    # docstring describes could not run for the case it names, and `_CLIENTS`
+    # grew one entry per loop for the process lifetime. The map holds a handful
+    # of entries, so scanning it is cheaper than the leak.
+    for dead_key, (dead_client, dead_owner) in list(_CLIENTS.items()):
+        if _is_dead(dead_client, dead_owner):
+            del _CLIENTS[dead_key]
+            log.info("qdrant_client_evicted", reason="closed_or_dead_loop")
+
     cached = _CLIENTS.get(key)
     if cached is not None:
         client, owner = cached

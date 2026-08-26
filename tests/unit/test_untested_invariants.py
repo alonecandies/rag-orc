@@ -19,6 +19,7 @@ them in place.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -394,3 +395,85 @@ async def test_concurrent_global_searches_do_not_share_a_bill() -> None:
     assert all(c == calls[0] for c in calls)
     assert calls[0] > 0, "no calls were billed, so this proves nothing"
     assert calls[0] <= 3, f"one request was billed for {calls[0]} community calls, not 3"
+
+
+def test_the_relational_store_fails_closed_like_every_other_store() -> None:
+    """`_filter_clauses` logged a warning and emitted no predicate, deferring to
+    "the guard layer, which sees the request".
+
+    That holds only while every path reaches the guard, which is a property of
+    the callers rather than of this code — and the graph path turned out not to.
+    A store that answers unscoped when told to isolate is the one thing tenancy
+    cannot leave to convention.
+    """
+    from ragorc.core.errors import GuardrailViolation
+    from ragorc.core.settings import Settings
+    from ragorc.stores.postgres.store import PostgresStore
+
+    store = PostgresStore(
+        settings=Settings(security={"enforce_tenant_isolation": True}, llm={"api_key": "k"})
+    )
+    with pytest.raises(GuardrailViolation, match="tenant_id is required"):
+        store._filter_clauses(None, None, alias="c", params={})
+
+    # Named, and it scopes. Off, and it does not refuse — the boot argument the
+    # old comment made only applies when isolation is on, which is not the default.
+    assert store._filter_clauses(None, "acme", alias="c", params={})
+    off = PostgresStore(
+        settings=Settings(security={"enforce_tenant_isolation": False}, llm={"api_key": "k"})
+    )
+    assert off._filter_clauses(None, None, alias="c", params={}) == []
+
+
+def test_the_qdrant_client_cache_evicts_a_client_whose_loop_has_gone() -> None:
+    """Eviction only fired on a lookup of the *same* key, and the key contains
+    `id(loop)` — so a client whose loop finished was looked up under a different
+    key forever and never reached. The check could not run for the case its own
+    docstring names, and the map grew one entry per loop for the process
+    lifetime."""
+    import asyncio
+
+    from ragorc.stores.qdrant import client as mod
+
+    class _Dead:
+        """A client whose inner handle reports closed."""
+
+        def __init__(self) -> None:
+            self._client = type("Inner", (), {"closed": True})()
+
+    loop = asyncio.new_event_loop()
+    loop.close()
+    stale_key = (id(loop), "http://gone.invalid", False, 6334, 30, "deadbeef")
+    mod._CLIENTS[stale_key] = (_Dead(), loop)
+
+    assert mod._is_dead(*mod._CLIENTS[stale_key]), "the fixture is not actually dead"
+
+    async def build_one() -> None:
+        # Any build sweeps; this one lands under a different key.
+        with contextlib.suppress(Exception):
+            mod.build_client()
+
+    asyncio.run(build_one())
+
+    assert stale_key not in mod._CLIENTS, "a client on a finished loop was never evicted"
+
+
+def test_cache_rerank_reaches_the_reranker_on_the_library_path() -> None:
+    """`cache.cache_rerank` is on by default and reached nothing through
+    `RAGPipeline`: `CrossEncoderReranker.cache_enabled` requires a backend, the
+    factory takes none, and only the HTTP engine attached one afterwards."""
+    from ragorc.core.settings import Settings
+    from ragorc.pipeline.builder import RAGPipeline
+
+    pipeline = RAGPipeline(
+        settings=Settings(
+            security={"enforce_tenant_isolation": False},
+            cache={"enabled": True, "cache_rerank": True},
+            llm={"api_key": "k"},
+            retrieval={"rerank": "cross_encoder"},
+        )
+    )
+    reranker = pipeline.reranker
+    if not hasattr(reranker, "cache"):
+        pytest.skip("the configured reranker declares no cache slot")
+    assert reranker.cache is not None, "cache_rerank is on and the backend was never attached"
