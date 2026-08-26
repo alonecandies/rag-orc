@@ -110,7 +110,7 @@ from ragorc.retrieve.hybrid import HybridRetriever
 from ragorc.retrieve.rerank import build_reranker
 from ragorc.security.audit import AuditLog
 from ragorc.security.ratelimit import KeyedRateLimiter
-from ragorc.security.tenancy import graph_legs_refused
+from ragorc.security.tenancy import graph_legs_refused, require_tenant
 from ragorc.translate import build_translators
 
 log = structlog.get_logger(__name__)
@@ -1033,7 +1033,7 @@ class RAGPipeline:
                 question, tenant_id=tenant_id, top_k=top_k, pipeline=pipeline
             )
 
-        tenant = tenant_id or self.settings.tenant_id
+        tenant = self._scoped_tenant(tenant_id)
         request_id = uuid.uuid4().hex[:16]
         cost = self.settings.cost
         with new_request_context(
@@ -1094,7 +1094,7 @@ class RAGPipeline:
         that every model call is accounted for.
         """
         self._ensure_open()
-        tenant = tenant_id or self.settings.tenant_id
+        tenant = self._scoped_tenant(tenant_id)
         request_id = uuid.uuid4().hex[:16]
         cost = self.settings.cost
         with new_request_context(
@@ -1273,6 +1273,27 @@ class RAGPipeline:
     # ------------------------------------------------------------------
     # Semantic cache
     # ------------------------------------------------------------------
+    def _scoped_tenant(self, tenant_id: str | None) -> str | None:
+        """Resolve the tenant for this request, refusing if isolation demands one.
+
+        Called before anything else in :meth:`query` and :meth:`stream`, and that
+        position is the point. ``require_tenant`` also runs in the graph's first
+        node, which is where every *retrieval* path meets it — but the semantic
+        cache is consulted before the graph is invoked, so a cache hit answered
+        the request with the guard never having run.
+
+        The two failures compounded. With no tenant resolvable,
+        :meth:`SemanticCache.get` also drops its tenant predicate — the filter is
+        built under ``if tenant_id:`` — so the lookup matched *any* tenant's entry.
+        A caller passing no tenant under enforced isolation was therefore served
+        another tenant's cached answer verbatim, when it should have been refused.
+
+        It also makes the audit line honest: it records the tenant a request ran
+        under, and writing ``None`` there for a request that should never have run
+        makes the log agree with the bug.
+        """
+        return require_tenant(tenant_id or self.settings.tenant_id, self.settings.security)
+
     async def _cache_get(
         self, question: str, tenant: str | None, top_k: int | None = None
     ) -> Answer | None:

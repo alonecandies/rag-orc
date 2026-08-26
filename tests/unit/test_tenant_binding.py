@@ -296,3 +296,58 @@ async def test_health_is_not_refused_by_tenant_isolation() -> None:
     assert by_name["qdrant"].detail["points"] == 7
     assert health.status == "ok", "a healthy service must not report itself degraded"
     assert vector.counts == 0, "the probe must not go through the tenant-scoped count"
+
+
+# ---------------------------------------------------------------------------
+# The guard has to run before the cache, not only inside the graph
+# ---------------------------------------------------------------------------
+async def test_the_semantic_cache_cannot_answer_before_the_tenant_guard() -> None:
+    """`RAGPipeline.query` consulted the cache, then invoked the graph.
+
+    `require_tenant` lives in the graph's first node, so a cache hit returned
+    before it ever ran. And with no tenant resolvable `SemanticCache.get` drops
+    its tenant predicate — the filter is built under `if tenant_id:` — so the
+    lookup matched *any* tenant's entry. A caller passing no tenant under
+    enforced isolation was served another tenant's cached answer verbatim.
+
+    Driven through `RAGPipeline`, which is the entry point the README documents,
+    because the ordering is the bug: a test of `SemanticCache` alone sees a
+    correctly scoped cache, and a test of the graph alone sees a working guard.
+    """
+    from ragorc.cache.semantic import scope_key
+    from ragorc.pipeline.builder import RAGPipeline
+
+    settings = Settings(
+        security={"enforce_tenant_isolation": True},
+        cache={"enabled": True, "semantic_enabled": True},
+        llm={"api_key": "k"},
+    )
+    pipeline = RAGPipeline(settings=settings)
+
+    served: list[str] = []
+
+    class Leaky:
+        """A cache that answers whatever it is asked, recording that it was asked.
+
+        Deliberately unscoped: the question is whether the guard runs *before*
+        this is consulted, so a cache that refuses on its own would hide the
+        answer.
+        """
+
+        async def get(self, question: str, **kwargs: Any) -> Any:
+            served.append(question)
+            raise AssertionError("the cache was consulted before the tenant guard")
+
+    # Seeded through the backing field the property memoizes into, so the cache
+    # is present without `cache.semantic_enabled` having to be on.
+    pipeline._semantic_cache = Leaky()
+
+    with pytest.raises(GuardrailViolation, match="tenant_id is required"):
+        await pipeline.query("what is the merger price?")
+    assert served == [], "the guard must run first"
+
+    # And the scope helper is what the guard is attached to, for both entry points.
+    assert pipeline._scoped_tenant("acme") == "acme"
+    with pytest.raises(GuardrailViolation):
+        pipeline._scoped_tenant(None)
+    assert scope_key(None, None)  # the key the leak reproduction needed
