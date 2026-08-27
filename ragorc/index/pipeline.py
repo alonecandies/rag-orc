@@ -136,6 +136,7 @@ from ragorc.core.protocols import (
 from ragorc.core.registry import resolve
 from ragorc.core.settings import IndexingSettings, Settings, get_settings
 from ragorc.core.telemetry import current_ledger, timed
+from ragorc.embed.factory import build_late_chunking_embedder
 from ragorc.embed.late_chunking import LateChunkingEmbedder, resolve_strategy
 from ragorc.index.loaders import DirectoryLoader
 from ragorc.index.loaders import load as load_source
@@ -500,6 +501,10 @@ class IngestPipeline:
         self.llm = llm
         self.validator = validator or DocumentValidator(self.settings)
         self._strategy: ChunkingStrategy | None = None
+        #: The embedder every stored unit must go through. Set by :meth:`_prepare`;
+        #: ``None`` until then, which is why the accessor falls back to the dense
+        #: embedder rather than assuming.
+        self._unit_embedder: Any | None = None
         self._enricher: Any | None = None
         self._colbert_indexer: Any | None = None
         self._stages: list[tuple[_Plugin, Any]] = []
@@ -881,6 +886,13 @@ class IngestPipeline:
         # is the embedder the query side must use and its width is the collection's
         # width. Under EARLY/CONTEXTUAL the configured dense embedder owns both.
         query_side: Any = chunker if strategy is ChunkingStrategy.LATE else self._dense()
+        # Every *stored, retrievable* vector must come from this object, not only
+        # the leaf chunks. RAPTOR summaries, multi-representation units and parent
+        # documents all land in the same collection and are searched by the same
+        # query vector, so a summary embedded by the dense provider under LATE sits
+        # in a different space from the leaves beside it — findable, ranked, and
+        # scored against the wrong geometry.
+        self._unit_embedder = query_side
         dimension = await self._pin_dimension(query_side, measure=strategy is ChunkingStrategy.LATE)
 
         # Before the stores, not on first use: `_ensure_stores` declares the
@@ -935,6 +947,48 @@ class IngestPipeline:
                 embedder.dimension = dimension
         return dimension
 
+    def _bind_query_side(self, query_side: Any) -> None:
+        """Point an *injected* store at the embedder this run's strategy requires.
+
+        ``query_side`` says which object must embed queries: the late chunker under
+        LATE, the dense embedder otherwise. It was computed in :meth:`_prepare`,
+        passed here, and read in exactly one place — the ``if self.vector is None``
+        branch above. Every shipped construction site injects the store
+        (``RAGPipeline.ingest_pipeline``, ``RAGPipeline._ingest_for``, the server's
+        ``_LinearEngine``), so that branch is dead in production and the store went
+        on embedding queries with the dense provider while ingest wrote chunk
+        vectors pooled by the late chunker.
+
+        ADR-0002 states the rule this restores — "queries must be embedded through
+        *this* object's ``embed_query``" — and calls breaking it a silent recall
+        collapse. Silent is right: nothing errors, the vectors are the same width,
+        and the neighbours are merely worse. Even with one model behind both, CLS
+        pooling and mean pooling do not agree (measured on bge-small: cosine 0.95
+        between the two), and that is the *best* case.
+
+        The rebinding outlives the ingest deliberately. A corpus indexed with late
+        chunking must be *queried* with the late chunker for as long as it exists,
+        so scoping this to the run would restore the bug the moment the run ended.
+        """
+        if self.vector is None or query_side is None:
+            return
+        current = getattr(self.vector, "dense_embedder", None)
+        if current is query_side:
+            return
+        if not hasattr(self.vector, "dense_embedder"):  # pragma: no cover - duck typing
+            log.warning(
+                "query_side_not_bindable",
+                store=type(self.vector).__name__,
+                hint="queries will use whatever embedder this store was built with",
+            )
+            return
+        self.vector.dense_embedder = query_side
+        log.info(
+            "query_side_bound",
+            embedder=type(query_side).__name__,
+            replaced=type(current).__name__ if current is not None else None,
+        )
+
     async def _ensure_stores(self, query_side: Any, dimension: int) -> None:
         """Create the stores, then their schema. Idempotent, once per pipeline.
 
@@ -961,6 +1015,8 @@ class IngestPipeline:
                 late_embedder=self.late_embedder,
             )
             self._owns_stores = True
+        else:
+            self._bind_query_side(query_side)
         if self.relational is None:
             from ragorc.stores.postgres.store import PostgresStore
 
@@ -1026,13 +1082,54 @@ class IngestPipeline:
         return self.late_embedder
 
     def _late_chunker(self) -> LateChunkingEmbedder:
-        """The late-chunking pooler, wired to a token-capable embedder if we have
-        one. It builds its own backend otherwise (transformers, else FastEmbed)."""
+        """The late-chunking pooler, wired to the **dense** embedder.
+
+        The token source has to be the model that embeds queries — that is what
+        late chunking *is*. Pooling token vectors only yields a usable chunk vector
+        if the result lands in the same space as the query vector, and queries go
+        through the dense embedder.
+
+        This used to pass ``self.late_embedder``, which is the ColBERT
+        late-interaction model. ADR-0002 records that substitution as already tried
+        and rejected — "ColBERT is a different model in a different space at a
+        different width (128 vs 384)" — and
+        :func:`~ragorc.embed.factory.build_late_chunking_embedder` says the same
+        thing in its docstring while having no in-library caller at all. So the
+        mistake the ADR documents as removed was live, one module over, and reached
+        by a route the ADR does not mention: turning on ColBERT *reranking*
+        (``embedding.enable_late_interaction``) silently changed the chunking
+        strategy, because ``FastEmbedLateInteraction`` exposes token output and so
+        made ``supports_token_embeddings`` true.
+
+        The symptom was visible without running anything: ``supports_late_chunking()``
+        returned False while ``resolve_strategy`` returned LATE — the exact
+        disagreement ADR-0002 says there is a test for. The test passes the dense
+        embedder rather than the pipeline's chunker, so it resolved EARLY and
+        passed.
+
+        Uses the pipeline's own dense embedder rather than letting the factory build
+        one, so the token source and the query side are the same *object*, not
+        merely the same model name.
+        """
         if self.late_chunker is None:
-            self.late_chunker = LateChunkingEmbedder(
-                token_embedder=self.late_embedder, settings=self.settings
+            self.late_chunker = build_late_chunking_embedder(
+                self.settings, token_embedder=self._dense()
             )
         return self.late_chunker
+
+    def _units(self) -> Any:
+        """The embedder for anything this pipeline writes as a retrievable unit.
+
+        The late chunker under LATE, the dense embedder otherwise — the same object
+        ``query_side`` names, because a stored vector and the query that has to find
+        it must come from one model.
+
+        Not used for the splitter or the contextual enricher: those embed to
+        *decide* something (a breakpoint, a similarity) and nothing they produce is
+        stored, so they can stay on the dense embedder and avoid a circular
+        dependency with the chunker that needs the splitter.
+        """
+        return self._unit_embedder or self._dense()
 
     def _splitter_for(self) -> Splitter:
         if self.splitter is None:
@@ -1089,7 +1186,7 @@ class IngestPipeline:
                         _construct(
                             factory,
                             llm=self.llm,
-                            embedder=self._dense(),
+                            embedder=self._units(),
                             settings=self.settings,
                         ),
                     )
@@ -1313,7 +1410,7 @@ class IngestPipeline:
         from ragorc.index.multirep import ParentDocumentIndexer
 
         indexer = ParentDocumentIndexer(
-            embedder=self._dense(), validator=self.validator, settings=self.settings
+            embedder=self._units(), validator=self.validator, settings=self.settings
         )
         index = await indexer.build(document)
         return list(index.children), list(index.parents)

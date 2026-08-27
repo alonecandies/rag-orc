@@ -104,3 +104,34 @@ opt-in (`indexing.contextual_enabled`) since it costs one LLM call per chunk.
 - Prefer a long-context embedding model. `jinaai/jina-embeddings-v2-base-en`
   (8192 tokens) is the reference choice; the 512-token default caps how much
   document context any single pass can carry.
+
+## Addendum: three call sites that broke the one-model rule
+
+Found in round eleven. The primitives were right in every case; the callers
+handed them the wrong object, which is why nothing failed loudly.
+
+* **`IngestPipeline._late_chunker` passed the ColBERT embedder as the token
+  source** — the substitution this ADR records as tried and removed, live again
+  one module over. `build_late_chunking_embedder`, which wires the dense model in
+  correctly and says so in its docstring, had no in-library caller at all.
+
+  The route in was not one this ADR anticipated: `FastEmbedLateInteraction`
+  exposes token output, so enabling ColBERT **reranking**
+  (`embedding.enable_late_interaction`) made `supports_token_embeddings` true and
+  switched the **chunking strategy** to late. The symptom was visible without
+  running anything — `supports_late_chunking()` returned False while
+  `resolve_strategy()` returned LATE. The test this ADR says exists for that
+  disagreement passes the dense embedder rather than the pipeline's chunker, so
+  it resolved EARLY and passed.
+
+* **`query_side` was computed and dropped.** It is read in exactly one branch,
+  `if self.vector is None`, and all three shipped construction sites inject the
+  store — so under LATE the store went on embedding queries with the dense
+  provider. Even with one model behind both, CLS and mean pooling do not agree
+  (cosine 0.95 on bge-small), and that is the best case.
+
+* **Derived units were embedded by the dense provider under LATE.** RAPTOR
+  summaries, multi-representation units and parent documents share a collection
+  with the leaves and are found by the same query vector, so they have to come
+  from the same model. The splitter and the contextual enricher are deliberately
+  excluded: they embed to *decide* something and store nothing.
