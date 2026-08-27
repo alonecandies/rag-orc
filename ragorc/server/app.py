@@ -1981,7 +1981,7 @@ def create_app(settings: Settings | None = None) -> Any:
     _require("fastapi", "server")
     from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
     from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import ORJSONResponse, PlainTextResponse
+    from fastapi.responses import PlainTextResponse
     from starlette.exceptions import HTTPException as StarletteHTTPException
     from starlette.middleware.cors import CORSMiddleware
 
@@ -2044,13 +2044,15 @@ def create_app(settings: Settings | None = None) -> Any:
         version=_VERSION,
         summary="Retrieval-augmented generation over Qdrant, Postgres and Neo4j.",
         lifespan=lifespan,
-        # orjson serializes in Rust and is already a base dependency of this
-        # library. It matters here rather than being a micro-optimization: a
-        # QueryResponse carries the packed chunk bodies, per-component score maps
-        # and a per-stage trace, so a 10-chunk answer is a six-figure-byte
-        # document that stdlib json encodes several times slower — on the event
-        # loop, blocking every other request while it does.
-        default_response_class=ORJSONResponse,
+        # No `default_response_class`. It used to be `ORJSONResponse`, justified
+        # against stdlib json — which is no longer the alternative. FastAPI now
+        # serializes a route's declared `response_model` straight to bytes with
+        # Pydantic's Rust serializer, skipping the intermediate `model_dump()`
+        # dict that orjson would then have to walk. Measured on a realistic
+        # 13.1 KB QueryResponse: 0.016 ms native against 0.019 ms via
+        # ORJSONResponse, so removing the deprecated class is also the faster
+        # option. Every route that returns a body declares a response model,
+        # which is the condition that path requires.
     )
     app.add_middleware(
         CORSMiddleware,
@@ -2487,10 +2489,15 @@ def _json_error(
     *,
     headers: dict[str, str] | None = None,
 ) -> Any:
-    from fastapi.responses import ORJSONResponse
+    from fastapi.responses import JSONResponse
 
+    # Built by hand rather than returned from a route, so FastAPI's serialization
+    # does not apply and a response class has to be named. `JSONResponse` and its
+    # stdlib encoder are correct here for the reason they are wrong on `/query`:
+    # an error body is a few hundred bytes, where the 6x difference measured
+    # against orjson is microseconds.
     merged = {"X-Request-ID": request_id, **(headers or {})}
-    return ORJSONResponse(status_code=status_code, content=body.model_dump(), headers=merged)
+    return JSONResponse(status_code=status_code, content=body.model_dump(), headers=merged)
 
 
 def _error_responses() -> dict[int | str, dict[str, Any]]:

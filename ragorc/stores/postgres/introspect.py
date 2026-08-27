@@ -437,7 +437,7 @@ class SchemaIntrospector:
         # credentials.
         return cache_key(
             "pg_schema",
-            pg.dsn.rsplit("@", 1)[-1],
+            pg.dsn.get_secret_value().rsplit("@", 1)[-1],
             pg.schema_name,
             tuple(sorted(pg.allowed_tables)),
         )

@@ -254,7 +254,7 @@ class PostgresStore:
     async def close(self) -> None:
         """Release both pools. A shutdown hook, not a per-request operation."""
         await close_pool(self.pg)
-        if self.pg.readonly_dsn:
+        if self.pg.readonly_dsn.get_secret_value():
             await close_pool(self.pg, readonly=True)
 
     # ------------------------------------------------------------------
@@ -298,7 +298,7 @@ class PostgresStore:
         """
         cap = max(1, min(int(limit or self.pg.max_sql_rows), self.pg.max_sql_rows))
         statement = _capped(sql, cap)
-        use_readonly_pool = bool(self.pg.readonly_dsn)
+        use_readonly_pool = bool(self.pg.readonly_dsn.get_secret_value())
 
         with timed("pg_execute_readonly", rows_cap=cap):
             async with self._connection(readonly=use_readonly_pool) as conn, conn.transaction():
@@ -330,7 +330,7 @@ class PostgresStore:
 
     async def _get_introspector(self) -> SchemaIntrospector:
         if self._introspector is None:
-            pool = await open_pool(self.pg, readonly=bool(self.pg.readonly_dsn))
+            pool = await open_pool(self.pg, readonly=bool(self.pg.readonly_dsn.get_secret_value()))
             self._introspector = SchemaIntrospector(pool, self.settings, cache=self.cache)
         return self._introspector
 

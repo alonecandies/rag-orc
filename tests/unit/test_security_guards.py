@@ -890,3 +890,68 @@ def test_a_clean_document_is_left_alone() -> None:
     (doc,) = report.accepted
     assert doc.content == body
     assert "injection_risk" not in doc.metadata
+
+# ---------------------------------------------------------------------------
+# Credentials must not escape by being printed
+# ---------------------------------------------------------------------------
+def test_the_postgres_dsn_is_masked_wherever_settings_are_rendered() -> None:
+    """It was the one credential in this tree hidden inside a field that does not
+    look like one. `llm.api_key` and `neo4j.password` were `SecretStr` and this
+    was a plain `str`, so every rendering masked those two and printed this in
+    full — measured across repr, str, model_dump and model_dump_json.
+    """
+    from ragorc.core.settings import Settings
+
+    canary = "CANARYPGPASSWORD"
+    settings = Settings(
+        llm={"api_key": "sk-or-v1-" + "x" * 40},
+        postgres={"dsn": f"postgresql://u:{canary}@db.internal:5432/prod"},
+        neo4j={"password": "CANARYNEO4J"},
+    )
+
+    rendered = {
+        "repr": repr(settings),
+        "str": str(settings),
+        "model_dump": str(settings.model_dump()),
+        "model_dump_json": settings.model_dump_json(),
+        "summary": str(settings.summary()),
+        "repr(postgres)": repr(settings.postgres),
+    }
+    leaked = sorted(name for name, text in rendered.items() if canary in text)
+    assert leaked == [], f"the DSN password was rendered in: {leaked}"
+
+    assert settings.postgres.dsn.get_secret_value().endswith("/prod"), (
+        "masking must not change the value the pool connects with"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["dsn", "target", "url", "error", "detail"],
+    ids=["hinted-key", "unhinted-target", "unhinted-url", "exception-text", "detail"],
+)
+def test_a_credential_in_a_url_is_redacted_under_any_log_key(key: str) -> None:
+    """`_SECRET_HINTS` masks by *key name*, which covers `log.info("x", dsn=...)`
+    and not the 104 sites that log `error=str(exc)`. Neither psycopg nor the
+    neo4j driver puts the password in a connection error — this closes a gap in
+    a defence-in-depth control, not a demonstrated leak.
+    """
+    from ragorc.core.telemetry import _redact_secrets
+
+    for url in (
+        "postgresql://user:CANARY@db.internal:5432/prod",
+        "bolt://neo4j:CANARY@graph.internal:7687",
+        "redis://:CANARY@cache.internal:6379/0",
+    ):
+        out = _redact_secrets(None, None, {key: url})[key]
+        assert "CANARY" not in out, f"{key}={out}"
+
+
+def test_a_url_with_no_credential_is_left_alone() -> None:
+    """A redactor that mangles ordinary URLs makes logs harder to read, which is
+    how redaction ends up switched off."""
+    from ragorc.core.telemetry import _redact_secrets
+
+    plain = "https://openrouter.ai/api/v1/chat/completions?stream=true"
+    assert _redact_secrets(None, None, {"url": plain})["url"] == plain
+

@@ -239,8 +239,21 @@ class QdrantSettings(BaseModel):
 
 
 class PostgresSettings(BaseModel):
-    dsn: str = "postgresql://ragorc:ragorc@localhost:5432/ragorc"
-    readonly_dsn: str = ""
+    dsn: SecretStr = SecretStr("postgresql://ragorc:ragorc@localhost:5432/ragorc")
+    """Connection string for the primary role.
+
+    ``SecretStr`` because it carries a password inline, which is the one place in
+    this settings tree where a credential hides inside a field that does not look
+    like one. ``llm.api_key`` and ``neo4j.password`` were secrets and this was a
+    plain ``str``, so ``repr(settings)``, ``model_dump()`` and
+    ``model_dump_json()`` masked those two and printed this one in full — into a
+    debugger, a crash reporter, or any handler that serializes its configuration.
+    ``Settings.summary()`` was already careful; nothing else was.
+
+    Read it with ``.get_secret_value()``. There are three call sites and two of
+    them only want the host part."""
+
+    readonly_dsn: SecretStr = SecretStr("")
     """Separate DSN for a ``SELECT``-only role used by Text-to-SQL. Defence in
     depth: even if the SQL guard is bypassed, the connection cannot write."""
 
@@ -916,7 +929,7 @@ class Settings(BaseSettings):
             },
             "stores": {
                 "qdrant": self.qdrant.url,
-                "postgres": self.postgres.dsn.split("@")[-1],
+                "postgres": self.postgres.dsn.get_secret_value().split("@")[-1],
                 "neo4j": self.neo4j.uri,
             },
             "features": {

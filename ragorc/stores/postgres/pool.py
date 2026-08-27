@@ -146,9 +146,9 @@ def resolve_dsn(settings: PostgresSettings, *, readonly: bool = False) -> str:
     ``readonly`` degrades to the primary DSN when no restricted role has been
     configured; the caller still gets the per-transaction ``READ ONLY`` barrier.
     """
-    if readonly and settings.readonly_dsn:
-        return settings.readonly_dsn
-    return settings.dsn
+    if readonly and settings.readonly_dsn.get_secret_value():
+        return settings.readonly_dsn.get_secret_value()
+    return settings.dsn.get_secret_value()
 
 
 def _make_configure(

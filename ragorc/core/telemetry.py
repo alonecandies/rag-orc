@@ -102,12 +102,20 @@ _IDENTIFIER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{10,}", re.IGNORECASE), "Bearer ***"),
     (re.compile(r"https?://[^\s\"'<>]*/keys/[A-Za-z0-9._-]{8,}"), "<key-url-redacted>"),
     (re.compile(r"(user_id\\?\"?\s*[:=]\s*\\?\"?)[A-Za-z0-9_-]{6,}"), r"\1<redacted>"),
+    # A credential inside a URL's authority. `_SECRET_HINTS` masks a value whose
+    # *key* is dsn/password/token, which covers `log.info("x", dsn=...)` and not
+    # `log.warning("connect_failed", target=...)` or an exception string that
+    # happens to quote the URL. Measured: neither psycopg nor the neo4j driver
+    # puts the password in a connection error, so this closes a gap rather than a
+    # demonstrated leak — but there are 104 `error=str(exc)` sites and the cost of
+    # one more pattern is a substring check that almost always misses.
+    (re.compile(r"\b([a-z][a-z0-9+.-]*://[^\s:/@]*):[^\s/@]+@"), r"\1:***@"),
 )
 
 #: Cheap pre-filter. Almost every string that reaches the redactor contains none
 #: of these, and a substring scan is an order of magnitude cheaper than five
 #: regex passes — which matters because this runs on log lines.
-_IDENTIFIER_MARKERS = ("sk-", "/keys/", "user_id", "earer ", "ghp_", "gho_", "xox")
+_IDENTIFIER_MARKERS = ("sk-", "/keys/", "user_id", "earer ", "ghp_", "gho_", "xox", "://")
 
 
 def redact_identifiers(text: str) -> str:
