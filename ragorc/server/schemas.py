@@ -51,6 +51,8 @@ __all__ = [
     "MAX_TOP_K",
     "ChunkModel",
     "CitationModel",
+    "DeleteRequest",
+    "DeleteResponse",
     "ErrorResponse",
     "EvalItem",
     "EvalMetrics",
@@ -499,6 +501,54 @@ class IngestResponse(_Body):
 # ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
+class DeleteRequest(_Body):
+    """Which documents to remove.
+
+    Ids, not a filter. A filtered delete is one typo away from emptying an index,
+    and there is no undo behind it — the vectors, the rows and the graph nodes are
+    gone. Naming the documents keeps the blast radius equal to what the caller
+    typed.
+    """
+
+    document_ids: list[str] = Field(
+        min_length=1,
+        max_length=1000,
+        description="Document ids to remove from every store that holds them.",
+    )
+    tenant_id: str | None = Field(
+        default=None,
+        description=(
+            "Whose documents these are. Bound to the API key when "
+            "server.api_key_tenants names it; refused if it names another."
+        ),
+    )
+
+
+class DeleteResponse(_Body):
+    """What was removed, per store.
+
+    Counts are separate rather than totalled because the question an operator has
+    is not "how many things went" but "has every store that held this stopped
+    holding it". ``complete`` answers that directly, and ``errors`` says which
+    store did not: a delete attempts every store even when one fails, since
+    stopping halfway leaves the caller believing the document is gone while it is
+    still retrievable from whichever store was not reached.
+    """
+
+    request_id: str = ""
+    documents: int = 0
+    vectors: int = 0
+    rows: int = 0
+    entities: int = 0
+    """Entities removed because nothing mentions them any more — not every entity
+    the documents mentioned. Entities merge on name, so one shared with a
+    surviving document keeps its edge and stays."""
+    communities: int = 0
+    answers_invalidated: int = 0
+    complete: bool = True
+    errors: dict[str, str] = Field(default_factory=dict)
+
+
 class EvalItem(_Body):
     """One graded question.
 

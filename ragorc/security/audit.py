@@ -83,6 +83,16 @@ class AuditLog:
             )
         )
 
+    def deleted(self, *, tenant_id: str | None, documents: int) -> None:
+        """Record a deletion request before it runs.
+
+        Before, not after, and unconditionally. A delete is the one operation
+        whose *attempt* has to be in the log even when it fails: a partial delete
+        is the outcome an auditor most needs to see, and recording only successes
+        would leave the interesting case invisible.
+        """
+        self.record(AuditEvent("delete", tenant_id=tenant_id, detail={"documents": documents}))
+
     def blocked(self, action: str, rule: str, **detail: Any) -> None:
         self.record(AuditEvent(action, outcome="blocked", rule=rule, detail=detail))
 

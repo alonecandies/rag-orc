@@ -20,7 +20,7 @@ tests need to assert on:
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from itertools import pairwise
 from typing import Any
@@ -74,6 +74,14 @@ def _matches(payload: dict[str, Any], filters: dict[str, Any] | None) -> bool:
                     return False
                 if op == "lt" and not (value is not None and value < operand):
                     return False
+        elif isinstance(condition, (list, tuple, set, frozenset)):
+            # A bare sequence means any-of, which is what the real store does:
+            # `_condition` in `stores/qdrant/filters.py` turns it into `MatchAny`.
+            # Treating it as equality here made `filters={"document_id": [...]}` —
+            # the shape the purge and the delete both use — match nothing, so a
+            # test could watch a delete remove zero rows and call it correct.
+            if value not in condition:
+                return False
         elif value != condition:
             return False
     return True
@@ -175,16 +183,61 @@ class FakeVectorStore:
             return found
         return [replace(chunk, dense=None, sparse=None, multi=None) for chunk in found]
 
-    async def delete(self, ids: Sequence[str] | None = None, **kwargs: Any) -> int:
-        if ids is None:
-            count = len(self.chunks)
-            self.chunks.clear()
-            return count
-        removed = 0
-        for i in ids:
-            if self.chunks.pop(i, None) is not None:
-                removed += 1
-        return removed
+    async def delete(
+        self,
+        ids: Sequence[str] | None = None,
+        *,
+        filters: dict[str, Any] | None = None,
+        tenant_id: str | None = None,
+        **kwargs: Any,
+    ) -> int:
+        """Delete by id or by filter, honouring the tenant either way.
+
+        The real store routes a bare id list through a filter when isolation is on
+        — ``HasIdCondition`` ANDed with the tenant — precisely so one tenant cannot
+        delete another's point by guessing a deterministic id. A double that
+        ignored ``tenant_id`` would let that argument be dropped at a call site
+        with every test still green, which is the shape of the round-nine leaks.
+        """
+        del kwargs
+        if ids is None and filters is None:
+            if tenant_id:
+                doomed = [k for k, c in self.chunks.items() if c.tenant_id == tenant_id]
+            else:
+                doomed = list(self.chunks)
+        else:
+            candidates = list(ids) if ids is not None else list(self.chunks)
+            doomed = [
+                cid
+                for cid in candidates
+                if (chunk := self.chunks.get(cid)) is not None
+                and (not tenant_id or chunk.tenant_id == tenant_id)
+                and _matches(chunk.payload(), filters)
+            ]
+        for cid in doomed:
+            self.chunks.pop(cid, None)
+        return len(doomed)
+
+    async def scroll(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        tenant_id: str | None = None,
+        with_vectors: bool = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[Chunk]:
+        """Iterate the collection, filtered the same way ``search`` is.
+
+        Modelled because the delete path reads chunk ids through it — the graph's
+        only handle on a document — so a fake without it would leave that read
+        untested at exactly the point it matters.
+        """
+        del kwargs, with_vectors
+        for chunk in list(self.chunks.values()):
+            if tenant_id and chunk.tenant_id != tenant_id:
+                continue
+            if _matches(chunk.payload(), filters):
+                yield chunk
 
     async def count(self, **kwargs: Any) -> int:
         return len(self.chunks)

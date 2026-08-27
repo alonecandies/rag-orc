@@ -189,3 +189,35 @@ ragorc alias-swap ragorc ragorc_v2      # atomic cutover
 
 The vector index is *derived data*. If Postgres holds the chunks, Qdrant and Neo4j
 can both be rebuilt — which is the right way to think about a restore.
+
+## Removing documents
+
+```bash
+ragorc delete doc-id-1 doc-id-2 --tenant acme
+curl -X DELETE localhost:8000/documents -H 'X-API-Key: ...' \
+     -d '{"document_ids": ["doc-id-1"], "tenant_id": "acme"}'
+```
+
+Both reach `RAGPipeline.delete`, which removes the vectors, the rows, the graph
+nodes and the cached answers built from them. Get the ids from
+`ragorc query --json`, which reports `document_id` on every chunk.
+
+**Ids, not filters.** A filtered delete is one typo away from emptying an index
+and there is nothing behind it — no tombstone, no undo. The CLI confirms unless
+`--yes`.
+
+**It does not stop at the first failure.** Every store is attempted and the
+report says which ones did not answer, because a delete that aborts halfway
+leaves the caller believing the document is gone while it is still retrievable
+from whichever store was skipped. Read `complete`; if it is false, retry — the
+operation is idempotent.
+
+**Entities are removed only when nothing mentions them.** Entities merge on
+`name`, so two documents about the same company share one node; deleting the
+first must not strip the second. That rule is also what makes the graph delete
+tenant-safe in a graph that stores no tenant — another tenant's surviving chunk
+keeps the edge.
+
+The order is the reverse of the ingest's, and the first step is a read: a
+`Chunk` node carries an id and no document reference, so the chunk ids have to
+be collected before the vectors go or the graph nodes become unreachable.

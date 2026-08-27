@@ -595,6 +595,83 @@ def ingest(
     _run(run)
 
 
+@app.command()
+def delete(
+    document_ids: list[str] = typer.Argument(..., help="Document ids to remove."),
+    tenant: str | None = typer.Option(None, "--tenant", "-t", help="Tenant that owns them."),
+    collection: str | None = typer.Option(None, "--collection", "-c", help="Qdrant collection."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    as_json: bool = typer.Option(False, "--json", help="Print the report as JSON."),
+) -> None:
+    """Remove documents from Qdrant, Postgres, Neo4j and the answer cache.
+
+    Until this existed there was no supported way to take a document out of the
+    index: the only deletion anywhere was the stale-purge inside re-ingest, which
+    replaces a document and cannot remove one.
+
+    Ids, not globs. A filtered delete is one typo away from emptying an index and
+    there is nothing behind it — no tombstone, no undo — so the blast radius is
+    kept equal to what was typed. Get the ids from `ragorc query --json`, which
+    reports `document_id` on every chunk.
+
+    Confirms first unless `--yes`, because this is the one command in the CLI that
+    destroys data.
+    """
+    settings = _settings(collection=collection, tenant=tenant)
+    ids = [i for i in document_ids if i]
+    if not ids:
+        err.print("[yellow]no document ids given[/yellow]")
+        raise typer.Exit(EXIT_OK)
+
+    if not yes:
+        listed = ", ".join(ids[:5]) + (f" and {len(ids) - 5} more" if len(ids) > 5 else "")
+        typer.confirm(
+            f"Permanently delete {len(ids)} document(s) — {listed} — from every store?",
+            abort=True,
+        )
+
+    async def run() -> None:
+        async with _service(settings) as service:
+            report = await service.engine.delete(ids, tenant_id=tenant)
+
+        if as_json:
+            _print_json(
+                {
+                    "documents": report.documents,
+                    "vectors": report.vectors,
+                    "rows": report.rows,
+                    "entities": report.entities,
+                    "communities": report.communities,
+                    "answers_invalidated": report.answers_invalidated,
+                    "complete": report.complete,
+                    "errors": report.errors,
+                }
+            )
+            return
+
+        table = Table(title="deleted", box=None, pad_edge=False)
+        table.add_column("store")
+        table.add_column("removed", justify="right")
+        table.add_row("documents", str(report.documents))
+        table.add_row("vectors", str(report.vectors))
+        table.add_row("rows", str(report.rows))
+        table.add_row("orphaned entities", str(report.entities))
+        table.add_row("empty communities", str(report.communities))
+        table.add_row("cached answers", str(report.answers_invalidated))
+        console.print(table)
+
+        if not report.complete:
+            # Not an exception: the stores that succeeded are already done, and a
+            # caller needs to know which ones to retry rather than being told the
+            # whole thing failed.
+            for store, message in report.errors.items():
+                err.print(f"[red]{store}[/red]: {message}")
+            err.print("[yellow]the document may still be retrievable — retry[/yellow]")
+            raise typer.Exit(EXIT_ERROR)
+
+    _run(run)
+
+
 async def _discover(
     paths: Sequence[Path],
     settings: Settings,

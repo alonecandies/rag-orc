@@ -136,6 +136,8 @@ from ragorc.security.tenancy import (
 )
 from ragorc.server.schemas import (
     MAX_QUESTION_CHARS,
+    DeleteRequest,
+    DeleteResponse,
     ErrorResponse,
     EvalItem,
     EvalMetrics,
@@ -1245,6 +1247,42 @@ class RagService:
         )
 
     # -- ingest ------------------------------------------------------------
+    async def delete(
+        self,
+        request: DeleteRequest,
+        *,
+        request_id: str = "",
+        principal: str = ANONYMOUS,
+    ) -> DeleteResponse:
+        """Remove documents from every store that holds them.
+
+        Tenancy is resolved the same way ingest resolves it, and for the same
+        reason stated there: a caller able to file documents under another
+        tenant's id is a caller able to have them answered back to that tenant —
+        and a caller able to *delete* under another tenant's id is worse, because
+        that one does not need a second step.
+        """
+        request_id = request_id or _new_request_id()
+        with self._request_context(request_id):
+            tenant = resolve_tenant(
+                request.tenant_id or self.settings.tenant_id,
+                principal=principal,
+                bindings=self.tenant_bindings,
+                settings=self.settings.security,
+            )
+            report = await self.engine.delete(request.document_ids, tenant_id=tenant)
+        return DeleteResponse(
+            request_id=request_id,
+            documents=report.documents,
+            vectors=report.vectors,
+            rows=report.rows,
+            entities=report.entities,
+            communities=report.communities,
+            answers_invalidated=report.answers_invalidated,
+            complete=report.complete,
+            errors=dict(report.errors),
+        )
+
     async def ingest(
         self,
         request: IngestRequest,
@@ -2243,6 +2281,34 @@ def create_app(settings: Settings | None = None) -> Any:
             await _json_body(request, IngestRequest, resolved),
             request_id=request_id,
             principal=principal,
+        )
+
+    @app.delete(
+        "/documents",
+        response_model=DeleteResponse,
+        summary="Remove documents from every store that holds them.",
+        responses=_error_responses(),
+    )
+    async def delete_documents(
+        body: DeleteRequest,
+        request: Request,
+        service: RagService = Depends(service_dependency),
+        principal: str = Depends(guard),
+    ) -> DeleteResponse:
+        """The only way to take a document out of the index.
+
+        Authenticated like ingest, and bound to the credential's tenant for a
+        sharper version of the same reason: a caller who can write under another
+        tenant's id needs a second step to cause harm, and one who can delete
+        under it does not.
+
+        A body on a ``DELETE`` rather than ids in the path or query, because a
+        delete is naturally a batch — a re-ingest that supersedes a directory
+        removes hundreds — and a URL is the wrong place for hundreds of ids and
+        the wrong place for anything that ends up in an access log.
+        """
+        return await service.delete(
+            body, request_id=_request_id(request), principal=principal
         )
 
     @app.post(

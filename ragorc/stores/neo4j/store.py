@@ -982,6 +982,78 @@ RETURN count(*) AS written
             log.info("neo4j_communities_pruned", removed=removed, kept=len(set(keep_ids)))
         return removed
 
+    async def delete_chunks(self, chunk_ids: Sequence[str]) -> dict[str, int]:
+        """Remove chunk nodes and whatever they were the last reason to keep.
+
+        Three deletions, in dependency order, because the graph merges on shared
+        keys and none of them is namespaced by document:
+
+        1. The ``Chunk`` nodes themselves, ``DETACH`` so their ``MENTIONS`` edges
+           go with them.
+        2. ``Entity`` nodes with no ``MENTIONS`` edge left. **Not** every entity
+           the deleted chunks mentioned — an entity merges on ``name``, so two
+           documents that both discuss "Acme" converge on one node and deleting
+           it with the first document would silently strip the second. Orphan
+           deletion is the only correct rule, and it has a property worth
+           naming: it is tenant-safe by construction, in a graph that stores no
+           tenant. If another tenant's chunk still mentions the entity, the
+           entity still has an edge, so this leaves it alone.
+        3. Communities whose membership is now entirely gone. A community
+           summarizes entities; one whose members have all been deleted
+           describes nothing and would still be returned by global search.
+           Partial members are left, matching :meth:`prune_communities`, which
+           documents why being wrong in the other direction is worse.
+
+        Returns the counts separately rather than a total, because "removed 40
+        things" does not tell an operator whether they lost an entity they
+        expected to keep.
+        """
+        ids = _dedupe(chunk_ids)
+        if not ids:
+            return {"chunks": 0, "entities": 0, "communities": 0}
+
+        chunks = await self._write_count(
+            f"""
+MATCH (c:`{self.chunk_label}`)
+WHERE c.id IN $ids
+DETACH DELETE c
+RETURN count(*) AS written
+""",
+            {"ids": ids},
+            label="delete_chunks",
+        )
+        entities = await self._write_count(
+            f"""
+MATCH (e:`{self.node_label}`)
+WHERE NOT (:`{self.chunk_label}`)-[:`{_MENTIONS}`]->(e)
+DETACH DELETE e
+RETURN count(*) AS written
+""",
+            {},
+            label="delete_orphan_entities",
+        )
+        communities = await self._write_count(
+            f"""
+MATCH (k:`{self.community_label}`)
+WHERE k.entity_names IS NOT NULL
+  AND size(k.entity_names) > 0
+  AND NOT EXISTS {{
+      MATCH (e:`{self.node_label}`) WHERE e.name IN k.entity_names
+  }}
+DETACH DELETE k
+RETURN count(*) AS written
+""",
+            {},
+            label="delete_empty_communities",
+        )
+        log.info(
+            "neo4j_chunks_deleted",
+            chunks=chunks,
+            orphan_entities=entities,
+            empty_communities=communities,
+        )
+        return {"chunks": chunks, "entities": entities, "communities": communities}
+
     # -- reads ------------------------------------------------------------
     async def fulltext_entities(
         self, query: str, *, limit: int | None = None

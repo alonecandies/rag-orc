@@ -603,3 +603,47 @@ class _StubEmbedder32:
         rng = np.random.default_rng(abs(hash(text)) % (2**32))
         v = rng.normal(size=32).astype(np.float32)
         return (v / np.linalg.norm(v)).astype(np.float32)
+
+@pytest.mark.integration
+async def test_deleting_a_document_leaves_entities_another_one_still_mentions(
+    settings: Settings,
+) -> None:
+    """The rule the graph's shared-key model forces, against a real Neo4j.
+
+    An ``Entity`` merges on ``name``, so two documents that both discuss "Acme"
+    converge on one node. Deleting the first document must not take the entity
+    with it, or the second document silently loses a node it still asserts. Only
+    entities with no ``MENTIONS`` edge left may go.
+
+    That rule has a second property worth pinning: in a graph that stores no
+    tenant at all, it is tenant-safe by construction. Another tenant's surviving
+    chunk keeps the edge, so the entity stays.
+    """
+    from ragorc.stores.neo4j.store import Neo4jStore
+
+    store = Neo4jStore(settings=settings)
+    try:
+        await store.ensure_schema()
+        await store.upsert_entities(
+            [
+                Entity(name="Acme", type="ORG", description="shared by both documents"),
+                Entity(name="Solo", type="ORG", description="only in the doomed document"),
+            ]
+        )
+        # doc-a owns chunk-a1; doc-b owns chunk-b1. Both mention Acme.
+        await store.upsert_chunk_links({"Acme": ["chunk-a1", "chunk-b1"], "Solo": ["chunk-a1"]})
+
+        counts = await store.delete_chunks(["chunk-a1"])
+
+        assert counts["chunks"] == 1
+        surviving = {e.name for e, _score in await store.fulltext_entities("Acme Solo", limit=10)}
+        assert "Acme" in surviving, "an entity another document still mentions was deleted"
+        assert "Solo" not in surviving, "an orphaned entity was left behind"
+        assert counts["entities"] >= 1
+    finally:
+        async with store.driver.session() as session:
+            await session.run(
+                f"MATCH (n:`{settings.neo4j.node_label}`) DETACH DELETE n"
+            )
+            await session.run("MATCH (c:Chunk) WHERE c.id STARTS WITH 'chunk-' DETACH DELETE c")
+        await store.close()

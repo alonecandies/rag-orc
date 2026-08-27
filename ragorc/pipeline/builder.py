@@ -70,6 +70,7 @@ import importlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -274,6 +275,37 @@ class _LazyRetriever:
     ) -> list[ScoredChunk]:
         inner = await self._resolve()
         return await inner.retrieve(query, top_k=top_k, **kwargs)
+
+
+@dataclass(slots=True)
+class DeleteReport:
+    """What a delete actually removed, per store.
+
+    Counts are separate rather than totalled because "removed 40 things" does not
+    answer the question an operator has, which is whether every store that held
+    the document has stopped holding it.
+
+    ``errors`` is the failure channel: :meth:`RAGPipeline.delete` attempts every
+    store even when one fails, so a caller has to read this to know whether the
+    document is really gone. Empty means it is.
+    """
+
+    documents: int = 0
+    vectors: int = 0
+    rows: int = 0
+    graph_chunks: int = 0
+    entities: int = 0
+    """Entities deleted because nothing mentions them any more — not every entity
+    the documents mentioned. An entity merges on ``name``, so one shared with a
+    surviving document keeps its edge and stays."""
+    communities: int = 0
+    answers_invalidated: int = 0
+    errors: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        """Whether every store that was asked reported success."""
+        return not self.errors
 
 
 class RAGPipeline:
@@ -985,6 +1017,123 @@ class RAGPipeline:
                 answer_cache=lambda: self.semantic_cache,
             )
         return self._ingest
+
+    async def delete(
+        self,
+        document_ids: Sequence[str] | str,
+        *,
+        tenant_id: str | None = None,
+    ) -> DeleteReport:
+        """Remove documents from every store that holds them.
+
+        Until this existed there was no supported way to take a document out of
+        the index. The API was ``/health /metrics /query /query/stream /ingest
+        /eval`` and the CLI was ``init ingest query eval bench serve inspect
+        alias-swap``: the only deletion anywhere was the stale-purge inside
+        re-ingest, which *replaces* a document and cannot remove one. An operator
+        asked to delete a document had to drive three store objects by hand and
+        would still have missed the graph, which had no delete at all, and the
+        answer cache, which had no invalidation.
+
+        Order matters and is the reverse of the ingest's. The chunk ids are read
+        **first**, because they are the graph's only handle on a document — a
+        ``Chunk`` node carries an id and nothing else, so once the vectors are
+        gone there is no way left to find the nodes that referenced them. Then
+        vectors, rows, graph, cache.
+
+        Every store is attempted even if an earlier one fails, and the failures
+        are reported rather than raised. A delete that stops halfway is the worst
+        outcome available here: the caller believes the document is gone and it is
+        still retrievable from whichever store was not reached. Reporting lets
+        them retry, and the operation is idempotent — deleting what is already
+        deleted removes nothing and succeeds.
+        """
+        self._ensure_open()
+        ids = [document_ids] if isinstance(document_ids, str) else list(document_ids)
+        ids = [i for i in ids if i]
+        tenant = self._scoped_tenant(tenant_id)
+        report = DeleteReport(documents=len(ids))
+        if not ids:
+            return report
+
+        self._audit.deleted(tenant_id=tenant, documents=len(ids))
+        chunk_ids = await self._chunk_ids_for(ids, tenant, report)
+
+        report.vectors = await self._try(
+            report, "vector", self.vector_store.delete(filters={"document_id": ids}, tenant_id=tenant)
+        )
+        if self._relational is not None:
+            rows = 0
+            for document_id in ids:
+                rows += (
+                    await self._try(
+                        report,
+                        "relational",
+                        self._relational.delete_document(document_id, tenant_id=tenant),
+                    )
+                    or 0
+                )
+            report.rows = rows
+        if self.settings.graph.enabled and chunk_ids:
+            graph = await self.graph_store()
+            counts = await self._try(report, "graph", graph.delete_chunks(chunk_ids))
+            if counts:
+                report.entities = counts["entities"]
+                report.communities = counts["communities"]
+                report.graph_chunks = counts["chunks"]
+        cache = self.semantic_cache
+        if cache is not None:
+            await self._try(report, "cache", cache.invalidate(ids, tenant_id=tenant))
+            report.answers_invalidated = len(ids)
+
+        log.info(
+            "documents_deleted",
+            documents=len(ids),
+            vectors=report.vectors,
+            rows=report.rows,
+            entities=report.entities,
+            errors=list(report.errors),
+            tenant_id=tenant,
+        )
+        return report
+
+    async def _chunk_ids_for(
+        self, document_ids: Sequence[str], tenant: str | None, report: DeleteReport
+    ) -> list[str]:
+        """The graph's only handle on a document, read before anything is removed.
+
+        A ``Chunk`` node stores an id and no document reference, so this is the
+        one chance to learn which nodes belong to the documents being deleted.
+        Read from the vector store rather than the relational one because the
+        vector store is the only one guaranteed to be present.
+        """
+        if not self.settings.graph.enabled:
+            return []
+        try:
+            return [
+                chunk.id
+                async for chunk in self.vector_store.scroll(
+                    filters={"document_id": list(document_ids)}, tenant_id=tenant
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            report.errors["chunk_lookup"] = str(exc)[:200]
+            return []
+
+    @staticmethod
+    async def _try(report: DeleteReport, store: str, awaitable: Any) -> Any:
+        """Await one store's delete, recording a failure instead of propagating it.
+
+        Deliberately swallowing: see :meth:`delete`. A partial delete that raises
+        leaves the caller believing nothing happened, when in fact some stores are
+        already done and the document is now inconsistent across them.
+        """
+        try:
+            return await awaitable
+        except Exception as exc:  # noqa: BLE001 - the report is the error channel
+            report.errors[store] = str(exc)[:200]
+            log.warning("delete_failed", store=store, error=str(exc)[:200])
+            return None
 
     async def ingest(
         self,
