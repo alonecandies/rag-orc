@@ -596,6 +596,47 @@ def ingest(
 
 
 @app.command()
+def documents(
+    source: str | None = typer.Option(None, "--source", "-s", help="Substring of the path."),
+    tenant: str | None = typer.Option(None, "--tenant", "-t", help="Tenant to list."),
+    collection: str | None = typer.Option(None, "--collection", "-c", help="Qdrant collection."),
+    limit: int = typer.Option(100, "--limit", "-n", min=1, help="Documents to list."),
+    as_json: bool = typer.Option(False, "--json", help="Print as JSON."),
+) -> None:
+    """List what is indexed: document id, source and chunk count.
+
+    Exists because `ragorc delete` had nothing to name. Its help pointed at
+    `ragorc query --json` for an id, and that needs a working LLM — so a
+    deployment out of model credit could not find out what it had indexed, let
+    alone remove any of it. `inspect` reports counts, not ids.
+
+    `--source` matches a substring of the path, which is how you get from "I
+    deleted this file" to the id that removes it.
+    """
+    settings = _settings(collection=collection, tenant=tenant)
+
+    async def run() -> None:
+        async with _service(settings) as service:
+            rows = await service.engine.documents(tenant_id=tenant, source=source, limit=limit)
+
+        if as_json:
+            _print_json(rows)
+            return
+        if not rows:
+            err.print("[yellow]nothing indexed matches[/yellow]")
+            return
+        table = Table(title="documents", box=None, pad_edge=False)
+        table.add_column("document id")
+        table.add_column("chunks", justify="right")
+        table.add_column("source")
+        for row in rows:
+            table.add_row(str(row["document_id"]), str(row["chunks"]), str(row["source"]))
+        console.print(table)
+
+    _run(run)
+
+
+@app.command()
 def delete(
     document_ids: list[str] = typer.Argument(..., help="Document ids to remove."),
     tenant: str | None = typer.Option(None, "--tenant", "-t", help="Tenant that owns them."),
@@ -611,8 +652,8 @@ def delete(
 
     Ids, not globs. A filtered delete is one typo away from emptying an index and
     there is nothing behind it — no tombstone, no undo — so the blast radius is
-    kept equal to what was typed. Get the ids from `ragorc query --json`, which
-    reports `document_id` on every chunk.
+    kept equal to what was typed. Get the ids from `ragorc documents`, which needs
+    no model credit — this used to point at `ragorc query --json`, which does.
 
     Confirms first unless `--yes`, because this is the one command in the CLI that
     destroys data.
@@ -637,7 +678,9 @@ def delete(
         if as_json:
             _print_json(
                 {
-                    "documents": report.documents,
+                    "requested": report.documents,
+                    "found": report.found,
+                    "deleted": report.deleted,
                     "vectors": report.vectors,
                     "rows": report.rows,
                     "entities": report.entities,
@@ -649,16 +692,31 @@ def delete(
             )
             return
 
-        table = Table(title="deleted", box=None, pad_edge=False)
-        table.add_column("store")
-        table.add_column("removed", justify="right")
-        table.add_row("documents", str(report.documents))
-        table.add_row("vectors", str(report.vectors))
-        table.add_row("rows", str(report.rows))
-        table.add_row("orphaned entities", str(report.entities))
-        table.add_row("empty communities", str(report.communities))
-        table.add_row("cached answers", str(report.answers_invalidated))
+        # Two columns, because half these numbers are requests and half are
+        # results. One column headed "removed" printed `documents 1` for an id
+        # that never existed, and `cached answers 1` for an invalidation whose own
+        # primitive documents its return as "the number of documents the removal
+        # was requested for, not the number of points removed". The honest
+        # statement was there and was lost at every layer above it.
+        table = Table(title="delete", box=None, pad_edge=False)
+        table.add_column("")
+        table.add_column("count", justify="right")
+        table.add_row("documents requested", str(report.documents))
+        table.add_row("documents found", str(report.found))
+        table.add_row("vectors removed", str(report.vectors))
+        table.add_row("rows removed", str(report.rows))
+        table.add_row("orphaned entities removed", str(report.entities))
+        table.add_row("empty communities removed", str(report.communities))
+        table.add_row("cache invalidated for", f"{report.answers_invalidated} document(s)")
         console.print(table)
+
+        if report.complete and not report.deleted:
+            missing = report.documents - report.found
+            err.print(
+                f"[yellow]{missing} of {report.documents} id(s) matched nothing[/yellow] — "
+                "unknown id, already deleted, or owned by another tenant"
+            )
+            raise typer.Exit(EXIT_ERROR)
 
         if not report.complete:
             # Not an exception: the stores that succeeded are already done, and a

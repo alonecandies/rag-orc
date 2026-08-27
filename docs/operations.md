@@ -199,8 +199,23 @@ curl -X DELETE localhost:8000/documents -H 'X-API-Key: ...' \
 ```
 
 Both reach `RAGPipeline.delete`, which removes the vectors, the rows, the graph
-nodes and the cached answers built from them. Get the ids from
-`ragorc query --json`, which reports `document_id` on every chunk.
+nodes and the cached answers built from them.
+
+```bash
+ragorc documents --source policy.md     # id, chunk count, source
+curl localhost:8000/documents?source=policy.md -H 'X-API-Key: ...'
+```
+
+Get the ids from there. This used to say `ragorc query --json`, which needs a
+working LLM — so a deployment out of model credit could not find out what it had
+indexed, let alone remove any of it.
+
+**Read the report, not the exit code.** `complete` says every store answered;
+`deleted` says every document named was found and removed. They differ exactly
+when the ids did not resolve — a typo, an already-completed delete, or another
+tenant's document, which isolation refuses to touch. `complete: true,
+deleted: false` means nothing went wrong and nothing was removed, and it used to
+be indistinguishable from success.
 
 **Ids, not filters.** A filtered delete is one typo away from emptying an index
 and there is nothing behind it — no tombstone, no undo. The CLI confirms unless

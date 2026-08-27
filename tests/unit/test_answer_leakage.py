@@ -322,3 +322,56 @@ def test_the_stream_filter_states_its_limit() -> None:
     long_tag = "<untrusted_document " + "a" * (_STREAM_TAIL * 2) + ">"
     text, filt = _feed([long_tag[:10], long_tag[10:]], pii=False)
     assert not filt.scaffold_leak or "untrusted_document" not in text
+
+
+# ---------------------------------------------------------------------------
+# What the filter costs
+# ---------------------------------------------------------------------------
+def test_ordinary_prose_is_not_held_back() -> None:
+    """The regression this closes. A fixed 96-character window cost ~310 ms of
+    time-to-first-token against a provider emitting 4-character deltas — by
+    default, since PII redaction is off by default and the scaffold check is not —
+    on the one path whose docstring says to use it when latency matters.
+
+    Prose contains nothing any pattern could be mid-match on, so the only thing
+    withheld is the trailing partial word.
+    """
+    from ragorc.validate.output import _hold_back
+
+    assert _hold_back("The refund window is thirty days from the date of deliv") == len("deliv")
+    assert _hold_back("a complete sentence ends here. ") == 0
+
+
+def test_content_that_could_still_be_a_pattern_is_held() -> None:
+    """The guarantee that must survive the optimization. Phone numbers, cards,
+    IBANs and PEM headers interleave separators with digits, so a space is not a
+    safe boundary once one of those characters is in the window."""
+    from ragorc.validate.output import _STREAM_TAIL, _hold_back
+
+    for risky in ("call me on 0203 741", "write to ada", "tag <untrusted", "key AKIA-"):
+        held = _hold_back(risky)
+        assert held > 0, f"{risky!r} was emitted with a pattern possibly in flight"
+    assert _hold_back("x" * 200 + " 0203 741") == _STREAM_TAIL, "the window still bounds it"
+
+
+def test_a_zero_window_holds_nothing_rather_than_everything() -> None:
+    """`text[-0:]` is `text[0:]`, so a window of zero withheld the entire answer
+    and it arrived only at flush — the opposite of what the number says. Harmless
+    at the shipped 96 and a trap for anyone tuning it down."""
+    import ragorc.validate.output as module
+
+    original = module._STREAM_TAIL
+    module._STREAM_TAIL = 0
+    try:
+        assert module._hold_back("anything at all") == 0
+    finally:
+        module._STREAM_TAIL = original
+
+
+def test_the_split_pattern_is_still_caught_after_the_optimization() -> None:
+    """Re-asserted here rather than trusted: the whole point of holding back is
+    this case, and an optimization that emits too eagerly breaks it silently."""
+    deltas = ["Reach ada", "@exa", "mple", ".com", " today, please, at any hour."]
+    text, filt = _feed(deltas)
+    assert "ada@example.com" not in text, text
+    assert filt.entities == ["EMAIL"]

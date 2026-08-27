@@ -283,6 +283,55 @@ class AnswerValidator:
 #: matters.
 _STREAM_TAIL = 96
 
+#: Characters no pattern can contain, and which therefore end any partial match.
+#: Whitespace is the useful one: a trailing run of non-space characters is the
+#: only thing an email, a JWT or an AWS key could still be growing into, so
+#: holding back to the last space covers them at a cost of a few characters
+#: rather than ninety-six.
+_BOUNDARY = frozenset(" \t\n\r")
+
+#: Characters that mean a *whitespace-spanning* pattern may be in progress, where
+#: holding to the last space is not enough. Phone numbers, credit cards, IBANs and
+#: PEM headers all interleave separators — and all of them contain a digit or a
+#: dash. `@` and `<` are here so an email or a fence in flight is never emitted in
+#: halves. Deliberately not upper-case letters: they appear at the start of every
+#: sentence, and including them held the whole window on ordinary prose, which is
+#: how the first version of this function saved nothing at all.
+_SPANNING = frozenset("0123456789@<-")
+
+
+def _hold_back(text: str) -> int:
+    """How many trailing characters must be withheld, given what they are.
+
+    A fixed window was correct and expensive. Holding the last 96 characters
+    unconditionally cost ~310 ms of time-to-first-token against a provider
+    emitting 4-character deltas — on the one path whose docstring says to use it
+    "when latency to first token" matters, and by default, because PII redaction
+    is off by default while the scaffold check is not.
+
+    The window is only needed while a pattern *could* still be extending. Ordinary
+    prose contains none of :data:`_RISKY`, so nothing is held and the stream flows
+    at the provider's rate. Once a risky character appears, everything from it
+    onward is held until the window is exhausted — which is the same guarantee the
+    fixed window gave, applied only where it can matter.
+    """
+    if _STREAM_TAIL <= 0:
+        # `text[-0:]` is `text[0:]`, i.e. the whole string — so a window of zero
+        # held *everything* rather than nothing, and the answer arrived only at
+        # flush. Harmless at the shipped value and a trap for anyone tuning it
+        # down, which is the only reason the constant is worth a branch.
+        return 0
+    window = text[-_STREAM_TAIL:]
+    if any(char in _SPANNING for char in window):
+        # Conservative and rare: something in the window could be a pattern that
+        # keeps going across a space, so the whole window waits.
+        return len(window)
+    for offset in range(len(window) - 1, -1, -1):
+        if window[offset] in _BOUNDARY:
+            return len(window) - offset - 1
+    return len(window)
+
+
 
 class StreamLeakFilter:
     """Redacts a token stream as it passes, holding back a small tail.
@@ -302,15 +351,14 @@ class StreamLeakFilter:
     def feed(self, delta: str) -> str:
         """Absorb one delta and return the part that is safe to emit."""
         self._buffer += delta
-        if len(self._buffer) <= _STREAM_TAIL:
-            return ""
         cleaned = self._clean(self._buffer)
-        # Re-measured after cleaning: a redaction changes the length, and slicing
-        # at an offset computed before it would cut mid-token.
-        if len(cleaned) <= _STREAM_TAIL:
+        # Measured after cleaning: a redaction changes the length, so an offset
+        # computed before it would cut mid-token.
+        hold = _hold_back(cleaned)
+        if hold >= len(cleaned):
             self._buffer = cleaned
             return ""
-        emit, self._buffer = cleaned[:-_STREAM_TAIL], cleaned[-_STREAM_TAIL:]
+        emit, self._buffer = cleaned[: len(cleaned) - hold], cleaned[len(cleaned) - hold :]
         return emit
 
     def flush(self) -> str:

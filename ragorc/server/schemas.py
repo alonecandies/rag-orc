@@ -53,6 +53,8 @@ __all__ = [
     "CitationModel",
     "DeleteRequest",
     "DeleteResponse",
+    "DocumentSummary",
+    "DocumentsResponse",
     "ErrorResponse",
     "EvalItem",
     "EvalMetrics",
@@ -501,6 +503,26 @@ class IngestResponse(_Body):
 # ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
+class DocumentSummary(_Body):
+    """One indexed document, as much of it as the vector store knows."""
+
+    document_id: str
+    source: str = ""
+    chunks: int = 0
+
+
+class DocumentsResponse(_Body):
+    """What is indexed.
+
+    Exists because ``DELETE /documents`` had nothing to name: the only documented
+    way to find an id was a query, which costs a model call, and ``/health``
+    reports counts rather than ids.
+    """
+
+    request_id: str = ""
+    documents: list[DocumentSummary] = Field(default_factory=list)
+
+
 class DeleteRequest(_Body):
     """Which documents to remove.
 
@@ -537,6 +559,16 @@ class DeleteResponse(_Body):
 
     request_id: str = ""
     documents: int = 0
+    """How many ids were asked for. A request count, not a result."""
+    found: int = 0
+    """How many of them existed and were visible to this tenant."""
+    deleted: bool = False
+    """Every document named was found and removed.
+
+    Distinct from ``complete``, which only says every store answered. A delete of
+    an unknown id — or of another tenant's document, which isolation refuses to
+    touch — is ``complete=true, deleted=false``: nothing went wrong and nothing
+    was removed. Confirming a removal means reading this one."""
     vectors: int = 0
     rows: int = 0
     entities: int = 0

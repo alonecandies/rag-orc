@@ -291,6 +291,16 @@ class DeleteReport:
     """
 
     documents: int = 0
+    """How many document ids the caller asked to remove. A *request* count."""
+    found: int = 0
+    """How many of them existed and were visible to this tenant.
+
+    The number the caller actually wants, and the one that was missing. Without
+    it a delete of an id that never existed — or one belonging to another tenant,
+    which isolation correctly refuses to touch — reported ``documents=1,
+    complete=True, errors={}`` and read as a successful deletion. For the
+    compliance-driven removal this API exists to serve, a false confirmation is
+    the worst thing it can return."""
     vectors: int = 0
     rows: int = 0
     graph_chunks: int = 0
@@ -304,8 +314,23 @@ class DeleteReport:
 
     @property
     def complete(self) -> bool:
-        """Whether every store that was asked reported success."""
+        """Whether every store that was asked answered without error.
+
+        Deliberately *not* "the documents are gone" — that is :attr:`deleted`.
+        Both are needed and they answer different questions: this one says the
+        operation ran everywhere it should have, and a caller retries on ``False``.
+        """
         return not self.errors
+
+    @property
+    def deleted(self) -> bool:
+        """Whether every document named was found and removed.
+
+        ``False`` with no errors means the ids did not resolve — a typo, an
+        already-completed delete, or a tenant that does not own them. An operator
+        confirming a removal should read this, not :attr:`complete`.
+        """
+        return not self.errors and self.found == self.documents
 
 
 class RAGPipeline:
@@ -1018,6 +1043,54 @@ class RAGPipeline:
             )
         return self._ingest
 
+    async def documents(
+        self,
+        *,
+        tenant_id: str | None = None,
+        source: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """What is indexed: document id, source and chunk count.
+
+        Added because :meth:`delete` had nothing to name. Its own help pointed at
+        ``ragorc query --json`` to find an id, and that needs a working LLM — so a
+        deployment out of model credit, or one that simply wants to know what is in
+        its index, had no way to answer either question. ``inspect`` reports counts,
+        not ids, and there was no route, no store method and no command that listed
+        anything.
+
+        Read from the vector store, scoped by tenant, because that is the store
+        every deployment has and the one whose contents decide what a query can
+        find. ``source`` is a substring match, which is what makes "the id for this
+        file" answerable from the path the operator already knows.
+
+        ``limit`` counts *documents*, not chunks, and the scroll stops once it has
+        them — this is a lookup, not an export.
+        """
+        self._ensure_open()
+        tenant = self._scoped_tenant(tenant_id)
+        found: dict[str, dict[str, Any]] = {}
+        async for chunk in self.vector_store.scroll(tenant_id=tenant):
+            document_id = chunk.document_id
+            if not document_id:
+                continue
+            entry = found.get(document_id)
+            if entry is None:
+                if len(found) >= limit:
+                    continue
+                entry = found[document_id] = {
+                    "document_id": document_id,
+                    "source": (chunk.metadata or {}).get("source") or "",
+                    "chunks": 0,
+                }
+            entry["chunks"] += 1
+        rows = list(found.values())
+        if source:
+            needle = source.lower()
+            rows = [r for r in rows if needle in str(r["source"]).lower()]
+        rows.sort(key=lambda r: (str(r["source"]), str(r["document_id"])))
+        return rows
+
     async def delete(
         self,
         document_ids: Sequence[str] | str,
@@ -1057,7 +1130,8 @@ class RAGPipeline:
             return report
 
         self._audit.deleted(tenant_id=tenant, documents=len(ids))
-        chunk_ids = await self._chunk_ids_for(ids, tenant, report)
+        chunk_ids, present = await self._chunk_ids_for(ids, tenant, report)
+        report.found = len(present)
 
         report.vectors = await self._try(
             report,
@@ -1091,36 +1165,60 @@ class RAGPipeline:
         log.info(
             "documents_deleted",
             documents=len(ids),
+            found=report.found,
             vectors=report.vectors,
             rows=report.rows,
             entities=report.entities,
             errors=list(report.errors),
             tenant_id=tenant,
         )
+        if report.found < report.documents and not report.errors:
+            # Not an error — deleting what is not there is a no-op by design — but
+            # an operator who asked to remove something and removed nothing needs
+            # to be told, because every other number in the report reads as success.
+            log.warning(
+                "delete_matched_nothing",
+                requested=report.documents,
+                found=report.found,
+                tenant_id=tenant,
+                hint="unknown id, already deleted, or owned by another tenant",
+            )
         return report
 
     async def _chunk_ids_for(
         self, document_ids: Sequence[str], tenant: str | None, report: DeleteReport
-    ) -> list[str]:
-        """The graph's only handle on a document, read before anything is removed.
+    ) -> tuple[list[str], set[str]]:
+        """What is actually there, read before anything is removed.
 
-        A ``Chunk`` node stores an id and no document reference, so this is the
-        one chance to learn which nodes belong to the documents being deleted.
-        Read from the vector store rather than the relational one because the
-        vector store is the only one guaranteed to be present.
+        Returns the chunk ids and the set of document ids that resolved. Two
+        callers for one scroll:
+
+        * The graph needs the chunk ids. A ``Chunk`` node stores an id and no
+          document reference, so this is the only chance to learn which nodes
+          belong to the documents being deleted — after the vectors go they are
+          unreachable.
+        * The report needs to know what existed. Every store's delete is
+          "remove what matches", which succeeds identically over nothing, so
+          without this the report could not tell a completed deletion from a typo
+          or from a tenant that does not own the id.
+
+        Read from the vector store because it is the only one guaranteed to be
+        present, and scoped by tenant so a foreign id resolves to nothing — which
+        is what makes ``found`` an honest answer under isolation rather than a
+        report that the delete "worked".
         """
-        if not self.settings.graph.enabled:
-            return []
+        chunk_ids: list[str] = []
+        present: set[str] = set()
         try:
-            return [
-                chunk.id
-                async for chunk in self.vector_store.scroll(
-                    filters={"document_id": list(document_ids)}, tenant_id=tenant
-                )
-            ]
+            async for chunk in self.vector_store.scroll(
+                filters={"document_id": list(document_ids)}, tenant_id=tenant
+            ):
+                chunk_ids.append(chunk.id)
+                if chunk.document_id:
+                    present.add(chunk.document_id)
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             report.errors["chunk_lookup"] = str(exc)[:200]
-            return []
+        return chunk_ids, present
 
     @staticmethod
     async def _try(report: DeleteReport, store: str, awaitable: Any) -> Any:

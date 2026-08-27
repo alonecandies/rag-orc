@@ -146,6 +146,8 @@ from ragorc.server.schemas import (
     MAX_QUESTION_CHARS,
     DeleteRequest,
     DeleteResponse,
+    DocumentsResponse,
+    DocumentSummary,
     ErrorResponse,
     EvalItem,
     EvalMetrics,
@@ -1282,6 +1284,30 @@ class RagService:
         )
 
     # -- ingest ------------------------------------------------------------
+    async def documents(
+        self,
+        *,
+        tenant_id: str | None = None,
+        source: str | None = None,
+        limit: int = 100,
+        request_id: str = "",
+        principal: str = ANONYMOUS,
+    ) -> DocumentsResponse:
+        """List indexed documents, scoped to the caller's tenant."""
+        request_id = request_id or _new_request_id()
+        with self._request_context(request_id):
+            tenant = resolve_tenant(
+                tenant_id or self.settings.tenant_id,
+                principal=principal,
+                bindings=self.tenant_bindings,
+                settings=self.settings.security,
+            )
+            rows = await self.engine.documents(tenant_id=tenant, source=source, limit=limit)
+        return DocumentsResponse(
+            request_id=request_id,
+            documents=[DocumentSummary(**row) for row in rows],
+        )
+
     async def delete(
         self,
         request: DeleteRequest,
@@ -1309,6 +1335,8 @@ class RagService:
         return DeleteResponse(
             request_id=request_id,
             documents=report.documents,
+            found=report.found,
+            deleted=report.deleted,
             vectors=report.vectors,
             rows=report.rows,
             entities=report.entities,
@@ -2336,6 +2364,34 @@ def create_app(settings: Settings | None = None) -> Any:
         return await service.ingest(
             await _json_body(request, IngestRequest, resolved),
             request_id=request_id,
+            principal=principal,
+        )
+
+    @app.get(
+        "/documents",
+        response_model=DocumentsResponse,
+        summary="List indexed documents.",
+        responses=_error_responses(),
+    )
+    async def list_documents(
+        request: Request,
+        source: str | None = None,
+        limit: int = 100,
+        tenant_id: str | None = None,
+        service: RagService = Depends(service_dependency),
+        principal: str = Depends(guard),
+    ) -> DocumentsResponse:
+        """The read that makes ``DELETE /documents`` usable.
+
+        Authenticated and tenant-scoped like every other read: a list of what is
+        indexed is a list of what exists, which is exactly the enumeration the
+        400-not-403 choice elsewhere in this service exists to avoid leaking.
+        """
+        return await service.documents(
+            tenant_id=tenant_id,
+            source=source,
+            limit=limit,
+            request_id=_request_id(request),
             principal=principal,
         )
 

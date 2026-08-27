@@ -155,14 +155,16 @@ async def test_the_graph_is_skipped_when_it_is_not_enabled() -> None:
     assert report.entities == 0
 
 
-async def test_the_chunk_id_lookup_is_skipped_when_the_graph_is_off() -> None:
-    """Not just the delete — the *read* too. The ids exist only to hand to the
-    graph, so scrolling a document's every chunk to build a list nobody uses is
-    pure cost, paid on a path whose whole job is to remove things.
+async def test_the_lookup_runs_even_with_the_graph_off() -> None:
+    """A deliberate reversal, recorded because the previous test asserted the
+    opposite.
 
-    Two guards cover this, and either alone gives the same result, so a mutation
-    removing one is correctly invisible in the behaviour above. This pins the
-    property the redundancy is actually protecting.
+    The scroll used to be skipped when the graph was off, on the grounds that the
+    chunk ids existed only to hand to Neo4j. It has a second reader now: the
+    report cannot say whether anything was *found* without asking, and every
+    store's delete is "remove what matches", which succeeds identically over
+    nothing. One scroll bounded by the documents being deleted is the price of a
+    report that can tell a completed deletion from a typo.
     """
     _CountingScroll.scrolls = 0
     store = _CountingScroll()
@@ -172,9 +174,10 @@ async def test_the_chunk_id_lookup_is_skipped_when_the_graph_is_off() -> None:
     )
     pipeline._semantic_cache = None
 
-    await pipeline.delete(["policy"])
+    report = await pipeline.delete(["policy"])
 
-    assert _CountingScroll.scrolls == 0, "the collection was scrolled for ids nobody wanted"
+    assert _CountingScroll.scrolls == 1
+    assert report.found == 1 and report.deleted
 
 
 async def test_deleting_nothing_is_not_an_error() -> None:
@@ -282,3 +285,130 @@ async def test_the_attempt_is_audited_even_if_it_fails() -> None:
 
     actions = [getattr(e, "action", None) for e in events]
     assert "delete" in actions, f"a delete left no audit record: {actions}"
+
+
+# ---------------------------------------------------------------------------
+# The report has to be able to say "nothing happened"
+# ---------------------------------------------------------------------------
+async def test_a_refused_cross_tenant_delete_does_not_read_as_success() -> None:
+    """The worst thing this API can return. Isolation correctly protects the
+    chunk, and the report used to say `documents=1, complete=True, errors={}` —
+    which for a compliance-driven removal is a false confirmation that data is
+    gone."""
+    pipeline, store = await _pipeline(
+        settings=_settings(isolation=True),
+        chunks=[_chunk("c1", "policy", "acme")],
+    )
+
+    report = await pipeline.delete(["policy"], tenant_id="globex")
+
+    assert report.documents == 1, "the request count is still what was asked"
+    assert report.found == 0, "nothing belonging to globex resolved"
+    assert not report.deleted, "the report claimed a deletion that did not happen"
+    assert report.complete, "no store errored, which is a different question"
+    assert [c.id async for c in store.scroll()] == ["c1"]
+
+
+async def test_deleting_an_unknown_id_is_reported_as_finding_nothing() -> None:
+    pipeline, _store = await _pipeline(
+        graph=FakeGraphDeleter(), chunks=[_chunk("c1", "policy")]
+    )
+
+    report = await pipeline.delete(["never-existed"])
+
+    assert (report.documents, report.found) == (1, 0)
+    assert not report.deleted
+    assert report.complete
+
+
+async def test_a_real_delete_reports_both_numbers_equal() -> None:
+    pipeline, _store = await _pipeline(
+        graph=FakeGraphDeleter(), chunks=[_chunk("c1", "policy"), _chunk("c2", "faq")]
+    )
+
+    report = await pipeline.delete(["policy", "faq"])
+
+    assert (report.documents, report.found) == (2, 2)
+    assert report.deleted and report.complete
+
+
+async def test_a_partial_match_is_neither_success_nor_failure() -> None:
+    """One good id and one typo. `complete` is true — every store answered — and
+    `deleted` is false, because the caller did not get what they asked for."""
+    pipeline, _store = await _pipeline(
+        graph=FakeGraphDeleter(), chunks=[_chunk("c1", "policy")]
+    )
+
+    report = await pipeline.delete(["policy", "typo"])
+
+    assert (report.documents, report.found) == (2, 1)
+    assert report.complete and not report.deleted
+
+
+async def test_complete_and_deleted_answer_different_questions() -> None:
+    """A store failing must not be confused with an id not existing, and vice
+    versa — the two states need different remedies (retry, versus check the id)."""
+    pipeline, _store = await _pipeline(
+        graph=_BrokenGraph(), chunks=[_chunk("c1", "policy")]
+    )
+
+    report = await pipeline.delete(["policy"])
+
+    assert report.found == 1, "the document was there"
+    assert not report.complete, "but a store did not answer"
+    assert not report.deleted, "so the removal cannot be confirmed"
+
+
+# ---------------------------------------------------------------------------
+# Finding an id in the first place
+# ---------------------------------------------------------------------------
+async def test_documents_lists_what_is_indexed() -> None:
+    """`delete` had nothing to name. Its help pointed at `query --json`, which
+    needs a working LLM, and `inspect` reports counts rather than ids — so a
+    deployment out of model credit could not discover what it had indexed."""
+    pipeline, store = await _pipeline()
+    await store.upsert(
+        [_chunk("c1", "policy"), _chunk("c2", "policy"), _chunk("c3", "faq")]
+    )
+
+    rows = await pipeline.documents()
+
+    assert [(r["document_id"], r["chunks"]) for r in rows] == [("faq", 1), ("policy", 2)]
+
+
+async def test_documents_is_scoped_to_the_tenant() -> None:
+    """A list of what is indexed is a list of what exists — the enumeration the
+    400-not-403 choice elsewhere exists to avoid leaking."""
+    pipeline, store = await _pipeline(settings=_settings(isolation=True))
+    await store.upsert(
+        [_chunk("c1", "acme-doc", "acme"), _chunk("c2", "globex-doc", "globex")]
+    )
+
+    rows = await pipeline.documents(tenant_id="globex")
+
+    assert [r["document_id"] for r in rows] == ["globex-doc"]
+
+
+async def test_documents_can_be_filtered_by_source() -> None:
+    """How you get from "I deleted this file" to the id that removes it."""
+    pipeline, store = await _pipeline()
+    a = _chunk("c1", "policy")
+    a.metadata = {"source": "/corpus/policy.md"}
+    b = _chunk("c2", "faq")
+    b.metadata = {"source": "/corpus/faq.md"}
+    await store.upsert([a, b])
+
+    rows = await pipeline.documents(source="policy")
+
+    assert [r["document_id"] for r in rows] == ["policy"]
+
+
+async def test_the_limit_counts_documents_not_chunks() -> None:
+    """A document with a thousand chunks must not exhaust a limit of ten."""
+    pipeline, store = await _pipeline()
+    await store.upsert([_chunk(f"c{i}", "policy") for i in range(20)])
+    await store.upsert([_chunk("z1", "faq")])
+
+    rows = await pipeline.documents(limit=1)
+
+    assert len(rows) == 1
