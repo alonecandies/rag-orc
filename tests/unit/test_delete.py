@@ -412,3 +412,81 @@ async def test_the_limit_counts_documents_not_chunks() -> None:
     rows = await pipeline.documents(limit=1)
 
     assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Through the real app
+# ---------------------------------------------------------------------------
+async def _http(chunks: list[Chunk], settings: Settings | None = None) -> Any:
+    """A TestClient over the real app with a fake-backed engine.
+
+    Both routes are new and neither had been driven through FastAPI. The drift
+    that matters is between the links — a response model that omits a field, a
+    query parameter that never reaches the service — and nothing in this file
+    would catch it.
+    """
+    from fastapi.testclient import TestClient
+
+    from ragorc.server.app import RagService, create_app, service_dependency
+
+    resolved = settings or _settings(graph=False)
+    store = FakeVectorStore()
+    if chunks:
+        await store.upsert(chunks)
+    engine = RAGPipeline(settings=resolved, vector_store=store)
+    engine._semantic_cache = None
+
+    service = RagService(resolved)
+    service.engine = engine
+    app = create_app(resolved)
+    app.dependency_overrides[service_dependency] = lambda: service
+    return TestClient(app), store
+
+
+async def test_http_lists_documents() -> None:
+    a = _chunk("c1", "policy")
+    a.metadata = {"source": "/corpus/policy.md"}
+    b = _chunk("c2", "faq")
+    b.metadata = {"source": "/corpus/faq.md"}
+    client, _store = await _http([a, b])
+
+    with client:
+        response = client.get("/documents")
+
+    assert response.status_code == 200
+    listed = {d["document_id"]: d for d in response.json()["documents"]}
+    assert set(listed) == {"policy", "faq"}
+    assert listed["policy"]["source"] == "/corpus/policy.md"
+    assert listed["policy"]["chunks"] == 1
+
+
+async def test_http_filters_documents_by_source() -> None:
+    """The query parameter has to survive FastAPI's signature binding to reach the
+    service — a field the response model declares but the route never fills is the
+    shape this catches."""
+    a = _chunk("c1", "policy")
+    a.metadata = {"source": "/corpus/policy.md"}
+    b = _chunk("c2", "faq")
+    b.metadata = {"source": "/corpus/faq.md"}
+    client, _store = await _http([a, b])
+
+    with client:
+        response = client.get("/documents", params={"source": "faq"})
+
+    assert [d["document_id"] for d in response.json()["documents"]] == ["faq"]
+
+
+async def test_http_delete_reports_found_and_deleted() -> None:
+    """The two fields the round added. A response model that declares them and a
+    service that never sets them would serialize defaults — `found: 0,
+    deleted: false` on a successful delete — which is the mirror of the bug."""
+    client, _store = await _http([_chunk("c1", "policy")])
+
+    with client:
+        removed = client.request("DELETE", "/documents", json={"document_ids": ["policy"]})
+        missing = client.request("DELETE", "/documents", json={"document_ids": ["nope"]})
+
+    assert removed.status_code == 200
+    assert (removed.json()["found"], removed.json()["deleted"]) == (1, True)
+    assert (missing.json()["found"], missing.json()["deleted"]) == (0, False)
+    assert missing.json()["complete"] is True, "nothing errored; nothing was there"
