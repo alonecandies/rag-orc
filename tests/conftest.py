@@ -7,14 +7,42 @@ the ``integration`` marker, which is deselected by default in
 
 from __future__ import annotations
 
+import os
+import pathlib
 import socket
 
 import numpy as np
 import pytest
 
-from ragorc.core.models import Chunk, Document, Query, ScoredChunk
-from ragorc.core.settings import Settings, get_settings
-from tests.fakes import (
+#: Where tiktoken keeps the BPE file it downloads. Set before anything imports
+#: tiktoken, because it reads this at import time.
+#:
+#: Its default is a directory under ``tempfile.gettempdir()``, which on macOS is
+#: a per-boot path under ``/var/folders`` that the OS periodically purges. So the
+#: unit suite passed or failed depending on whether *some earlier process on this
+#: machine* had warmed a cache that nothing in the repo owns: a full green run,
+#: then five failures an hour later with no change in between, all reported as
+#: "unit test opened a real connection". Pinning it inside the repo makes the
+#: download happen once per clone instead of once per temp-dir purge.
+_CACHE_ROOT = pathlib.Path(__file__).resolve().parent.parent / ".cache"
+_TIKTOKEN_CACHE = _CACHE_ROOT / "tiktoken"
+_TIKTOKEN_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(_TIKTOKEN_CACHE))
+
+#: The same problem one library over. FastEmbed defaults to ``fastembed_cache``
+#: in the system temp directory, so four ingest tests downloaded an ONNX model
+#: whenever that directory had been purged — and then failed inside the network
+#: guard, whose message ("inject a fake store or embedder") describes neither the
+#: cause nor the fix.
+_FASTEMBED_CACHE = _CACHE_ROOT / "fastembed"
+_FASTEMBED_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("FASTEMBED_CACHE_PATH", str(_FASTEMBED_CACHE))
+
+# Imported after the environment is set, not before: `tiktoken` reads
+# TIKTOKEN_CACHE_DIR at import time and `ragorc` pulls it in transitively.
+from ragorc.core.models import Chunk, Document, Query, ScoredChunk  # noqa: E402
+from ragorc.core.settings import Settings, get_settings  # noqa: E402
+from tests.fakes import (  # noqa: E402
     FakeCache,
     FakeGraphStore,
     FakeRelationalStore,
@@ -27,6 +55,67 @@ from tests.fakes import (
 
 _REAL_CONNECT = socket.socket.connect
 _REAL_CONNECT_EX = socket.socket.connect_ex
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _tokenizer_cache() -> bool:
+    """Warm the BPE cache once per session, before the network guard is armed.
+
+    The guard is function-scoped and this is session-scoped, so this runs first
+    and with real sockets — which is the only honest way to keep both promises at
+    once. `tests/fakes` says the suite runs with "no network, no model
+    downloads"; that is true of every *test*, and it was never true of the first
+    thing a test asked for a token count.
+
+    Returns whether an encoder is available, so a test that needs exact counts can
+    skip with a reason instead of failing inside the guard with a message about
+    injecting a fake store — which is not the problem and not the fix.
+
+    After the first successful run the cache is on disk in the repo and no
+    subsequent run touches the network at all.
+    """
+    from ragorc.core.tokens import load_encoder
+
+    try:
+        return load_encoder() is not None
+    except Exception:  # noqa: BLE001 - availability is the answer, not the cause
+        return False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _embedder_cache() -> bool:
+    """Warm the default ONNX embedding model once, for the same reason.
+
+    Session-scoped and therefore ahead of the function-scoped network guard, so
+    the one download a fresh clone needs happens outside it. Four ingest tests
+    build a real embedder — deliberately, since they are testing the dimension
+    pin that only a real model has — and every one of them reached the network on
+    a cold cache.
+    """
+    from ragorc.core.settings import get_settings
+
+    try:
+        from ragorc.embed.fastembed_provider import _load
+    except ImportError:  # pragma: no cover - fastembed is an extra
+        return False
+    embedding = get_settings().embedding
+    # Dense and sparse only. Those are the two the default ingest path builds, and
+    # they are ~68 MB together; ColBERT is another order of magnitude and no unit
+    # test needs a real one, so a clone does not pay for it.
+    wanted = (("dense", embedding.dense_model), ("sparse", embedding.sparse_model))
+    for kind, model in wanted:
+        try:
+            _load(kind, model, embedding.threads)
+        except Exception:  # noqa: BLE001 - availability is the answer, not the cause
+            return False
+    return True
+
+
+@pytest.fixture
+def requires_tokenizer(_tokenizer_cache: bool) -> None:
+    """Skip when the real BPE is unavailable — a cold cache with no network."""
+    if not _tokenizer_cache:
+        pytest.skip("tiktoken BPE unavailable offline; token counts fall back to an estimate")
 
 
 @pytest.fixture(autouse=True)
