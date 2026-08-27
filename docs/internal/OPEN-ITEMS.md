@@ -425,6 +425,74 @@ to exercise; and a redundancy that made a mutation genuinely invisible, where
 the fix was to pin the property the redundancy protects rather than the
 redundancy itself.
 
+## 11j. Closed: round eleven — the loader, late chunking, and last round's work
+
+Fourteen findings across three areas. Two of the three had never been audited;
+the third was the previous round's own output, which turned out to be as prone
+to this codebase's characteristic defect as the code it fixed.
+
+**The loader was the worst single module found in eleven rounds.** 1400 lines,
+no test file, and the place untrusted files enter. Six defects, two of which end
+in an empty corpus and no error — the failure nobody notices, because it looks
+exactly like ingesting an empty directory. One renamed `.docx` aborted a
+twenty-file walk and recorded no failure, because the catch tuple missed
+`PackageNotFoundError` and `FileDataError` — the two exceptions the class
+docstring names when it promises in bold that this cannot happen. And any ingest
+root *under* a directory called `build`, `env`, `dist`, `target` or `.cache`
+loaded nothing, because the skip list was matched against the absolute path and
+so vetoed ancestors above the root the caller named.
+
+The other four: every multipart upload minted a fresh `document_id` (identity
+came from the ephemeral staging path, so re-uploading duplicated forever and the
+checksum skip could never fire); `IngestRequest.recursive` and `metadata` were
+parsed, validated and dropped before any loader was built; `JSONLoader` built
+documents on the event loop (676 ms stall on 16 MB, against its JSONL sibling's
+52 ms); and `CSVLoader` used `splitlines()`, which deletes newlines inside
+quoted cells and splits on six characters CSV does not treat as terminators.
+
+**Late chunking was pooling through the model ADR-0002 rejects.** Three call
+sites, all wiring rather than mathematics. `_late_chunker()` passed the ColBERT
+embedder as the token source — the substitution the ADR records as already tried
+and removed, "a different model in a different space at a different width" —
+while `build_late_chunking_embedder`, which wires the dense model in correctly,
+had no in-library caller at all. The route in was one the ADR does not mention:
+enabling ColBERT *reranking* switched the *chunking strategy*, because
+`FastEmbedLateInteraction` exposes token output. The disagreement was visible
+without running anything, `supports_late_chunking()` False against
+`resolve_strategy()` LATE, and the test the ADR says covers it passes the dense
+embedder rather than the pipeline's chunker.
+
+Alongside it, `query_side` — the variable whose whole purpose is to name the
+object queries must use — was computed and read in one dead branch, so under
+LATE the store went on embedding queries with the dense provider. And RAPTOR
+summaries, multi-representation units and parent documents were embedded by the
+dense provider too, landing in a different space from the leaves they share a
+collection with.
+
+**Round ten's own output.** A delete that removed nothing reported
+`documents=1, complete=True, errors={}` — including when tenant isolation had
+correctly refused it, which is a false confirmation for the one use case the
+feature exists for. The CLI printed request counts under a column headed
+"removed". The streaming leak filter cost ~310 ms of time-to-first-token, by
+default, on the path documented as the one to use when latency matters. And
+`ragorc delete` pointed at `ragorc query --json` to find an id, which needs a
+model call — nothing could list what was indexed.
+
+**Mutation verification found seven tests that passed for the wrong reason**,
+the highest count yet, and six of the seven were one mistake: testing a helper
+instead of the call site that uses it. Reverting `_ensure_stores` so it never
+called `_bind_query_side`, and reverting both stage sites to `_dense()`, all
+left the suite green because the helpers were still correct and still unreached.
+That is the gap this codebase is named for, found by mutation for the third
+round running. The other one overrode the very method under test, so the handler
+it was checking never ran.
+
+Two findings were nearly reported wrongly in the *other* direction: the
+dataclass performance claim measured 1.62x under an unfair six-field comparison
+and 2.87–3.25x field-for-field, and the ColBERT finding was nearly refuted
+because `_late_chunker()` reads an injected attribute that is `None` on a bare
+`IngestPipeline` and only becomes ColBERT once the builder wires it.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
@@ -515,6 +583,22 @@ Round ten:
   added anyway; the leak was not real.
 * "The LangChain adapter synthesizes a fake similarity score" — it is rank-derived
   and the default fusion is RRF, which reads position.
+
+Round eleven:
+
+* Four documented performance claims, all measured and all holding: dataclass
+  construction 2.87-3.25x with 86% less memory (the docs say 2-3x and ~40%, so the
+  memory figure is understated), orjson 12x on dumps, float32 4.0 KiB against a
+  ~32 KiB list, and `tiktoken.encode_batch` genuinely releasing the GIL.
+* Prometheus label cardinality is bounded — two labels, 21 series, no tenant or
+  question anywhere near a label.
+* Symlink escape from an ingest root, `..` escape from the upload staging
+  directory, the 20 MB `MAX_FILE_BYTES` ceiling being unenforced, and silent loss
+  on decode failure: all four checked against real files, all clean.
+* The late-chunking mathematics: no off-by-one in the char-to-token map, no NaN
+  or unit-cosine collision from a zero-token span, no splitter span violations
+  under Hypothesis, no RAPTOR non-termination or leaf/summary id collision, and no
+  token drop in the long-document windowing. The defects were all in the wiring.
 
 ## 15. Deliberately unused, kept on purpose
 
