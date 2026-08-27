@@ -9,8 +9,25 @@ Three independent checks, because they catch different failures:
   the most convincing hallucination there is: a plausible quotation attributed to
   a real document that does not contain it. Comparison is on normalized text, so
   whitespace and smart-quote differences do not cause false alarms.
-* **Leakage** — the answer must not contain PII that was redacted upstream, or
-  the delimiters of our own prompt scaffolding.
+* **Leakage** — the answer must not carry personal data out, nor the delimiters
+  of our own prompt scaffolding. Both are *removed*, not merely reported: this
+  section promised "must not contain" for nine rounds while implementing only
+  half of it, and the half it did implement set a flag no code read.
+
+The asymmetry the leakage check exists for
+------------------------------------------
+``enable_pii_redaction`` used to scrub the inbound *question* and nothing else.
+The question is written by the caller, who already knows what is in it; the
+answer is assembled from retrieved documents, which is where the corpus's
+personal data actually lives. So the setting protected the least likely source
+and missed the most likely one, and an operator reading "PII redaction: on" had
+no way to tell.
+
+Scaffolding is stripped rather than abstained on. A model echoing
+``</untrusted_document>`` is usually quoting a document that contains it, not
+mounting an attack, and refusing to answer would turn a formatting artifact into
+an outage; removing the delimiter costs nothing and closes the case where the
+echo *is* an attempt to forge a fence in the next turn's context.
 """
 
 from __future__ import annotations
@@ -24,10 +41,11 @@ import structlog
 
 from ragorc.core.models import Answer, Citation, ScoredChunk
 from ragorc.core.settings import Settings, get_settings
+from ragorc.security.pii import PIIRedactor
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["AnswerValidator", "OutputReport"]
+__all__ = ["AnswerValidator", "OutputReport", "StreamLeakFilter"]
 
 #: Matches grouped markers too. The single-number version silently disagreed
 #: with ``ragorc.generate.citations``, which has always emitted and parsed the
@@ -83,13 +101,22 @@ class OutputReport:
     invalid_citations: list[int] = field(default_factory=list)
     unverified_quotes: list[str] = field(default_factory=list)
     scaffold_leak: bool = False
+    """Prompt scaffolding appeared in the answer and was stripped from it."""
+    pii_entities: list[str] = field(default_factory=list)
+    """Entity kinds redacted out of the answer, in the order first seen."""
     citation_coverage: float = 1.0
     """Fraction of the answer's sentences that carry at least one citation."""
+
+    @property
+    def redacted(self) -> bool:
+        """Whether :meth:`AnswerValidator.validate` rewrote the answer text."""
+        return self.scaffold_leak or bool(self.pii_entities)
 
 
 class AnswerValidator:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.redactor = PIIRedactor(self.settings.security)
 
     def validate(self, answer: Answer, chunks: list[ScoredChunk]) -> OutputReport:
         report = OutputReport()
@@ -126,10 +153,11 @@ class AnswerValidator:
                     "documents they are attributed to"
                 )
 
-        # --- prompt scaffolding must not leak into the answer -------------
-        if _SCAFFOLD.search(answer.text):
-            report.scaffold_leak = True
-            report.warnings.append("answer contains prompt scaffolding markup")
+        # --- nothing leaks out of the answer ------------------------------
+        # Rewrites `answer.text` in place, which is why it runs before coverage
+        # is measured below: coverage counts sentences, and a redaction can
+        # remove one.
+        self._strip_leaks(answer, report)
 
         # --- how much of the answer is actually attributed ----------------
         report.citation_coverage = self._coverage(answer.text)
@@ -139,6 +167,54 @@ class AnswerValidator:
         if report.warnings:
             log.info("answer_validation", valid=report.valid, warnings=report.warnings)
         return report
+
+    def stream_filter(self) -> StreamLeakFilter:
+        """A leak filter for a token stream.
+
+        Groundedness cannot run on a stream — it needs the whole answer, and you
+        cannot un-emit a token. The leakage checks are regexes over emitted text
+        and have no such constraint, so they were being skipped for a reason that
+        only covered the other two checks. ``stream()`` had no outbound validation
+        of any kind, which meant ``enable_pii_redaction`` silently applied to
+        ``/query`` and not to ``/query/stream``.
+        """
+        return StreamLeakFilter(
+            self.redactor if self.settings.security.enable_pii_redaction else None
+        )
+
+    def _strip_leaks(self, answer: Answer, report: OutputReport) -> None:
+        """Remove scaffolding and personal data from the answer, and say so.
+
+        Removal rather than detection. The previous version set
+        ``report.scaffold_leak`` and appended a warning, and nothing read either:
+        the flag had no consumer anywhere in the package, it did not set
+        ``report.valid`` to ``False``, it was absent from
+        ``answer.metadata["validation"]``, and the markup went to the reader
+        unchanged. "Must not contain" describes prevention; that was a log line.
+
+        Neither finding invalidates the answer. ``valid`` gates the groundedness
+        check and the abstention path, and an answer that quoted a delimiter or
+        mentioned an email address is not therefore ungrounded — failing it would
+        spend a retry on a text problem that has already been fixed by the time
+        anything reads the flag.
+        """
+        text = answer.text
+        if _SCAFFOLD.search(text):
+            report.scaffold_leak = True
+            text = _SCAFFOLD.sub("", text)
+            report.warnings.append("prompt scaffolding was stripped from the answer")
+
+        if self.settings.security.enable_pii_redaction:
+            result = self.redactor.redact(text)
+            if result.found:
+                report.pii_entities = list(result.entities)
+                text = result.text
+                report.warnings.append(
+                    f"PII redacted from answer: {', '.join(report.pii_entities)}"
+                )
+
+        if text != answer.text:
+            answer.text = text.strip()
 
     @staticmethod
     def _quote_present(quote: str, source: str, *, threshold: float = 0.92) -> bool:
@@ -192,6 +268,72 @@ class AnswerValidator:
             c for c in answer.citations if c.chunk_id in {x.chunk.id for x in chunks}
         ]
         return answer
+
+
+#: How much of the stream is held back so a pattern split across two deltas is
+#: still seen whole. A provider emits a few characters at a time, so an email
+#: address or a `</untrusted_document>` tag routinely straddles a boundary and a
+#: filter that scanned each delta alone would miss most of them.
+#:
+#: 96 characters comfortably exceeds every pattern in `security.pii` and a normal
+#: scaffold tag. The bound is real and worth stating: a *longer* construction —
+#: `<untrusted_document ` followed by 200 characters of attributes — can still
+#: straddle the window and reach the reader. The complete answer is re-checked by
+#: `validate()` on the non-streaming path, which is the one to use when this
+#: matters.
+_STREAM_TAIL = 96
+
+
+class StreamLeakFilter:
+    """Redacts a token stream as it passes, holding back a small tail.
+
+    Stateful and single-use, like the stream it wraps. Feed each delta and emit
+    what comes back; call :meth:`flush` once the stream ends to release the tail.
+    """
+
+    __slots__ = ("_buffer", "_redactor", "entities", "scaffold_leak")
+
+    def __init__(self, redactor: PIIRedactor | None) -> None:
+        self._redactor = redactor
+        self._buffer = ""
+        self.scaffold_leak = False
+        self.entities: list[str] = []
+
+    def feed(self, delta: str) -> str:
+        """Absorb one delta and return the part that is safe to emit."""
+        self._buffer += delta
+        if len(self._buffer) <= _STREAM_TAIL:
+            return ""
+        cleaned = self._clean(self._buffer)
+        # Re-measured after cleaning: a redaction changes the length, and slicing
+        # at an offset computed before it would cut mid-token.
+        if len(cleaned) <= _STREAM_TAIL:
+            self._buffer = cleaned
+            return ""
+        emit, self._buffer = cleaned[:-_STREAM_TAIL], cleaned[-_STREAM_TAIL:]
+        return emit
+
+    def flush(self) -> str:
+        """Release what is held back. Called once, when the stream is done."""
+        out, self._buffer = self._clean(self._buffer), ""
+        return out
+
+    def _clean(self, text: str) -> str:
+        if _SCAFFOLD.search(text):
+            self.scaffold_leak = True
+            text = _SCAFFOLD.sub("", text)
+        if self._redactor is not None:
+            result = self._redactor.redact(text)
+            if result.found:
+                for entity in result.entities:
+                    if entity not in self.entities:
+                        self.entities.append(entity)
+                text = result.text
+        return text
+
+    @property
+    def redacted(self) -> bool:
+        return self.scaffold_leak or bool(self.entities)
 
 
 def build_citations(answer_text: str, chunks: list[ScoredChunk]) -> list[Citation]:

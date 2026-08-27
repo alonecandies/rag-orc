@@ -1159,23 +1159,40 @@ class RAGPipeline:
             max_calls=cost.max_llm_calls_per_query,
             max_tokens=cost.max_tokens_per_query,
             trace=self.settings.observability.trace_enabled,
-        ):
+        ) as (_trace, ledger):
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
-            state, nodes = await self._retrieve_for_stream(
-                question, tenant=tenant, top_k=top_k, filters=filters, pipeline=pipeline
-            )
-            query = state.get("query")
-            if query is None:  # pragma: no cover - validate raises before this
-                return
-            retrieval = RetrievalResult(chunks=evidence(state))
-            async for delta in self.generator.stream(
-                query,
-                retrieval,
-                route=state.get("route"),
-                prompt_name=nodes.prompt_for(state),
-            ):
-                yield delta
+            chunks = 0
+            try:
+                state, nodes = await self._retrieve_for_stream(
+                    question, tenant=tenant, top_k=top_k, filters=filters, pipeline=pipeline
+                )
+                query = state.get("query")
+                if query is None:  # pragma: no cover - validate raises before this
+                    return
+                retrieval = RetrievalResult(chunks=evidence(state))
+                chunks = len(retrieval.chunks)
+                async for delta in self.generator.stream(
+                    query,
+                    retrieval,
+                    route=state.get("route"),
+                    prompt_name=nodes.prompt_for(state),
+                ):
+                    yield delta
+            finally:
+                # `answered` lives in `_finish`, which only `query` calls — so the
+                # audit trail recorded that a streamed question was *asked* and
+                # never that it was answered, what it cost, or how much evidence it
+                # had. In `finally` because a disconnect mid-stream closes the
+                # generator, and a run that was billed and abandoned is exactly the
+                # one an audit reader needs to see.
+                self._audit.answered(
+                    tenant_id=tenant,
+                    cost_usd=ledger.total.cost_usd,
+                    chunks=chunks,
+                    grounded=False,
+                    streamed=True,
+                )
 
     async def _retrieve_for_stream(
         self,

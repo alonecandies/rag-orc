@@ -101,12 +101,30 @@ class AuditLog:
         )
 
     def answered(
-        self, *, tenant_id: str | None, cost_usd: float, chunks: int, grounded: bool
+        self,
+        *,
+        tenant_id: str | None,
+        cost_usd: float,
+        chunks: int,
+        grounded: bool,
+        streamed: bool = False,
     ) -> None:
+        """Record that a question was answered, and what it cost.
+
+        ``streamed`` marks the answers that carry no groundedness verdict because
+        the path they took cannot produce one, so a reader of the log can tell
+        "not grounded" from "never checked" — two very different facts that a bare
+        ``grounded=False`` conflates.
+        """
         self.record(
             AuditEvent(
                 "answer",
                 tenant_id=tenant_id,
-                detail={"cost_usd": round(cost_usd, 6), "chunks": chunks, "grounded": grounded},
+                detail={
+                    "cost_usd": round(cost_usd, 6),
+                    "chunks": chunks,
+                    "grounded": grounded,
+                    "streamed": streamed,
+                },
             )
         )

@@ -238,6 +238,12 @@ class AnswerGenerator:
                 "invalid_citations": report.invalid_citations,
                 "unverified_quotes": report.unverified_quotes,
                 "citation_coverage": round(report.citation_coverage, 3),
+                # Both were computed and reported nowhere. A caller cannot tell
+                # that an answer was rewritten unless the rewrite is declared,
+                # and "was any of this redacted?" is a question a compliance
+                # reader asks of every answer, not only the ones that warned.
+                "scaffold_leak": report.scaffold_leak,
+                "pii_redacted": report.pii_entities,
                 "warnings": report.warnings,
             },
             "unsupported_claims": unsupported,
@@ -279,6 +285,14 @@ class AnswerGenerator:
         the caller fetch verification separately — never to stream an answer while
         claiming it has been verified. The pre-generation gate still applies, so a
         stream is not started when there is no evidence at all.
+
+        That tension is real for groundedness and citation checking, and it is not
+        an argument for skipping *everything*, which is what this used to do. The
+        leakage checks are regexes over emitted text: they need no completed
+        answer, only a small held-back tail so a pattern split across two deltas is
+        still seen whole. So PII redaction and scaffold stripping run here too, and
+        an operator who switched on ``enable_pii_redaction`` gets it on both paths
+        rather than on the non-streaming one alone.
         """
         gen = self.settings.generation
         chunks = list(retrieval.chunks)
@@ -315,8 +329,22 @@ class AnswerGenerator:
                 stage="answer_stream",
             ),
         )
+        leaks = self.validator.stream_filter()
         async for delta in deltas:
-            yield delta
+            emit = leaks.feed(delta)
+            if emit:
+                yield emit
+        tail = leaks.flush()
+        if tail:
+            yield tail
+        if leaks.redacted:
+            # No Answer object exists on this path to hang metadata off, so the log
+            # line is the only record that the stream was rewritten.
+            log.info(
+                "stream_answer_redacted",
+                scaffold_leak=leaks.scaffold_leak,
+                pii_entities=leaks.entities,
+            )
 
     # -- helpers -----------------------------------------------------------
     def _abstained(

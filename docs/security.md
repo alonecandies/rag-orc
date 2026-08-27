@@ -349,3 +349,27 @@ after redaction), `flag`.
   than best effort.
 - **The guards do not sandbox the model.** They constrain what its output is
   permitted to *do*.
+
+## What the answer is not allowed to carry out
+
+Two checks run on every answer, and both **remove** rather than report:
+
+* **Personal data.** `enable_pii_redaction` used to scrub the inbound question
+  and nothing else. The question is written by the caller, who already knows
+  what is in it; the answer is assembled from retrieved documents, which is
+  where the corpus's personal data lives. It now applies to both.
+* **Prompt scaffolding.** A model echoing `</untrusted_document>` gets the
+  delimiter stripped. Not abstained on — the echo is usually a document being
+  quoted, and refusing would turn a formatting artifact into an outage — but
+  removed, which closes the case where the echo is an attempt to forge a fence
+  in the next turn's context.
+
+`answer.metadata["validation"]` reports `pii_redacted` and `scaffold_leak`, so a
+caller can tell that an answer was rewritten.
+
+Both run on `/query/stream` too. Groundedness genuinely cannot: it needs the
+whole answer, and you cannot un-emit a token. These are regexes over emitted
+text, so the only thing they need is a 96-character held-back tail so a pattern
+split across two deltas is still seen whole. The bound is real — a construction
+longer than the window can still straddle it, and the complete-answer path is
+the one to use when that matters.
