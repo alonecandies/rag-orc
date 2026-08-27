@@ -982,6 +982,7 @@ class RAGPipeline:
                 late_embedder=self.late_embedder,
                 llm=self.llm,
                 settings=self.settings,
+                answer_cache=lambda: self.semantic_cache,
             )
         return self._ingest
 
@@ -1039,6 +1040,7 @@ class RAGPipeline:
             late_embedder=self.late_embedder,
             llm=self.llm,
             settings=settings,
+            answer_cache=lambda: self.semantic_cache,
         )
 
     @staticmethod
@@ -1418,6 +1420,11 @@ class RAGPipeline:
             _answer_to_payload(answer),
             tenant_id=tenant,
             scope=scope_key(filters, top_k),
+            # The provenance the entry is invalidated by. Taken from the chunks the
+            # answer was actually built from rather than from the citations: an
+            # uncited passage still reached the generator, so an edit to it can
+            # still change the answer.
+            document_ids=sorted({c.chunk.document_id for c in answer.chunks if c.chunk.document_id}),
         )
 
     # ------------------------------------------------------------------

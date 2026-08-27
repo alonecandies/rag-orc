@@ -112,7 +112,7 @@ import contextlib
 import importlib
 import inspect
 import time
-from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -214,6 +214,12 @@ class IngestReport:
     are separate numbers because the two stores are not in one transaction and the
     writes do not wait, so the only honest way to answer "did it land?" is to ask
     the store. ``None`` when the store cannot be asked."""
+    answers_invalidated: int = 0
+    """Documents whose cached answers were dropped because this run changed them.
+
+    Counts documents, not cache entries: a filtered delete does not report how many
+    points it removed, and counting them first would double the round trips to
+    produce a number nobody reads. Zero when no answer cache is attached."""
     strategy: str = ChunkingStrategy.AUTO.value
     total_ms: float = 0.0
     timings_ms: dict[str, float] = field(default_factory=dict)
@@ -282,7 +288,9 @@ class RelationalIngestStore(RelationalStore, Protocol):
 
     async def upsert_chunks(self, chunks: Sequence[Chunk], /) -> int: ...
 
-    async def delete_document(self, document_id: str, /) -> int: ...
+    async def delete_document(
+        self, document_id: str, /, *, tenant_id: str | None = None
+    ) -> int: ...
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +485,7 @@ class IngestPipeline:
         llm: LLM | None = None,
         validator: DocumentValidator | None = None,
         settings: Settings | None = None,
+        answer_cache: Any | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.config: IndexingSettings = self.settings.indexing
@@ -494,6 +503,17 @@ class IngestPipeline:
         self._colbert_indexer: Any | None = None
         self._stages: list[tuple[_Plugin, Any]] = []
         self._embedding_cache: Any | None = None
+        #: Optional. The answer cache to invalidate when a document changes — see
+        #: :meth:`_purge`. Ingest works without it, and then a corrected document
+        #: keeps being answered from the old one until the entry expires.
+        #:
+        #: Either an object with ``invalidate(ids, *, tenant_id=...)`` or a
+        #: zero-argument callable returning one. The callable form exists because
+        #: :class:`~ragorc.pipeline.builder.RAGPipeline`'s semantic cache pulls in
+        #: the dense embedder, and passing the object eagerly made *constructing*
+        #: an ingest pipeline download an ONNX model — which four unit tests caught
+        #: immediately by opening a real connection.
+        self.answer_cache = answer_cache
         self._owns_stores = False
 
     # ------------------------------------------------------------------
@@ -1640,11 +1660,55 @@ class IngestPipeline:
             # the chunks and the document row in one transaction. Bounded because
             # a large re-ingest can change thousands of documents at once.
             await bounded_gather(
-                (self.relational.delete_document(doc.id) for doc in documents),
+                (
+                    self.relational.delete_document(doc.id, tenant_id=doc.tenant_id)
+                    for doc in documents
+                ),
                 limit=max(1, self.config.max_concurrent_documents),
             )
+        await self._invalidate_answers(by_tenant, report)
         report.timings_ms["purge"] = report.timings_ms.get("purge", 0.0) + _elapsed_ms(started)
         log.info("stale_chunks_purged", documents=len(documents))
+
+    async def _invalidate_answers(
+        self, by_tenant: Mapping[str | None, Sequence[str]], report: IngestReport
+    ) -> None:
+        """Drop cached answers built from the documents this run is replacing.
+
+        The purge above removes the old chunks from the stores. It did not reach the
+        answer cache, so a corrected document kept being answered from the old one
+        for up to ``cache.semantic_ttl_s`` — reproduced against a live stack with a
+        policy edited from "30 days" to "7 days", which the pipeline went on
+        answering "30 days", with no citations attached because a cache hit carries
+        none.
+
+        Only the *purge* set, which is the set of documents that already existed
+        and changed. A newly-added document cannot appear in an answer computed
+        before it existed, so there is nothing of its to invalidate; widening this
+        to every ingested document would evict the whole cache on a first load.
+
+        Never raises. :meth:`~ragorc.cache.semantic.SemanticCache.invalidate` traps
+        its own failures, and the reasoning is the same one step up: not
+        invalidating costs a stale answer for up to one TTL, while raising fails
+        the ingest the operator is running *to fix that document*.
+        """
+        cache = self.answer_cache
+        if cache is None:
+            return
+        if not hasattr(cache, "invalidate") and callable(cache):
+            # Resolved here rather than in ``__init__`` so that building an ingest
+            # pipeline stays free of whatever the cache depends on.
+            cache = cache()
+            if cache is None:
+                return
+        invalidate = getattr(cache, "invalidate", None)
+        if not callable(invalidate):
+            return
+        removed = 0
+        for tenant, ids in by_tenant.items():
+            removed += await invalidate(ids, tenant_id=tenant)
+        if removed:
+            report.answers_invalidated = removed
 
 
 # ---------------------------------------------------------------------------

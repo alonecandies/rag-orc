@@ -101,3 +101,33 @@ different scopes are not the same request, and `scope_key()` is what keeps them
 apart. It is matched exactly, unlike the question itself — a near-miss on the
 question is the point of a semantic cache; a near-miss on the scope is a wrong
 answer.
+
+## Staleness, and why TTL is not the whole answer
+
+An answer is a statement about the index at the moment it was computed. The
+semantic cache already refused to store an abstention for that reason — serving
+one later hides content that has since been added — and the same sentence with
+the sign flipped is why a positive answer needs invalidating: serving it later
+shows content that has since been corrected or removed.
+
+Reproduced against a live stack: a policy edited from "30 days" to "7 days" and
+re-ingested was still answered "30 days", from a cache hit that carried no
+citations, so nothing in the response pointed at the document that no longer
+said it.
+
+Each entry now records the documents its answer was built from, and
+`IngestPipeline._purge` calls `SemanticCache.invalidate` for every document a run
+replaces. Three things follow from how that is built:
+
+* **Provenance is the chunks the generator saw, not the citations.** An uncited
+  passage still went into the prompt, so an edit to it can still change the
+  answer.
+* **Only the purge set.** A newly-added document cannot appear in an answer
+  computed before it existed, so widening this to every ingested document would
+  evict the whole cache on a first load.
+* **Entries written before this field existed are not matched.** A filtered
+  delete cannot match an absent field; they expire by TTL as they always did.
+
+Invalidation never fails an ingest. Not invalidating costs a stale answer for up
+to one TTL; raising costs the operator the fix they were in the middle of
+applying.

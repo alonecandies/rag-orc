@@ -16,11 +16,29 @@ docstring on the setting says to be conservative for exactly this reason.
 Storage is a small Qdrant collection rather than a bespoke index: it is already a
 dependency, already does approximate nearest neighbour well, and gives TTL
 expiry through payload filtering.
+
+Staleness is the third danger, and TTL alone does not cover it
+--------------------------------------------------------------
+An answer is a statement about the index *at the moment it was computed*. This
+module already refused to cache an abstention for that reason — "serving one
+later hides content that has since been added" — and the same sentence is true
+of a positive answer with the sign flipped: serving it later shows content that
+has since been corrected or removed. Reproduced against a live stack: a policy
+edited from "30 days" to "7 days" and re-ingested was still answered "30 days",
+because the ingest purge does not reach here.
+
+TTL bounds that window but cannot close it, and an operator who has just fixed a
+document does not want to wait an hour. So each entry records the documents its
+answer was built from, and :meth:`SemanticCache.invalidate` drops every entry
+that cites one. Without that field there is nothing to invalidate *by*: the old
+payload was question, answer, timestamp, tenant and scope, so the only available
+removal was :meth:`clear`, which drops the collection for every tenant at once.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -178,7 +196,15 @@ class SemanticCache:
         *,
         tenant_id: str | None = None,
         scope: str | None = None,
+        document_ids: Sequence[str] | None = None,
     ) -> None:
+        """Store one answer.
+
+        ``document_ids`` is what makes the entry invalidatable — see
+        :meth:`invalidate`. It is optional because a caller may not know the
+        provenance, but an entry stored without it can only ever be removed by TTL
+        or :meth:`clear`, so the pipeline always passes it.
+        """
         cfg = self.settings.cache
         if not (cfg.enabled and cfg.semantic_enabled):
             return
@@ -204,6 +230,10 @@ class SemanticCache:
                             "ts": time.time(),
                             **({"tenant_id": tenant_id} if tenant_id else {}),
                             **({"scope": scope} if scope else {}),
+                            # A list, matched with MatchAny on the way out. Stored
+                            # even when empty is pointless, so it is omitted — an
+                            # answer with no sources cites nothing to invalidate.
+                            **({"document_ids": sorted(set(document_ids))} if document_ids else {}),
                         },
                     )
                 ],
@@ -213,6 +243,58 @@ class SemanticCache:
             return
         except Exception as exc:  # noqa: BLE001
             log.warning("semantic_cache_set_failed", error=str(exc)[:200])
+
+    async def invalidate(self, document_ids: Sequence[str], *, tenant_id: str | None = None) -> int:
+        """Drop every cached answer built from one of these documents.
+
+        Called from the ingest purge, so that correcting a document takes effect on
+        the next query rather than at the end of the TTL. Returns the number of
+        documents the removal was requested for, not the number of points removed:
+        Qdrant's filtered delete does not report a count, and inventing one by
+        counting first would double the round trips to produce a number no caller
+        uses.
+
+        Entries stored before this field existed, or by a caller that passed no
+        provenance, carry no ``document_ids`` and are not matched. They expire by
+        TTL as they always did. That is the honest behaviour — a filtered delete
+        cannot match a field that is absent — and it is why the ingest path passes
+        provenance unconditionally.
+        """
+        ids = sorted({d for d in document_ids if d})
+        if not ids or not (self.settings.cache.enabled and self.settings.cache.semantic_enabled):
+            return 0
+        try:
+            client = await self._ensure()
+            from qdrant_client import models
+
+            conditions: list[Any] = [
+                models.FieldCondition(key="document_ids", match=models.MatchAny(any=ids))
+            ]
+            if tenant_id:
+                # Scoped for the same reason `get` is: without it one tenant's
+                # re-ingest would evict another tenant's answers. Harmless to
+                # correctness, but it is their cache hit rate being spent.
+                conditions.append(
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id))
+                )
+            await client.delete(
+                collection_name=self.collection,
+                points_selector=models.FilterSelector(filter=models.Filter(must=conditions)),
+                wait=False,
+            )
+        except StoreUnavailable:
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            # Never fail an ingest because the answer cache could not be reached.
+            # The cost of not invalidating is a stale answer for up to one TTL; the
+            # cost of raising is a failed ingest, which is worse and is the thing
+            # the operator was in the middle of fixing.
+            log.warning(
+                "semantic_cache_invalidate_failed", error=str(exc)[:200], documents=len(ids)
+            )
+            return 0
+        log.info("semantic_cache_invalidated", documents=len(ids), tenant_id=tenant_id)
+        return len(ids)
 
     async def clear(self) -> None:
         try:

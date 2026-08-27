@@ -439,12 +439,24 @@ class FakeDocumentStore:
             self.chunks[chunk.id] = chunk
         return len(chunks)
 
-    async def delete_document(self, document_id: str) -> int:
-        """Delete the row and cascade to its chunks, as the FK declares."""
+    async def delete_document(self, document_id: str, *, tenant_id: str | None = None) -> int:
+        """Delete the row and cascade to its chunks, as the FK declares.
+
+        Tenant-scoped like the real store, so a test can see a foreign delete match
+        nothing rather than succeed. A double that ignores the scope would let the
+        argument be dropped at the call site without a single test noticing, which
+        is the failure mode that produced the round-nine leaks.
+        """
         self.calls.append("delete_document")
+        owner = self.documents.get(document_id)
+        if tenant_id and owner is not None and getattr(owner, "tenant_id", None) != tenant_id:
+            return 0
         self.documents.pop(document_id, None)
         cascaded = [
-            cid for cid, c in self.chunks.items() if getattr(c, "document_id", None) == document_id
+            cid
+            for cid, c in self.chunks.items()
+            if getattr(c, "document_id", None) == document_id
+            and (not tenant_id or getattr(c, "tenant_id", None) == tenant_id)
         ]
         for cid in cascaded:
             del self.chunks[cid]

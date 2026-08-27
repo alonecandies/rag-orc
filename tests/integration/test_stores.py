@@ -15,6 +15,7 @@ does not depend on a seeded database.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import uuid
 from typing import Any
@@ -530,3 +531,75 @@ async def test_by_id_chunk_reads_are_scoped_in_both_stores(settings: Settings) -
                 await relational.delete_document(f"doc-{t}-{tag}")
         await vector.close()
         await relational.close()
+
+@pytest.mark.integration
+async def test_correcting_a_document_drops_the_answers_built_from_it(
+    settings: Settings,
+) -> None:
+    """The end-to-end shape of the staleness bug, against the real cache.
+
+    Before the fix, this sequence — answer a question, correct the document,
+    re-ingest — went on serving the answer computed from the old text for up to
+    ``cache.semantic_ttl_s`` (one hour by default), with no citations attached,
+    because a cache hit carries none.
+
+    Exercised through ``IngestPipeline._purge`` rather than a full ingest: the
+    purge is the step that knows which documents are being replaced, and driving
+    a whole ingest here would make the test about embedding throughput.
+    """
+    from ragorc.cache.semantic import SemanticCache, scope_key
+    from ragorc.index.pipeline import IngestPipeline, IngestReport
+
+    cached = Settings(
+        llm=settings.llm,
+        qdrant=settings.qdrant,
+        embedding={"dense_dimension": 32},
+        cache={
+            "enabled": True,
+            "semantic_enabled": True,
+            "semantic_collection": f"{settings.qdrant.collection}_semcache",
+        },
+    )
+    cache = SemanticCache(_StubEmbedder32(), settings=cached)
+    scope = scope_key(None, None)
+    question = "what is the refund window?"
+
+    try:
+        await cache.set(
+            question,
+            {"text": "The refund window is 30 days."},
+            tenant_id="acme",
+            scope=scope,
+            document_ids=["policy"],
+        )
+        await asyncio.sleep(0.4)
+        hit = await cache.get(question, tenant_id="acme", scope=scope)
+        assert hit is not None and "30 days" in hit.answer["text"]
+
+        # The operator corrects the policy and re-ingests it.
+        pipeline = IngestPipeline(settings=cached, answer_cache=cache)
+        await pipeline._purge(
+            [Document(id="policy", content="7 days", source="policy.md", tenant_id="acme")],
+            IngestReport(),
+        )
+        await asyncio.sleep(0.4)
+
+        assert await cache.get(question, tenant_id="acme", scope=scope) is None, (
+            "the corrected document is still answered from the old one"
+        )
+    finally:
+        await cache.clear()
+
+
+class _StubEmbedder32:
+    """Deterministic 32-d vectors. The semantic cache needs *an* embedder and the
+    identity of the vectors is irrelevant here — what is under test is whether a
+    stored point survives a filtered delete."""
+
+    dimension = 32
+    model_name = "stub"
+
+    async def embed_query(self, text: str) -> np.ndarray:
+        rng = np.random.default_rng(abs(hash(text)) % (2**32))
+        v = rng.normal(size=32).astype(np.float32)
+        return (v / np.linalg.norm(v)).astype(np.float32)

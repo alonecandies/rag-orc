@@ -533,32 +533,59 @@ class PostgresStore:
         rows = await self._fetch(statement, params)
         return int(rows[0]["n"]) if rows else 0
 
-    async def delete_document(self, document_id: str) -> int:
+    async def delete_document(self, document_id: str, *, tenant_id: str | None = None) -> int:
         """Delete a document and its chunks; return the number of rows removed.
 
         The chunk delete is explicit even though the FK cascades, because the
         cascade's row count is not reported back and "how many chunks did that
         remove?" is the number an operator actually wants.
+
+        Scoped like every other statement in this class. It was the one that was
+        not: ``count`` directly above threads ``tenant_id`` through
+        :meth:`_filter_clauses` and this deleted by id alone, so with isolation on
+        a caller who could name another tenant's document id could remove it. Not
+        reachable through the shipped entry points — :func:`ragorc.core.ids.document_id`
+        folds the tenant in and both the server route and the loaders derive it —
+        but "no caller can currently construct the id" is a property of the callers,
+        which is exactly the reasoning :meth:`_filter_clauses` rejects one docstring
+        up.
+
+        A delete that matches nothing returns 0 rather than raising, which is what
+        makes it idempotent: re-running a purge after a partial failure must not
+        turn "already gone" into an error.
         """
-        params = {"id": document_id}
+        params: dict[str, Any] = {"id": document_id}
+        chunk_scope = self._filter_clauses(None, tenant_id, alias="c", params=params)
+        # The documents table names its key `id`, the chunks table `document_id`,
+        # and `_filter_clauses` writes predicates against a chunk alias — so the
+        # document-row scope is built separately rather than reusing that output.
+        doc_scope: list[Composable] = []
+        tenant = require_tenant(tenant_id or self.settings.tenant_id, self.settings.security)
+        if tenant:
+            params["tenant"] = tenant
+            doc_scope.append(SQL("d.tenant_id = {ph}").format(ph=Placeholder("tenant")))
         with timed("pg_delete_document"):
             async with self._connection() as conn, conn.transaction():
                 cur = conn.cursor()
                 await cur.execute(
-                    SQL("DELETE FROM {tbl} WHERE document_id = {ph}").format(
-                        tbl=self._chunks, ph=Placeholder("id")
+                    SQL("DELETE FROM {tbl} AS c WHERE c.document_id = {ph} {extra}").format(
+                        tbl=self._chunks,
+                        ph=Placeholder("id"),
+                        extra=_and(chunk_scope),
                     ),
                     params,
                 )
                 removed = max(cur.rowcount, 0)
                 await cur.execute(
-                    SQL("DELETE FROM {tbl} WHERE id = {ph}").format(
-                        tbl=self._documents, ph=Placeholder("id")
+                    SQL("DELETE FROM {tbl} AS d WHERE d.id = {ph} {extra}").format(
+                        tbl=self._documents,
+                        ph=Placeholder("id"),
+                        extra=_and(doc_scope),
                     ),
                     params,
                 )
                 removed += max(cur.rowcount, 0)
-        log.info("pg_document_deleted", document_id=document_id, rows=removed)
+        log.info("pg_document_deleted", document_id=document_id, rows=removed, tenant_id=tenant)
         return removed
 
     # ------------------------------------------------------------------
@@ -916,6 +943,18 @@ def _where(clauses: Sequence[Composable]) -> Composable:
     if not clauses:
         return SQL("")
     return SQL("WHERE ") + SQL(" AND ").join(clauses)
+
+
+def _and(clauses: Sequence[Composable]) -> Composable:
+    """The same clauses appended to a ``WHERE`` that already exists.
+
+    Separate from :func:`_where` because the leading keyword is the whole
+    difference, and a statement that already has a fixed predicate — a delete by
+    id, say — needs the scope joined on rather than introduced.
+    """
+    if not clauses:
+        return SQL("")
+    return SQL(" AND ") + SQL(" AND ").join(clauses)
 
 
 def _excluded_updates(names: Iterable[str]) -> Composed:
