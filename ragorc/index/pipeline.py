@@ -486,6 +486,7 @@ class IngestPipeline:
         validator: DocumentValidator | None = None,
         settings: Settings | None = None,
         answer_cache: Any | None = None,
+        loader_options: Mapping[str, Any] | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.config: IndexingSettings = self.settings.indexing
@@ -514,6 +515,17 @@ class IngestPipeline:
         #: an ingest pipeline download an ONNX model — which four unit tests caught
         #: immediately by opening a real connection.
         self.answer_cache = answer_cache
+        #: Keyword arguments for the :class:`~ragorc.index.loaders.DirectoryLoader`
+        #: this pipeline builds per run — ``recursive``, ``include``, ``exclude``,
+        #: ``metadata``, ``source_root``.
+        #:
+        #: It exists because the server had no way to reach that loader.
+        #: ``IngestRequest.recursive`` and ``IngestRequest.metadata`` were parsed and
+        #: validated on every request and then dropped: `RagService.ingest` turns the
+        #: request into bare ``Path`` objects, and the loader was constructed here
+        #: from settings alone. A caller who asked for a non-recursive ingest got a
+        #: recursive one, and per-request metadata never reached a document.
+        self.loader_options: dict[str, Any] = dict(loader_options or {})
         self._owns_stores = False
 
     # ------------------------------------------------------------------
@@ -643,7 +655,11 @@ class IngestPipeline:
         if isinstance(target, str):
             root = Path(target)
         if root is not None and root.is_dir():
-            loader = DirectoryLoader(tenant_id=self.settings.tenant_id, settings=self.settings)
+            loader = DirectoryLoader(
+                tenant_id=self.settings.tenant_id,
+                settings=self.settings,
+                **self.loader_options,
+            )
             async for batch in loader.iter_documents(root, window=window):
                 report.timings_ms["load"] = report.timings_ms.get("load", 0.0) + _elapsed_ms(
                     started

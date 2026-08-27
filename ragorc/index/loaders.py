@@ -59,6 +59,7 @@ import asyncio
 import contextlib
 import csv
 import fnmatch
+import io
 import re
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import UTC, date, datetime
@@ -363,10 +364,22 @@ class BaseLoader:
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         settings: Settings | None = None,
+        source_root: Path | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.tenant_id = tenant_id or self.settings.tenant_id
         self.base_metadata = dict(metadata or {})
+        #: When set, a document's ``source`` — and therefore its id — is the path
+        #: *relative to this root* rather than the absolute path on disk. Used by
+        #: the upload transport, where the absolute path is a temporary directory
+        #: with a fresh random component per request: identity taken from it made
+        #: every re-upload of the same file a brand new document, so the checksum
+        #: skip could never fire and the store accumulated one copy per upload.
+        #:
+        #: Left ``None`` for an ordinary directory ingest, deliberately. Switching
+        #: those to relative labels would change every existing document's id and
+        #: re-ingest the whole corpus once, which is not a thing a bug fix may do.
+        self.source_root = source_root
 
     async def load(self, source: Any, **kwargs: Any) -> list[Document]:
         raise NotImplementedError(f"{type(self).__name__} must implement load(source)")
@@ -388,6 +401,19 @@ class BaseLoader:
         return [doc for batch in batches for doc in batch]
 
     # -- identity ---------------------------------------------------------
+    def _label(self, path: Path) -> str:
+        """The ``source`` a document is identified by.
+
+        The absolute path unless :attr:`source_root` says otherwise — see the
+        note there for why the upload transport needs the difference.
+        """
+        if self.source_root is None:
+            return str(path)
+        try:
+            return path.relative_to(self.source_root).as_posix()
+        except ValueError:
+            return path.name
+
     def _document(
         self,
         content: str,
@@ -476,7 +502,7 @@ class TextLoader(BaseLoader):
         return [
             self._document(
                 text,
-                source=str(path),
+                source=self._label(path),
                 title=path.stem,
                 metadata=meta,
                 modality=_modality_for(path.suffix.lower()),
@@ -519,7 +545,7 @@ class MarkdownLoader(BaseLoader):
             # Recorded so a retrieval filter can distinguish authored metadata
             # from metadata this loader inferred.
             meta["front_matter_keys"] = sorted(front)
-        return [self._document(body, source=str(path), title=str(title), metadata=meta)]
+        return [self._document(body, source=self._label(path), title=str(title), metadata=meta)]
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +644,21 @@ class JSONLoader(_JSONBase):
         text, label, file_meta = await self._read(source)
         data = await asyncio.to_thread(self._parse, text, label)
         records = data if isinstance(data, list) else [data]
+        # In the thread with the parse, not after it. The module docstring promises
+        # "each loader does one ``asyncio.to_thread`` hop covering open, read,
+        # decode and parse together", and CONTRACTS rule 1 forbids CPU-bound work
+        # in a coroutine — but building the documents was left on the loop, and it
+        # is the expensive part: measured on a 16 MB / 60k-record file, read took
+        # 9 ms and parse 24 ms in threads while the build took 505 ms on the loop,
+        # stalling every other request for 676 ms. The JSONL sibling already does
+        # this correctly, which is why only one of the two starved a ticker task.
+        docs = await asyncio.to_thread(self._build, records, label, file_meta)
+        log.info("json_loaded", source=label, records=len(records), documents=len(docs))
+        return docs
+
+    def _build(
+        self, records: Sequence[Any], label: str, file_meta: dict[str, Any]
+    ) -> list[Document]:
         docs: list[Document] = []
         for ordinal, record in enumerate(records):
             doc = self._record_to_document(
@@ -625,7 +666,6 @@ class JSONLoader(_JSONBase):
             )
             if doc is not None:
                 docs.append(doc)
-        log.info("json_loaded", source=label, records=len(records), documents=len(docs))
         return docs
 
     @staticmethod
@@ -729,13 +769,24 @@ class CSVLoader(BaseLoader):
         meta["extension"] = path.suffix.lower()
         if self.mode == "file":
             return [
-                self._document(_collapse(text), source=str(path), title=path.stem, metadata=meta)
+                self._document(
+                    _collapse(text), source=self._label(path), title=path.stem, metadata=meta
+                )
             ]
         return await asyncio.to_thread(self._rows, text, str(path), path.stem, meta)
 
     def _rows(self, text: str, label: str, stem: str, file_meta: dict[str, Any]) -> list[Document]:
         delimiter = self.delimiter or _sniff_delimiter(text, label)
-        reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
+        # `io.StringIO(newline="")`, not `text.splitlines()`. `splitlines()` strips
+        # the terminator, so when `csv.reader` continues a quoted field across two
+        # elements it joins the fragments with nothing between them — the newline
+        # inside the cell is not preserved, it is deleted, gluing the last word of
+        # one line to the first of the next ("para one\npara two" -> "para onepara
+        # two"). It also splits on characters CSV does not treat as line endings
+        # (\x0b, \x0c, \x1c-\x1e, \x85, U+2028, U+2029), so a cell containing any of
+        # them was silently torn into two rows. `newline=""` is what the csv module
+        # documents as required for correct quoted-field handling.
+        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
         docs: list[Document] = []
         for ordinal, row in enumerate(reader, start=1):
             clean = {
@@ -972,7 +1023,7 @@ class PDFLoader(BaseLoader):
             docs = [
                 self._document(
                     text,
-                    source=str(path),
+                    source=self._label(path),
                     fragment=f"page={number}",
                     title=f"{title} p.{number}",
                     metadata={**stat_meta, "page": number},
@@ -1003,7 +1054,7 @@ class PDFLoader(BaseLoader):
         return [
             self._document(
                 "\n\n".join(kept),
-                source=str(path),
+                source=self._label(path),
                 title=str(title),
                 metadata={**stat_meta, "page_breaks": breaks},
             )
@@ -1068,7 +1119,7 @@ class DocxLoader(BaseLoader):
         return [
             self._document(
                 content,
-                source=str(path),
+                source=self._label(path),
                 title=meta.get("docx_title") or path.stem,
                 metadata=meta,
             )
@@ -1195,8 +1246,11 @@ class DirectoryLoader(BaseLoader):
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         settings: Settings | None = None,
+        source_root: Path | None = None,
     ) -> None:
-        super().__init__(tenant_id=tenant_id, metadata=metadata, settings=settings)
+        super().__init__(
+            tenant_id=tenant_id, metadata=metadata, settings=settings, source_root=source_root
+        )
         self.include = tuple(include or ())
         self.exclude = tuple(exclude or ())
         self.recursive = recursive
@@ -1280,12 +1334,20 @@ class DirectoryLoader(BaseLoader):
     def _admit(self, path: Path, root: Path) -> bool:
         if path.is_dir() or path.is_symlink():
             return False
-        if any(part in _SKIP_DIRS for part in path.parts):
-            return False
         try:
-            relative = path.relative_to(root).as_posix()
+            relative_path = path.relative_to(root)
         except ValueError:  # pragma: no cover - rglob results are always under root
-            relative = path.name
+            relative_path = Path(path.name)
+        relative = relative_path.as_posix()
+        # Only the parts *below* the root the caller named. Matching `path.parts`
+        # tested every ancestor too, so a corpus at ~/projects/build/corpus — or
+        # under any directory called env, dist, target, .cache, venv — matched
+        # `build` above the root and admitted nothing, reporting `directory_empty`
+        # for a directory full of documents. The caller naming a root is a
+        # statement that they want what is inside it; the skip list exists to prune
+        # what the walk *discovers*, not to veto the starting point.
+        if any(part in _SKIP_DIRS for part in relative_path.parts[:-1]):
+            return False
         if self.exclude and self._matches(relative, path.name, self.exclude):
             return False
         if self.include and not self._matches(relative, path.name, self.include):
@@ -1341,10 +1403,36 @@ class DirectoryLoader(BaseLoader):
                 tenant_id=self.tenant_id,
                 metadata={**self.base_metadata, "root": str(root)},
                 settings=self.settings,
+                # Down to the child, or the relabelling stops at this class and
+                # the per-file loaders — which are the ones that actually call
+                # `_document` — keep using the absolute path.
+                source_root=self.source_root,
                 **self.loader_kwargs.get(cls.name, {}),
             )
             return await loader.load(path)
-        except (OSError, ValueError, TypeError, ImportError, ValidationFailed) as exc:
+        except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
+            # Not per-file failures, so they must reach the caller.
+            #
+            # ``MemoryError`` is the only one of the four that this clause is load
+            # bearing for: it derives from ``Exception``, so the broad handler below
+            # would otherwise swallow it, and it means the next file will fail the
+            # same way — the one case the class docstring already names as worth
+            # aborting on. The other three derive from ``BaseException`` and would
+            # propagate regardless; they are listed because a reader checking
+            # whether Ctrl-C is safe here should not have to know that, and because
+            # narrowing the handler below to ``BaseException`` later would silently
+            # make them load bearing.
+            raise
+        except Exception as exc:  # noqa: BLE001 - see below
+            # Deliberately broad. The narrow tuple that was here —
+            # (OSError, ValueError, TypeError, ImportError, ValidationFailed) —
+            # missed the two exceptions this class exists for: python-docx raises
+            # PackageNotFoundError (Exception -> OpcError) and PyMuPDF raises
+            # FileDataError (Exception -> RuntimeError), so a single renamed .docx
+            # aborted a 20-file directory, returned nothing, and recorded no
+            # failure. A parser is third-party code reading a hostile file; the set
+            # of exceptions it can raise is not knowable from here, which is exactly
+            # when a blocklist beats an allowlist.
             self._record(path, exc)
             return []
 

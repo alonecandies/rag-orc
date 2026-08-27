@@ -81,7 +81,15 @@ import math
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -680,8 +688,35 @@ class _LinearEngine:
         ):
             yield delta
 
-    async def ingest(self, target: Any, *, force: bool = False) -> Any:
-        return await self.ingest_pipeline.ingest(target, force=force)
+    async def ingest(
+        self,
+        target: Any,
+        *,
+        force: bool = False,
+        loader_options: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Index a target, honouring the request's loader options.
+
+        Declared explicitly rather than left to ``**kwargs``: :func:`_accepted`
+        filters a call down to the parameters the target *declares*, so an engine
+        that omits this parameter has its options silently dropped rather than
+        raising — which is how ``recursive`` and ``metadata`` went unnoticed in the
+        first place.
+
+        Assigned per call rather than passed through, because this pipeline is
+        long-lived and shared: mutating it for the duration of one ingest is the
+        same scoping mistake ``RAGPipeline.ingest`` was fixed for in round nine.
+        So the previous value is restored on the way out.
+        """
+        pipeline = self.ingest_pipeline
+        if not loader_options:
+            return await pipeline.ingest(target, force=force)
+        previous = pipeline.loader_options
+        pipeline.loader_options = dict(loader_options)
+        try:
+            return await pipeline.ingest(target, force=force)
+        finally:
+            pipeline.loader_options = previous
 
     # -- stages ------------------------------------------------------------
     async def _route(self, query: Query) -> tuple[RouteDecision, Usage]:
@@ -1325,7 +1360,28 @@ class RagService:
             targets.extend(_resolve_paths(request.paths, roots=roots))
 
             ingester = _method(self.engine, _INGEST_METHODS) or self.linear.ingest
-            report = _as_report(await _maybe_await(ingester(targets)))
+            # `recursive` and `metadata` are fields on the request that reached no
+            # loader: the service turns `paths` into bare `Path` objects and the
+            # loader was built from settings alone, so a caller asking for a
+            # non-recursive ingest got a recursive one and per-request metadata
+            # never touched a document.
+            #
+            # `source_root` is the upload transport's fix for identity. A staged
+            # file's absolute path carries a fresh random component per request, so
+            # a document id derived from it was new every time: re-uploading the
+            # same file produced a second document instead of a skip, forever.
+            # Labelling relative to the staging root makes the id depend on the
+            # filename the user sent, which is what they mean by "the same file".
+            loader_options: dict[str, Any] = {"recursive": request.recursive}
+            if request.metadata:
+                loader_options["metadata"] = dict(request.metadata)
+            if staged_root is not None:
+                loader_options["source_root"] = staged_root
+            report = _as_report(
+                await _maybe_await(
+                    ingester(targets, **_accepted(ingester, {"loader_options": loader_options}))
+                )
+            )
             response = IngestResponse.from_report(report, request_id=request_id)
             log.info("ingest_complete", request_id=request_id, **report.summary())
             return response
@@ -2307,9 +2363,7 @@ def create_app(settings: Settings | None = None) -> Any:
         removes hundreds — and a URL is the wrong place for hundreds of ids and
         the wrong place for anything that ends up in an access log.
         """
-        return await service.delete(
-            body, request_id=_request_id(request), principal=principal
-        )
+        return await service.delete(body, request_id=_request_id(request), principal=principal)
 
     @app.post(
         "/eval",

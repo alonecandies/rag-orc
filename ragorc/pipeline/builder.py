@@ -1060,7 +1060,9 @@ class RAGPipeline:
         chunk_ids = await self._chunk_ids_for(ids, tenant, report)
 
         report.vectors = await self._try(
-            report, "vector", self.vector_store.delete(filters={"document_id": ids}, tenant_id=tenant)
+            report,
+            "vector",
+            self.vector_store.delete(filters={"document_id": ids}, tenant_id=tenant),
         )
         if self._relational is not None:
             rows = 0
@@ -1140,6 +1142,7 @@ class RAGPipeline:
         source: Any = None,
         *,
         documents: Sequence[Document] | None = None,
+        loader_options: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Index documents or a source, and report what happened.
@@ -1160,6 +1163,15 @@ class RAGPipeline:
         target = list(documents) if documents is not None else source
         if target is None:
             raise ConfigError("ingest needs a source or documents=", hint="rag.ingest('./docs')")
+        if loader_options:
+            # A scoped pipeline for the same reason ``kwargs`` gets one: these are
+            # per-call and must not outlive the call. Kept separate from ``kwargs``
+            # because they are not settings — ``_resolve_settings`` would reject
+            # them — and because they address the loader, which settings cannot.
+            scoped = _resolve_settings(self.settings, self._normalize_ingest_kwargs(kwargs))
+            pipeline = self._scoped_ingest_pipeline(scoped)
+            pipeline.loader_options = dict(loader_options)
+            return await pipeline.ingest(target)
         if kwargs:
             # Scoped to this call, which is what the docstring above promises and
             # what the previous version did not do: it assigned ``self.settings``,
@@ -1590,7 +1602,9 @@ class RAGPipeline:
             # answer was actually built from rather than from the citations: an
             # uncited passage still reached the generator, so an edit to it can
             # still change the answer.
-            document_ids=sorted({c.chunk.document_id for c in answer.chunks if c.chunk.document_id}),
+            document_ids=sorted(
+                {c.chunk.document_id for c in answer.chunks if c.chunk.document_id}
+            ),
         )
 
     # ------------------------------------------------------------------
