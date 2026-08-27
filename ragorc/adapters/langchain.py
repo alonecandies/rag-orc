@@ -78,6 +78,10 @@ from ragorc.core.models import (
 )
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import new_request_context, timed
+from ragorc.security.tenancy import (
+    foreign_retriever_isolation_warning,
+    require_foreign_retriever_isolation,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -520,15 +524,21 @@ class LangChainRetriever:
         self.source = source
         self.config = config
         self.name = name or f"langchain:{type(retriever).__name__}"
+        warning = foreign_retriever_isolation_warning(self.name, self.settings)
+        if warning:
+            log.warning("foreign_retriever_will_refuse", retriever=self.name, hint=warning)
 
     async def retrieve(
         self, query: Query, *, top_k: int | None = None, **kwargs: Any
     ) -> list[ScoredChunk]:
         """:class:`~ragorc.core.protocols.Retriever` entry point."""
+        tenant = kwargs.get("tenant_id") or query.tenant_id
+        require_foreign_retriever_isolation(self.name, self.settings)
         limit = int(top_k or query.top_k or self.settings.retrieval.top_k)
         with timed("adapter.langchain.reverse", retriever=self.name):
-            documents = await self._call(query.text)
+            documents = await self._call(query.text, tenant_id=tenant, query=query)
         chunks = from_langchain_documents(documents, source=self.source, document_id=self.name)
+        chunks = self._scoped(chunks, tenant)
         if len(chunks) > limit:
             log.debug(
                 "langchain_leg_truncated",
@@ -540,7 +550,63 @@ class LangChainRetriever:
             chunks = chunks[:limit]
         return chunks
 
-    async def _call(self, text: str) -> list[Any]:
+    def _scoped(self, chunks: list[ScoredChunk], tenant: str | None) -> list[ScoredChunk]:
+        """Drop what the leg did not prove belongs to this tenant.
+
+        Only under ``filter``: ``reject`` never reaches here and ``trusted`` is the
+        operator asserting the wrapped retriever holds one tenant, which this
+        would second-guess.
+
+        A chunk carrying *no* tenant is dropped along with a mismatched one. That
+        is the whole point of the mode — an absent label is not a match — and the
+        alternative, stamping it with the querying tenant's id, forges the
+        provenance that made the graph leak worse than an unlabelled one.
+        """
+        if self.settings.security.foreign_retriever_tenant_isolation != "filter":
+            return chunks
+        if not tenant:
+            return chunks
+        kept = [c for c in chunks if c.chunk.tenant_id == tenant]
+        if len(kept) != len(chunks):
+            log.info(
+                "foreign_leg_chunks_dropped",
+                retriever=self.name,
+                dropped=len(chunks) - len(kept),
+                kept=len(kept),
+                tenant_id=tenant,
+                reason="chunk did not declare the querying tenant",
+            )
+        return kept
+
+    def _scope_config(self, tenant_id: str | None, query: Any) -> dict[str, Any] | None:
+        """``config`` for this call, carrying the scope the leg was asked for.
+
+        The wrapped retriever used to be handed the question text and nothing
+        else, so a multi-tenant one could not have scoped itself even if it wanted
+        to: ``tenant_id`` and ``filters`` arrive in ``**kw`` from the ensemble and
+        were dropped on the floor one frame later.
+
+        ``config["metadata"]`` is where this goes because it is the one per-call
+        channel every ``Runnable`` accepts and passes to its own callbacks, so a
+        retriever that understands it can read it and one that does not is
+        unaffected. It is a *hand-off*, not enforcement — a foreign leg cannot
+        prove it honoured anything, which is what the guard above is for.
+        """
+        scope: dict[str, Any] = {}
+        if tenant_id:
+            scope["tenant_id"] = tenant_id
+        filters = getattr(query, "filters", None)
+        if filters:
+            scope["filters"] = dict(filters)
+        if not scope:
+            return self.config
+        config = dict(self.config or {})
+        config["metadata"] = {**(config.get("metadata") or {}), **scope}
+        return config
+
+    async def _call(
+        self, text: str, *, tenant_id: str | None = None, query: Any = None
+    ) -> list[Any]:
         """Invoke the wrapped retriever by whichever async surface it has.
 
         ``ainvoke`` is the modern one and ``BaseRetriever`` implements it for
@@ -549,10 +615,14 @@ class LangChainRetriever:
         inherited from ``BaseRetriever`` — and the last one runs in a thread rather
         than inline, because a blocking HTTP call inside a coroutine stalls every
         other leg of the fan-out it was supposed to be overlapping with.
+
+        Only ``ainvoke`` carries the scope: it is the only one of the three with a
+        per-call channel to put it in. The legacy surfaces take a bare string, so
+        a leg reached through them is scoped by the return-path filter alone.
         """
         ainvoke = getattr(self.retriever, "ainvoke", None)
         if callable(ainvoke):
-            return list(await ainvoke(text, config=self.config))
+            return list(await ainvoke(text, config=self._scope_config(tenant_id, query)))
         legacy = getattr(self.retriever, "aget_relevant_documents", None)
         if callable(legacy):
             return list(await legacy(text))

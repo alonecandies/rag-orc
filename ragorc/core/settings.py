@@ -465,6 +465,32 @@ class SecuritySettings(BaseModel):
     isolation, which is worse than a refusal an operator can see.
     """
 
+    foreign_retriever_tenant_isolation: Literal["reject", "filter", "trusted"] = "reject"
+    """How tenant isolation is enforced for a retriever this library does not own.
+
+    :func:`~ragorc.adapters.langchain.from_langchain_retriever` makes someone
+    else's retriever one leg of an ensemble, fused with ours. That leg is outside
+    every mechanism the other settings here describe: it runs its own query
+    against its own store, so no filter of ours reaches it, and the chunks it
+    returns declare their own ``tenant_id`` — read out of the foreign document's
+    metadata, which is the retriever's claim rather than anything we verified.
+
+    Unlike the graph, there *is* a defensible middle ground, which is why this has
+    three modes rather than two. A returned document either carries a tenant label
+    or does not, and both cases can be decided without a schema change.
+
+    ``reject``  — refuse the leg while tenant isolation is on. The default: a
+                  foreign retriever has no way to prove it scoped anything.
+    ``filter``  — pass the tenant down (so a capable retriever can scope itself)
+                  and drop every returned chunk that does not *declare* the
+                  querying tenant. Unlabelled chunks are dropped too: an absent
+                  label is not a match, and stamping one with the querying
+                  tenant's id would forge exactly the provenance
+                  ``graph_tenant_isolation`` exists to prevent.
+    ``trusted`` — the wrapped retriever holds one tenant's data. An explicit
+                  assertion, so it cannot be arrived at by accident.
+    """
+
     generated_query_isolation: Literal["reject", "database", "rls", "trusted"] = "reject"
     """How tenant isolation is enforced for *generated* SQL and Cypher.
 

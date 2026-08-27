@@ -35,8 +35,12 @@ from ragorc.core.settings import SecuritySettings, Settings, get_settings
 log = structlog.get_logger(__name__)
 
 __all__ = [
+    "foreign_leg_refused",
+    "foreign_retriever_isolation_warning",
+    "graph_isolation_warning",
     "graph_legs_refused",
     "principal_for_key",
+    "require_foreign_retriever_isolation",
     "require_generated_query_isolation",
     "require_graph_tenant_isolation",
     "require_tenant",
@@ -257,6 +261,82 @@ def require_graph_tenant_isolation(target: str, settings: Settings | None = None
             "the knowledge graph stores no tenant, so a traversal cannot be scoped; "
             "run one graph per tenant and set security.graph_tenant_isolation='trusted', "
             "or leave the graph legs off"
+        ),
+    )
+
+
+def foreign_leg_refused(settings: Settings | None = None) -> bool:
+    """Would a foreign retriever leg be refused right now?
+
+    The predicate behind :func:`require_foreign_retriever_isolation`, exposed for
+    the same reason :func:`graph_legs_refused` is: a caller that needs to *decide*
+    rather than *enforce* should not have to catch a guard's exception.
+    """
+    from ragorc.core.settings import get_settings as _get_settings
+
+    resolved = settings or _get_settings()
+    return (
+        resolved.security.enforce_tenant_isolation
+        and resolved.security.foreign_retriever_tenant_isolation == "reject"
+    )
+
+
+def foreign_retriever_isolation_warning(name: str, settings: Settings | None = None) -> str | None:
+    """The line an adapter logs when it is constructed into a refusing config.
+
+    Constructed, not queried. A foreign leg is assembled by the caller at wiring
+    time and fails on the first request, which is a long way from the line that
+    caused it; saying so at construction puts the message next to the mistake.
+    """
+    if not foreign_leg_refused(settings):
+        return None
+    return (
+        f"{name} will refuse every query: tenant isolation is enforced and "
+        "security.foreign_retriever_tenant_isolation='reject' (a foreign retriever "
+        "cannot show that it scoped its own store)"
+    )
+
+
+def require_foreign_retriever_isolation(target: str, settings: Settings | None = None) -> None:
+    """Refuse a retriever this library does not own when it cannot be scoped.
+
+    The third instance of one asymmetry, after the generated-query guard and the
+    graph guard. Both of those cover a leg whose *store* we reach but cannot
+    filter; this covers a leg whose store we never reach at all. An adapted
+    retriever runs its own query against its own index, so:
+
+    * no filter of ours reaches it — the ensemble forwards ``tenant_id`` in
+      ``**kw`` and the protocol lets a leg ignore what it does not understand,
+      which a foreign one necessarily does; and
+    * the ``tenant_id`` on what comes back is read out of the foreign document's
+      own metadata, so it is the retriever's claim, not a fact.
+
+    Reproduced before this guard existed: with ``enforce_tenant_isolation`` on, an
+    ensemble holding one adapted leg answered a query scoped to ``globex`` with a
+    chunk whose own ``tenant_id`` was ``acme``.
+
+    Unlike the graph there is a real middle ground — see
+    ``security.foreign_retriever_tenant_isolation`` — because a label that is
+    present can be checked and a label that is absent can be dropped, neither of
+    which needs a schema this library does not control.
+    """
+    from ragorc.core.settings import get_settings as _get_settings
+
+    resolved = settings or _get_settings()
+    if not resolved.security.enforce_tenant_isolation:
+        return
+    mode = resolved.security.foreign_retriever_tenant_isolation
+    if mode != "reject":
+        log.debug("foreign_retriever_tenant_isolation", target=target, mode=mode)
+        return
+    raise GuardrailViolation(
+        f"foreign retriever {target} is disabled while tenant isolation is enforced",
+        rule="foreign_retriever_tenant_isolation",
+        hint=(
+            "a retriever this library does not own cannot show that it scoped its own "
+            "store; set security.foreign_retriever_tenant_isolation='filter' to keep "
+            "only chunks that declare the querying tenant, or 'trusted' if the wrapped "
+            "retriever holds one tenant's data"
         ),
     )
 

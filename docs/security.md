@@ -172,6 +172,32 @@ By-id chunk reads (`QdrantStore.get`, `PostgresStore.get_chunks`) are scoped
 independently, so a foreign chunk id resolves to nothing even under `trusted`.
 An id is not a filter, and those two reads were the one unscoped door.
 
+### A retriever this library does not own
+
+```bash
+RAGORC_SECURITY__FOREIGN_RETRIEVER_TENANT_ISOLATION=filter
+```
+
+`from_langchain_retriever` makes someone else's retriever one leg of an
+ensemble. That leg queries its own store, so no filter of ours reaches it, and
+the `tenant_id` on what comes back is read out of the foreign document's own
+metadata — the retriever's claim, not a fact. With isolation on and this left at
+`reject`, an ensemble holding one adapted leg answered a query scoped to
+`globex` with a chunk whose own `tenant_id` was `acme`.
+
+`reject` (the default) refuses the leg. `filter` passes the tenant and filters
+down in `config["metadata"]`, so a retriever capable of scoping itself can, and
+then keeps only the chunks that **declare** the querying tenant. An unlabelled
+chunk is dropped rather than stamped: an absent label is not a match, and
+stamping it would forge the provenance the paragraph above exists to prevent.
+`trusted` asserts the wrapped retriever holds one tenant's data and skips the
+filter — necessary, because a genuinely single-tenant retriever's documents
+usually carry no tenant label at all, and filtering would drop all of them.
+
+Unlike the graph there is a middle ground here because the decision needs no
+schema we do not control: a label that is present can be checked, and one that
+is absent can be dropped.
+
 ### Naming a tenant is not the same as owning one
 
 `tenant_id` is a field on the request **body**, so on its own the setting above
