@@ -353,6 +353,78 @@ kept full chunk bodies.
 Six of these were only caught by mutating a *call site* rather than a function
 body — the gap named in 11g, still the most productive place to look.
 
+## 11i. Closed: round ten — the lifecycle, and what leaves the process
+
+Four lenses never previously applied: data lifecycle, the answer path's outbound
+guards, secret egress, and the public surface with the thinnest tests. Two
+findings were reproduced end to end before being fixed.
+
+**A foreign retrieval leg opted out of tenant isolation.**
+`from_langchain_retriever` makes someone else's retriever one leg of an
+ensemble, and it sat outside every mechanism in `docs/security.md`: it queries
+its own store, so no filter of ours reaches it, and `from_langchain_documents`
+reads `tenant_id` out of the foreign document's metadata — the retriever's
+claim, not a fact. With `enforce_tenant_isolation` on, a query scoped to
+`globex` came back with `id=acme-secret tenant_id='acme'`, and the wrapped
+retriever had been handed `('what was revenue?', None)`. The security doc calls
+that configuration "self-consistent — every query names a tenant, every store
+filter carries it"; a foreign leg falsified it silently. Third instance of the
+asymmetry behind `require_generated_query_isolation` and
+`require_graph_tenant_isolation`, and the first with a defensible middle ground:
+a label that is present can be checked and one that is absent can be dropped.
+
+**A corrected document kept being answered from the old one.** The semantic
+cache had no invalidation and *could not have had one*: the payload was
+question, answer, timestamp, tenant and scope, so there was nothing to
+invalidate by, and the only removal was `clear()` for every tenant at once. A
+policy edited from "30 days" to "7 days" and re-ingested was still answered "30
+days" from a cache hit carrying no citations. The module already contained the
+argument for the fix, applied to the opposite case — it refuses to cache an
+abstention because "it is a statement about the index at one moment" — and a
+positive answer is the same statement with the sign flipped.
+
+**A documented check that did not exist.** `validate/output.py` promised "the
+answer must not contain PII that was redacted upstream, or the delimiters of our
+own prompt scaffolding". `grep -ci pii` on that module returned 1: the
+docstring. The half that existed only *detected* — `scaffold_leak` was set, read
+nowhere, absent from the metadata, and the markup reached the reader. And
+`PIIRedactor` ran on the inbound question and nowhere else, so redaction
+protected the text the caller wrote and not the answer assembled from retrieved
+documents, which is where the corpus's personal data is.
+
+**Streaming skipped the guards that could have run.** Justified by "groundedness
+can only be judged once the answer is complete" — true of groundedness, not of a
+regex over emitted text. Both leakage checks now run on the stream behind a
+96-character hold-back. Separately `_audit.answered` lives in `_finish`, which
+only `query` calls, so the trail recorded that a streamed question was asked and
+never that it was answered or what it cost.
+
+**Nothing could be deleted.** No route, no CLI command, no graph delete at all.
+See section 16.
+
+**Secret egress.** `postgres.dsn` was a plain `str` while its two sibling
+credentials were `SecretStr`, so `repr`, `model_dump` and `model_dump_json`
+printed an embedded password that `summary()` was careful to mask.
+`redact_identifiers` had no pattern for a credential inside a URL — though the
+obvious exploit does not exist, and that is recorded in section 14.
+
+**The unit suite was not hermetic.** Nine tests passed or failed depending on
+whether a machine-local temp cache was warm: tiktoken and fastembed both default
+into `tempfile.gettempdir()`, which macOS purges. A full green run, then nine
+failures an hour later with no change in between, all reported as "unit test
+opened a real connection" — a message naming neither the cause nor the fix.
+Both caches now live under the repo's `.cache/` and two session-scoped fixtures
+warm them ahead of the function-scoped network guard. Verified by blocking
+AF_INET before pytest is imported: 943 tests, zero network.
+
+Mutation verification found four tests that passed for the wrong reason, which
+is the highest yield yet from that discipline: a tenant read only from the query
+rather than the ensemble's kwarg; a probe swallowed by the very `except` it was
+testing around; a split-delta test that never overflowed the buffer it existed
+to exercise; and a redundancy that made a mutation genuinely invisible, where
+the fix was to pin the property the redundancy protects rather than the
+redundancy itself.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
@@ -427,6 +499,23 @@ Recorded so they are not re-investigated a third time:
   `summary_index_enabled`" — the leaf vectors are what the summary indexer's
   sources keep and what RAPTOR clusters on; they are not discarded.
 
+Round ten:
+
+* "Some settings are dead" — 292 fields across 15 groups, every one has a reader
+  outside `settings.py`. Checked mechanically, not by eye.
+* "An unknown ensemble leg gets weight 0 under weighted fusion" — `_weight_vector`
+  defaults to 1.0, with a comment saying so.
+* "A tenant can force a cross-tenant purge by colliding a document id" —
+  `document_id()` folds the tenant in, and both the server route and the loaders
+  derive it. `PostgresStore.delete_document` was still unscoped and has been
+  fixed, but as a latent hazard, not a reachable one.
+* "`error=str(exc)` leaks the DSN password across 104 log sites" — measured:
+  neither psycopg nor the neo4j driver puts the password in a connection error,
+  and no call site passes a DSN under an unhinted key. The redaction pattern was
+  added anyway; the leak was not real.
+* "The LangChain adapter synthesizes a fake similarity score" — it is rank-derived
+  and the default fusion is RRF, which reads position.
+
 ## 15. Deliberately unused, kept on purpose
 
 * `scope_sql_where` / `scope_cypher_where` are exported with no in-library caller.
@@ -440,3 +529,35 @@ Recorded so they are not re-investigated a third time:
   does not advertise it, so nothing promises otherwise.
 * RAG-Fusion is reachable only through `translators=`, not a settings flag. Its
   fusion behaviour is on by default via `retrieval.fusion`.
+
+
+## 16. Delete, and what it deliberately does not do
+
+`RAGPipeline.delete`, `DELETE /documents` and `ragorc delete` remove a document
+from Qdrant, Postgres, Neo4j and the answer cache. Three things about it are
+decisions rather than implementation:
+
+* **Chunk ids are read before anything is removed.** A `Chunk` node carries an
+  id and no document reference, so the vector store is the only thing that knows
+  which nodes belong to a document. Delete the vectors first and the graph nodes
+  are unreachable, permanently and silently.
+* **Entities go only when nothing mentions them.** Not every entity the deleted
+  chunks mentioned — they merge on `name`. This is also what makes the graph
+  delete tenant-safe in a graph that stores no tenant.
+* **A failing store does not abort the rest.** `DeleteReport.errors` is the
+  channel; `complete` is the answer. Stopping halfway leaves the caller believing
+  the document is gone.
+
+Not done, on purpose:
+
+* **No filtered delete.** One typo from emptying an index, with no tombstone and
+  no undo behind it. Ids only, on all three surfaces.
+* **No cascade to derived units.** A RAPTOR summary or a multi-representation
+  unit built from a deleted leaf keeps its own document id and is deleted by
+  naming it. Inferring the parent-child closure would mean walking `parent_id`
+  across two stores at delete time, and getting it subtly wrong deletes a summary
+  another document still contributes to.
+* **No re-detection of communities.** A community whose membership is entirely
+  gone is removed; one that lost some members keeps its now-stale summary until
+  the next `ragorc graph build`. Re-running detection inside a delete would make
+  the cost of removing one document proportional to the corpus.
