@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, TypeVar
 
 import structlog
@@ -360,7 +360,7 @@ class PipelineNodes:
     # ------------------------------------------------------------------
     # 2. translate
     # ------------------------------------------------------------------
-    async def translate(self, state: RAGState) -> dict[str, Any]:
+    async def translate(self, state: RAGState, *, variants: bool = True) -> dict[str, Any]:
         """Expand the question into search variants (multi-query, HyDE, step-back).
 
         Purely additive, so a failure degrades to the untranslated query rather
@@ -373,6 +373,18 @@ class PipelineNodes:
         try:
             with timed("translate"):
                 translated, usage = await self.translator.translate(query)
+            if not variants and translated.variants:
+                # The graph will not read them, so do not carry them: every
+                # store retriever expands `query.all_texts` into one ranked list
+                # per text, and a graph that never reaches a store retriever
+                # would simply be paying for the LLM call that produced them.
+                #
+                # Dropped here rather than skipped upstream because the
+                # translator chain is configured globally and a graph cannot
+                # choose its members — and because a translator may do more than
+                # produce variants (HyDE also sets `hypothetical`, which the
+                # graph path's own seeding does use).
+                translated = replace(translated, variants=())
         except _FATAL:
             raise
         except Exception as exc:  # noqa: BLE001 - degrade: variants are optional
@@ -1524,15 +1536,33 @@ class PipelineNodes:
         state and by any concurrent branch, and the vectors are dropped because they
         belong to the old text — reusing them would search for the previous
         question while claiming to search for the new one.
+
+        Everything else derived from the old text goes for the same reason, and
+        two things used to survive it:
+
+        * **The variants.** A translator produced them *from the question that
+          failed*, so carrying them forward searches the failed question three
+          more times. Worse than wasted work: the retriever fuses one ranked list
+          per text with RRF, so with three stale variants the rewritten question
+          gets one slot in four of the candidate window — the rewrite is
+          outvoted by the thing it was rewriting.
+        * **The HyDE document.** ``metadata["hyde_documents"]`` is what
+          :func:`~ragorc.translate.hyde.hyde_search_vector` embeds, so a carried
+          one makes the rewrite search using a hypothetical answer to the
+          previous question. Harmless while nothing read that key; not harmless
+          now that the retriever does.
         """
+        stale = {"hyde_documents", "hyde", "hyde_blend"}
         return Query(
             text=text,
             original=query.original,
-            variants=query.variants,
             filters=dict(query.filters),
             top_k=query.top_k,
             tenant_id=query.tenant_id,
-            metadata={**query.metadata, f"{reason}_of": query.text},
+            metadata={
+                **{k: v for k, v in query.metadata.items() if k not in stale},
+                f"{reason}_of": query.text,
+            },
         )
 
     async def _answer_without_retrieval(

@@ -296,7 +296,22 @@ def build(
     graph: StateGraph[Any, Any, Any, Any] = StateGraph(RAGState)
 
     graph.add_node("validate", nodes.validate)
-    graph.add_node("translate", nodes.translate)
+    async def translate(state: RAGState) -> dict[str, Any]:
+        """Translate, but keep no variants.
+
+        Variants exist to be expanded by a *store* retriever — every one of them
+        turns `query.all_texts` into one ranked list per text and fuses with RRF.
+        This graph never reaches a store retriever: `classify` sends it to local,
+        global or DRIFT search, all of which traverse Neo4j and read
+        `query.text`, and `fuse` combines what those published. So the variants
+        were generated, billed and read by nothing.
+
+        The translator still runs, because it does more than produce variants —
+        HyDE sets `hypothetical`, which local search's own seeding uses.
+        """
+        return await nodes.translate(state, variants=False)
+
+    graph.add_node("translate", translate)
     graph.add_node("classify", classify_node)
     for mode, node_name in MODE_NODES.items():
         graph.add_node(node_name, nodes.graph_node(mode))

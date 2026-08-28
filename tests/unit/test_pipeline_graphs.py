@@ -767,3 +767,84 @@ async def test_streaming_multihop_consults_the_hop_loop(
     assert llm.calls_for("multihop_reason"), (
         f"the sufficiency check never ran; stages were {llm.stages()}"
     )
+
+
+async def test_a_rewrite_drops_everything_derived_from_the_failed_question() -> None:
+    """`_respell`'s docstring gives the rule — the vectors go "because they
+    belong to the old text" — and two things survived it anyway.
+
+    The variants were produced *from the question that failed*, and every store
+    retriever expands `all_texts` into one ranked list per text and fuses with
+    RRF: with three stale variants the rewritten question gets one slot in four,
+    outvoted by the thing it was rewriting. The HyDE document is worse now that
+    the retriever actually embeds it — the rewrite would search using a
+    hypothetical answer to the previous question.
+    """
+    from ragorc.core.models import Query
+    from ragorc.pipeline.nodes import PipelineNodes
+
+    original = Query(
+        text="how do I rotate the signing key?",
+        variants=("what is key rotation", "signing key docs"),
+        hypothetical="a hypothetical answer to the OLD question",
+        metadata={"hyde_documents": ["stale document"], "hyde": True, "keep_me": 1},
+    )
+
+    rewritten = PipelineNodes._respell(original, "how do I rotate the signing secret?", reason="rewrite")
+
+    assert rewritten.variants == (), f"stale variants survived: {rewritten.variants}"
+    assert not rewritten.metadata.get("hyde_documents"), "a stale hypothetical survived"
+    assert rewritten.hypothetical is None
+    assert rewritten.metadata["keep_me"] == 1, "unrelated metadata must survive"
+    assert rewritten.metadata["rewrite_of"] == original.text
+    assert original.variants, "the original must not be mutated"
+
+
+async def test_graphrag_pays_for_no_variants_it_cannot_read() -> None:
+    """`classify` sends this graph to local, global or DRIFT search — all Neo4j
+    traversals reading `query.text`. No store retriever is reached, so the
+    variants every other graph expands into extra ranked lists were generated,
+    billed and dropped on the floor."""
+    from ragorc.core.models import Query
+    from ragorc.core.settings import Settings
+    from ragorc.pipeline.nodes import PipelineNodes
+    from ragorc.pipeline.state import initial_state
+
+    class Expanding:
+        async def translate(self, query: Query) -> tuple[Query, object]:
+            from ragorc.core.models import Usage
+
+            return (
+                Query(text=query.text, variants=("a", "b", "c"), original=query.original),
+                Usage(model="stub", calls=1),
+            )
+
+    settings = Settings(llm={"api_key": "k"}, cache={"enabled": False},
+                        embedding={"dense_dimension": 32})
+    from ragorc.generate.answer import AnswerGenerator
+    from tests.fakes import StubLLM
+
+    llm = StubLLM()
+    nodes = PipelineNodes(
+        settings=settings, llm=llm, retriever=None, generator=AnswerGenerator(llm, settings)
+    )
+    nodes.translator = Expanding()
+    state = initial_state("what themes appear across the corpus?")
+    state["query"] = Query(text="what themes appear across the corpus?")
+
+    kept = await nodes.translate(state, variants=True)
+    assert kept["query"].variants == ("a", "b", "c"), "the translator produced none to drop"
+
+    # Through the graph's own node, not `nodes.translate` directly. Asserting on
+    # the parameter proves the mechanism; only invoking what `graphrag.build`
+    # bound proves the graph uses it — a mutation reverting the binding survived
+    # the direct call, which is the call-site gap this codebase is named for.
+    from ragorc.pipeline.graphs import build_graph
+
+    compiled = build_graph("graphrag", nodes, settings=settings)
+    node = compiled.nodes["translate"].bound
+    dropped = await node.ainvoke(dict(state))
+
+    assert dropped["query"].variants == (), (
+        f"graphrag carried variants no retriever on its path reads: {dropped['query'].variants}"
+    )
