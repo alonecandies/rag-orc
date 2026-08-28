@@ -275,3 +275,87 @@ async def test_json_records_are_built_off_the_event_loop(tmp_path: Path) -> None
     assert threads and "MainThread" not in threads, (
         f"documents were built on the event loop thread: {threads}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Every loader, not just the ones the first fix reached
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("suffix", "body"),
+    [
+        pytest.param(".md", "# Handbook\n" + "Refunds take thirty days. " * 8, id="markdown"),
+        pytest.param(".txt", "Refunds take thirty days. " * 8, id="text"),
+        pytest.param(
+            ".html",
+            "<html><body><p>" + "Refunds take thirty days. " * 8 + "</p></body></html>",
+            id="html",
+        ),
+        pytest.param(
+            ".json",
+            json.dumps([{"id": "1", "content": "Refunds take thirty days. " * 8}]),
+            id="json",
+        ),
+        pytest.param(
+            ".jsonl",
+            json.dumps({"id": "1", "content": "Refunds take thirty days. " * 8}),
+            id="jsonl",
+        ),
+    ],
+)
+async def test_upload_identity_is_stable_for_every_loader(
+    tmp_path: Path, suffix: str, body: str
+) -> None:
+    """The first version of this fix converted six of nine label sites and left
+    the three that read through `_read` — JSON, JSONL and HTML — on the absolute
+    path. The test that covered it used a Markdown file, so re-uploading a
+    `.html` still minted a new document every time. Parameterized now, because
+    "the primitive is used" and "every producer uses it" are different claims.
+    """
+    ids, sources = [], []
+    for attempt in ("first", "second"):
+        staging = tmp_path / f"ragorc-upload-{attempt}"
+        staging.mkdir()
+        (staging / f"handbook{suffix}").write_text(body)
+        documents = await DirectoryLoader(source_root=staging).load(staging)
+        assert documents, f"{suffix} produced no document"
+        ids.append(documents[0].id)
+        sources.append(documents[0].source)
+
+    assert len(set(ids)) == 1, f"{suffix} minted two ids for one file: {ids}"
+    assert all(not s.startswith("/") for s in sources), sources
+
+
+def test_every_loader_accepts_the_arguments_the_directory_walk_passes() -> None:
+    """The general form of two bugs in one commit.
+
+    `DirectoryLoader._load_one` constructs each file loader with a fixed keyword
+    set, and three subclasses override `__init__` without forwarding it — so
+    adding `source_root=` broke CSV, JSON, JSONL and PDF on *every* ingest, not
+    only uploads. The broad `except Exception` added in the same commit then
+    recorded each one as a per-file failure, so a run reported success over a
+    corpus it had silently dropped a quarter of.
+
+    Enumerated from the class hierarchy rather than a list of names, so a new
+    loader that overrides `__init__` fails here instead of dropping its file type
+    in production.
+    """
+    import inspect
+
+    from ragorc.index import loaders as module
+
+    passed = {"tenant_id", "metadata", "settings", "source_root"}
+    subclasses = [
+        cls
+        for cls in vars(module).values()
+        if isinstance(cls, type)
+        and issubclass(cls, module.BaseLoader)
+        and cls is not module.BaseLoader
+    ]
+    assert len(subclasses) >= 5, f"only found {len(subclasses)} loaders to check"
+
+    for cls in subclasses:
+        parameters = inspect.signature(cls.__init__).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            continue
+        missing = passed - set(parameters)
+        assert not missing, f"{cls.__name__} cannot be built by the directory walk: {missing}"

@@ -1770,3 +1770,44 @@ async def test_concurrent_ingests_do_not_flush_each_others_parents() -> None:
 
     parents = [c for c in store.chunks.values() if c.parent_id is None and c.level == 0]
     assert parents, "the parent-document stage wrote nothing, so this proves nothing"
+
+
+async def test_concurrent_ingests_do_not_share_loader_options() -> None:
+    """`_LinearEngine.ingest` used to assign `loader_options` on the long-lived
+    shared pipeline and restore it in a `finally`. Under two overlapping ingests
+    that is worse than not scoping at all: both runs observed whichever options
+    were assigned last, and the restore put the *first* run's options back
+    permanently, so every later request inherited them.
+
+    Measured before the fix — both runs saw caller B's metadata and the pipeline
+    was left holding caller A's.
+    """
+    import asyncio
+
+    from ragorc.core.settings import Settings
+    from ragorc.index.pipeline import IngestPipeline
+
+    seen: list[dict[str, Any]] = []
+
+    class Recording(IngestPipeline):
+        async def _document_windows(self, target, report, options):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.01)
+            seen.append(dict(options))
+            await asyncio.sleep(0.01)
+            return
+            yield  # pragma: no cover - never reached; makes this a generator
+
+    settings = Settings(
+        llm={"api_key": "k"}, embedding={"dense_dimension": 32}, cache={"enabled": False}
+    )
+    pipeline = Recording(settings=settings)
+
+    await asyncio.gather(
+        pipeline.ingest("a", loader_options={"recursive": True, "metadata": {"who": "A"}}),
+        pipeline.ingest("b", loader_options={"recursive": False, "metadata": {"who": "B"}}),
+    )
+
+    callers = sorted(o.get("metadata", {}).get("who") for o in seen)
+    assert callers == ["A", "B"], f"the runs saw each other's options: {seen}"
+    assert {o["recursive"] for o in seen} == {True, False}
+    assert pipeline.loader_options == {}, "the shared default was mutated and left behind"

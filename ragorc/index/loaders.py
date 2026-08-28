@@ -577,8 +577,11 @@ class _JSONBase(BaseLoader):
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         settings: Settings | None = None,
+        source_root: Path | None = None,
     ) -> None:
-        super().__init__(tenant_id=tenant_id, metadata=metadata, settings=settings)
+        super().__init__(
+            tenant_id=tenant_id, metadata=metadata, settings=settings, source_root=source_root
+        )
         self.content_key = content_key
         self.id_key = id_key
 
@@ -763,8 +766,11 @@ class CSVLoader(BaseLoader):
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         settings: Settings | None = None,
+        source_root: Path | None = None,
     ) -> None:
-        super().__init__(tenant_id=tenant_id, metadata=metadata, settings=settings)
+        super().__init__(
+            tenant_id=tenant_id, metadata=metadata, settings=settings, source_root=source_root
+        )
         self.mode = mode
         self.content_column = content_column
         self.id_column = id_column
@@ -1012,8 +1018,11 @@ class PDFLoader(BaseLoader):
         tenant_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         settings: Settings | None = None,
+        source_root: Path | None = None,
     ) -> None:
-        super().__init__(tenant_id=tenant_id, metadata=metadata, settings=settings)
+        super().__init__(
+            tenant_id=tenant_id, metadata=metadata, settings=settings, source_root=source_root
+        )
         self.mode = mode
         self.password = password
 

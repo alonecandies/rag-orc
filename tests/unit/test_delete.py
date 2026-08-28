@@ -490,3 +490,45 @@ async def test_http_delete_reports_found_and_deleted() -> None:
     assert (removed.json()["found"], removed.json()["deleted"]) == (1, True)
     assert (missing.json()["found"], missing.json()["deleted"]) == (0, False)
     assert missing.json()["complete"] is True, "nothing errored; nothing was there"
+
+
+# ---------------------------------------------------------------------------
+# Listing must not be a full scan
+# ---------------------------------------------------------------------------
+async def test_documents_uses_the_relational_store_when_it_is_there() -> None:
+    """A chunk count needs every chunk, so the scroll could not stop early and
+    read the whole collection whatever the limit said — 2 000 points scanned to
+    return three rows. Postgres answers the same question with one GROUP BY and a
+    LIMIT, from an index."""
+    asked: list[dict[str, Any]] = []
+
+    class Relational:
+        async def document_summaries(self, **kw: Any) -> list[dict[str, Any]]:
+            asked.append(kw)
+            return [{"document_id": "policy", "source": "/corpus/policy.md", "chunks": 2}]
+
+    pipeline, store = await _pipeline(chunks=[_chunk("c1", "policy")])
+    pipeline._relational = Relational()
+
+    rows = await pipeline.documents(source="policy", limit=7)
+
+    assert rows == [{"document_id": "policy", "source": "/corpus/policy.md", "chunks": 2}]
+    assert asked == [{"tenant_id": None, "source": "policy", "limit": 7}]
+    assert store.scrolls == 0 if hasattr(store, "scrolls") else True
+
+
+async def test_documents_falls_back_to_the_scroll_when_postgres_is_down() -> None:
+    """A read-only lookup should degrade, not fail: the vector store is the one
+    every deployment has."""
+    from ragorc.core.errors import StoreUnavailable
+
+    class Broken:
+        async def document_summaries(self, **kw: Any) -> list[dict[str, Any]]:
+            raise StoreUnavailable("postgres is down")
+
+    pipeline, _store = await _pipeline(chunks=[_chunk("c1", "policy")])
+    pipeline._relational = Broken()
+
+    rows = await pipeline.documents()
+
+    assert [r["document_id"] for r in rows] == ["policy"]
