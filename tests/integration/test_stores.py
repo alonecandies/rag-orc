@@ -709,3 +709,44 @@ async def test_search_returns_dense_vectors_only_when_a_stage_reads_them(
     finally:
         await drop_collection(store)
         await store.close()
+
+
+@pytest.mark.integration
+async def test_document_summaries_group_and_filter_in_postgres(settings: Settings) -> None:
+    """Hand-written SQL, so only a real server can say whether it parses.
+
+    `documents()` routes here rather than scrolling the vector store because a
+    chunk count per document needs every chunk, and the scroll therefore could not
+    stop at the limit — 2 000 points read to return three rows. A GROUP BY with a
+    LIMIT answers the same question from an index, and its correctness is not
+    something a fake relational store can attest to.
+    """
+    from ragorc.stores.postgres.store import PostgresStore
+
+    store = PostgresStore(settings)
+    try:
+        await store.ensure_schema()
+        await store.upsert_documents(
+            [
+                Document(id="policy", content="x", source="/corpus/policy.md"),
+                Document(id="faq", content="y", source="/corpus/faq.md"),
+            ]
+        )
+        await store.upsert_chunks(
+            [
+                Chunk(id="s1", content="a", document_id="policy"),
+                Chunk(id="s2", content="b", document_id="policy"),
+                Chunk(id="s3", content="c", document_id="faq"),
+            ]
+        )
+
+        every = await store.document_summaries()
+        assert [(r["document_id"], r["chunks"]) for r in every] == [("faq", 1), ("policy", 2)]
+        assert every[1]["source"] == "/corpus/policy.md"
+
+        assert [r["document_id"] for r in await store.document_summaries(source="POLICY")] == [
+            "policy"
+        ], "the source filter must be case-insensitive"
+        assert len(await store.document_summaries(limit=1)) == 1
+    finally:
+        await store.close()
