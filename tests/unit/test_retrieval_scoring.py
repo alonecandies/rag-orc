@@ -18,6 +18,7 @@ word.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import numpy as np
@@ -218,3 +219,86 @@ def test_a_plain_cut_is_attributed_to_truncation() -> None:
     assert len(kept) == 4
     assert (report.truncated, report.diversity_dropped) == (6, 0)
     assert report.removed >= 6, "the cut must be counted in the total"
+
+
+# ---------------------------------------------------------------------------
+# ...but only where something will narrow it again
+# ---------------------------------------------------------------------------
+async def test_naive_fetches_top_k_because_nothing_narrows_it() -> None:
+    """The correction to the fix above.
+
+    `retrieval.top_k` is documented as "What the generator sees" and `fetch_k` as
+    what a retriever fetches "before fusion and reranking" — so fetching wide is
+    right only when a rerank follows to spend the recall on precision. Every
+    shipped graph has a rerank node except `naive`, which is deliberately
+    `validate -> retrieve -> generate` because it is the control in benchmarks.
+
+    Widening it unconditionally handed its generator fifty passages where top_k
+    promised ten, at five times the context cost — and a control that does not
+    obey its own settings cannot be a control.
+    """
+    settings = _settings(retrieval={"top_k": 10, "fetch_k": 50})
+    retriever = _Recording()
+    nodes = _nodes(retriever, settings)
+    state = initial_state("q")
+    state["query"] = Query(text="q")
+
+    await nodes.retrieve(state, widen=False)
+
+    assert retriever.asked == [10]
+
+
+async def test_the_default_is_still_to_widen() -> None:
+    """`self_rag` and `multihop` bind `nodes.retrieve` unchanged and both have a
+    rerank node, so the default must stay wide or round twelve's fix is undone."""
+    settings = _settings(retrieval={"top_k": 10, "fetch_k": 50})
+    retriever = _Recording()
+    nodes = _nodes(retriever, settings)
+    state = initial_state("q")
+    state["query"] = Query(text="q")
+
+    await nodes.retrieve(state)
+
+    assert retriever.asked == [50]
+
+
+async def test_every_graph_that_retrieves_wide_also_narrows() -> None:
+    """Driven and inspected on the compiled graph, not grepped.
+
+    Two earlier versions of this test passed for the wrong reason. The first
+    asserted that `naive.build`'s source contains `widen=False`, which a mutation
+    binding `nodes.retrieve` directly walked past — the wrapper was still
+    *defined*, just unused. The second asked whether the source mentioned
+    "rerank", and the docstring I had written on that very wrapper says the word,
+    so every graph looked like it reranked.
+
+    A compiled graph knows its own node names. Ask it.
+    """
+    import inspect
+
+    from ragorc.pipeline.graphs import GRAPHS, build_graph
+
+    settings = _settings(
+        retrieval={"top_k": 10, "fetch_k": 50}, generation={"cite_sources": False}
+    )
+    checked = 0
+    for name, spec in GRAPHS.items():
+        if "nodes.retrieve" not in inspect.getsource(spec.build):
+            continue
+        checked += 1
+        retriever = _Recording()
+        nodes = _nodes(retriever, settings)
+        graph = build_graph(name, nodes, settings=settings)
+        with contextlib.suppress(Exception):
+            # A graph that cannot finish on a stub still reached the retriever,
+            # which is the only thing under test here.
+            await graph.ainvoke(initial_state("what is the refund window?", pipeline=name))
+
+        assert retriever.asked, f"{name} never reached the retriever"
+        widest = max(k or 0 for k in retriever.asked)
+        narrows = "rerank" in graph.get_graph().nodes
+        assert widest <= settings.retrieval.top_k or narrows, (
+            f"{name} asked its leg for {widest} and has no rerank node, so its "
+            f"generator sees more than top_k={settings.retrieval.top_k}"
+        )
+    assert checked >= 3, f"only {checked} graphs use nodes.retrieve; the scan is not working"

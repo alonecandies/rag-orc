@@ -60,8 +60,25 @@ def build(
     name and should not need a special case for the simple one.
     """
     graph: StateGraph[Any, Any, Any, Any] = StateGraph(RAGState)
+
+    async def retrieve(state: RAGState) -> dict[str, Any]:
+        """Fetch ``top_k``, not ``fetch_k``.
+
+        Every other graph in this package has a ``rerank`` node, so they fetch
+        wide and spend the recall on precision — that is what ``fetch_k`` means,
+        "before fusion and reranking". This graph is deliberately
+        ``validate -> retrieve -> generate`` because it is the control in
+        benchmarks, so nothing here would narrow the wide set and the generator
+        would simply be handed all fifty passages where ``top_k`` promises ten.
+
+        The control has to stay the control: measuring naive RAG against a
+        variant is only meaningful if naive's generator sees what its settings
+        say it sees.
+        """
+        return await nodes.retrieve(state, widen=False)
+
     graph.add_node("validate", nodes.validate)
-    graph.add_node("retrieve", nodes.retrieve)
+    graph.add_node("retrieve", retrieve)
     graph.add_node("generate", nodes.generate)
 
     graph.add_edge(START, "validate")

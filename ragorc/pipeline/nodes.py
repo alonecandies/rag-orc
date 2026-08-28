@@ -448,7 +448,7 @@ class PipelineNodes:
     # ------------------------------------------------------------------
     # 5. retrieve
     # ------------------------------------------------------------------
-    async def retrieve(self, state: RAGState) -> dict[str, Any]:
+    async def retrieve(self, state: RAGState, *, widen: bool = True) -> dict[str, Any]:
         """Whole-corpus retrieval through the configured retriever.
 
         The route is passed through even to retrievers that ignore it: the
@@ -470,15 +470,23 @@ class PipelineNodes:
         if query is None:
             return {}
         route = _route_or_default(state)
-        # `_fetch_k`, not `state["top_k"]`. Its docstring states the failure this
-        # line used to cause, verbatim: "A leg fetching only `top_k` makes the
-        # reranker reorder ten documents instead of choosing ten out of fifty."
-        # `store_node` a few methods down has always called it; this one read the
-        # state directly and passed `None`, so the retriever fell back to
-        # `retrieval.top_k` and `naive`, `self_rag` and `multihop` reranked ten
-        # candidates out of ten while `adaptive` and `graphrag` chose ten of fifty.
-        # Recall is bought at this stage and cannot be recovered afterwards.
-        top_k = self._fetch_k(state)
+        # `_fetch_k`, not `state["top_k"]`, when something downstream will narrow
+        # the result. Its docstring states the failure the old line caused,
+        # verbatim: "A leg fetching only `top_k` makes the reranker reorder ten
+        # documents instead of choosing ten out of fifty." `store_node` has always
+        # called it; this read the state directly and passed `None`.
+        #
+        # `widen=False` is for a graph with no narrowing stage. `retrieval.top_k`
+        # is documented as "What the generator sees", and `fetch_k` as what a
+        # retriever fetches "before fusion and reranking" — so fetching wide is
+        # only correct when a rerank follows to spend the recall on precision.
+        # Every shipped graph has a rerank node except `naive`, which is
+        # deliberately `validate -> retrieve -> generate` because it is the control
+        # in benchmarks. Widening it unconditionally handed its generator fifty
+        # passages where top_k said ten, at five times the context cost.
+        top_k = self._fetch_k(state) if widen else int(
+            state.get("top_k") or self.settings.retrieval.top_k
+        )
         try:
             with timed("retrieve"):
                 result, rrr_usage = await self._retrieve_with(
