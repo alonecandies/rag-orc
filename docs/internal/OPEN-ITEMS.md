@@ -556,6 +556,65 @@ Mutation verification: 24 mutations, all caught, across four scripts. One
 mutation had to be rewritten because deleting a line broke the module rather
 than its behaviour — a syntax error is not a test of anything.
 
+## 11l. Closed: round thirteen — the measuring instrument, and HyDE
+
+Seven findings. Two were critical and both were in the harness every other
+judgement about this library is made with; one was a whole feature with a
+finished producer, a finished consumer contract and no wire between them.
+
+**`ragorc eval --compare` crashed on the shipped dataset.** Round 11d taught
+`series_names()` to advertise the document-level series so `--compare` could A/B
+them and never taught `series()` to resolve them, so the first `doc_*` name
+raised `KeyError` — with an error message listing the name it said it did not
+have — and took the whole comparison down, including the metrics that would have
+compared. On the shipped dataset those are the only retrieval signal there is.
+The series pairs against a new `document_ids` field, because its vectors cover
+the document-labelled subset: 18 of 20, so pairing against `scored_ids` raises
+on `strict=True` for exactly the datasets it exists to grade.
+
+**And when it did not crash it measured one pipeline twice.** `scope_key` takes
+`pipeline=` and its docstring names the consequence verbatim — "whichever ran
+first answered for both — so a benchmark comparing two pipelines measured one of
+them twice". The HTTP layer passed it; `RAGPipeline._cache_get`/`_cache_set`,
+the cache the eval harness actually runs through, did not and had no parameter
+to forward. The candidate scored $0.00, zero LLM calls and 0.000 retrieval,
+because a cached payload deliberately carries no chunks — and `cache_hit_rate`
+could not expose it, since a semantic hit records no call at all.
+
+**HyDE never embedded its hypothetical document.** The module opens with "HyDE:
+embed a hypothetical answer instead of the question" and did the opposite: the
+translator billed an LLM call, stored the document on `Query.hypothetical`, left
+`Query.dense` as `None`, and the store embedded `query.text`. Both halves of the
+contract were already written — `retrieve/vector.py` says twice that
+`query.dense` "is how HyDE injects the embedding of a hypothetical document",
+and `embed_for_search` implements the blend correctly with a docstring saying
+"Called by the retriever instead of the plain query embedding". `grep -rn
+embed_for_search` found the definition and two unit tests. Tested in isolation
+at both ends, which is why it survived thirteen rounds.
+
+**A rewrite carried the failed question forward.** `_respell` drops the vectors
+"because they belong to the old text" and kept the variants, which a translator
+produced *from the question that failed* — so with three of them the rewritten
+question got one slot in four of the RRF window. It also kept
+`metadata["hyde_documents"]`, which was harmless while nothing read that key and
+stopped being harmless in the commit immediately before.
+
+**graphrag paid for variants nothing on its path reads**, since `classify` sends
+it to Neo4j traversals that read `query.text` and no store retriever is reached.
+The audit made the same claim for `multihop` and it is wrong — `multihop` binds
+`nodes.retrieve`, which does expand `all_texts`.
+
+**And round twelve's fan-out fix over-applied.** Widening `nodes.retrieve` to
+`fetch_k` was right for the two graphs that rerank and wrong for `naive`, the
+one that does not: its generator was handed fifty passages where `top_k` — "What
+the generator sees" — promises ten.
+
+Mutation verification: 24 mutations across five scripts, all caught, with five
+tests initially passing for the wrong reason. Three of those five were the same
+mistake in different clothes — asserting on a helper, a source string, or a
+parameter, rather than on what the caller does. One of them was defeated by a
+docstring I had just written containing the word the test was grepping for.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
@@ -683,6 +742,26 @@ Round twelve:
 * The adaptive stream hold-back is complete — every PII pattern that spans
   whitespace contains a `_SPANNING` trigger, and every pattern that does not span
   whitespace is covered by holding the trailing run.
+
+Round thirteen:
+
+* A case whose pipeline call raised is *not* counted in the scored denominator,
+  so a run that crashes on hard questions does not look better than one that
+  answers them badly; `bounded_gather` does not misalign results against cases;
+  the significance test is seeded; the per-case cost ledger is not cumulative.
+* Translator and logical-router LLM calls all reach the cost ledger.
+* `SemanticRouter` embeds exemplars with `embed_documents` and the query with
+  `embed_query`, its `min_similarity` does fire, and a `none` route does not send
+  a request to `generate` with zero chunks.
+* Translated variants do all reach retrieval on the paths that read them, and one
+  variant's results do not overwrite another's.
+* `multihop` does consume `all_texts` — the audit's claim that it pays for unread
+  variants was wrong, and only `graphrag` does.
+* Narrowing `_ARTICLES` to English cost no legitimate merge: "The Acme
+  Corporation"/"ACME Corp", "The Times"/"Times", "An Post"/"Post" and "A Tribe
+  Called Quest"/"Tribe Called Quest" all still merge.
+* Adding `truncated` to `NoiseReport.removed` changed no behaviour — every reader
+  is a debug log line.
 
 ## 15. Deliberately unused, kept on purpose
 
