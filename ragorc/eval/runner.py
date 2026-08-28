@@ -103,6 +103,12 @@ _BOOTSTRAP_BLOCK = 256
 tens of megabytes on a large dataset for no gain, so it is drawn in blocks."""
 
 _OPERATIONAL_SERIES = ("latency_ms", "cost_usd", "llm_calls")
+
+#: Prefix distinguishing a document-level retrieval series from its chunk-level
+#: namesake. Both are called ``recall@10``; only one of them is about whether the
+#: right *file* was found. Defined once because `series_names` writes it and
+#: `series` parses it, and the two disagreeing is what made `--compare` raise.
+_DOCUMENT_PREFIX = "doc_"
 """Per-case series that need no labels, and are therefore comparable on any
 dataset. Exposed for pairing so an A/B can bootstrap latency and cost with the
 same machinery it uses for quality."""
@@ -360,6 +366,15 @@ class RunReport:
     carry — see :attr:`CaseResult.expected_documents`."""
     answer_scores: dict[str, FloatArray] = field(default_factory=dict)
     scored_ids: tuple[str, ...] = ()
+    document_ids: tuple[str, ...] = ()
+    """Case ids of the document-labelled subset, in the order
+    :attr:`document_retrieval`'s vectors are in.
+
+    A separate tuple from :attr:`scored_ids` because the two are different
+    lengths whenever some cases carry a source document and others do not — on
+    the shipped dataset, 18 of 20. Pairing the document series against
+    ``scored_ids`` would raise on ``strict=True`` for exactly the datasets this
+    series exists to grade."""
     ks: tuple[int, ...] = DEFAULT_KS
 
     # -- slices ------------------------------------------------------------
@@ -468,6 +483,23 @@ class RunReport:
         if metric in self.answer_scores:
             values = self.answer_scores[metric]
             return dict(zip(self.scored_ids, (float(v) for v in values), strict=True))
+        # The branch `series_names()` has been advertising since round 11d taught
+        # it to list `doc_*` so `--compare` could A/B document-level retrieval.
+        # Nothing taught this method to resolve them, so `compare_runs` — which
+        # defaults to exactly the names `series_names()` produced — raised
+        # `KeyError` on the first one and took the whole comparison down,
+        # including the metrics that would have compared. On the shipped dataset
+        # the `doc_*` series are the only retrieval signal there is.
+        #
+        # Paired against `document_ids`, not `scored_ids`: the vectors cover the
+        # document-labelled subset, which is 18 of the shipped dataset's 20 cases.
+        if (
+            metric.startswith(_DOCUMENT_PREFIX)
+            and self.document_retrieval is not None
+            and metric[len(_DOCUMENT_PREFIX) :] in self.document_retrieval.per_query
+        ):
+            values = self.document_retrieval.per_query[metric[len(_DOCUMENT_PREFIX) :]]
+            return dict(zip(self.document_ids, (float(v) for v in values), strict=True))
         raise KeyError(f"no series named {metric!r}; have {sorted(self.series_names())}")
 
     def series_names(self) -> list[str]:
@@ -478,7 +510,7 @@ class RunReport:
         # so a run with document labels and no chunk labels — which is what the
         # shipped dataset is — can still be A/B'd on retrieval quality.
         if self.document_retrieval is not None:
-            names.extend(f"doc_{name}" for name in self.document_retrieval.per_query)
+            names.extend(_DOCUMENT_PREFIX + name for name in self.document_retrieval.per_query)
         names.extend(self.answer_scores)
         return names
 
@@ -655,6 +687,7 @@ class EvalRunner:
         scored = [r for r in results if r.ok]
         retrieval: RetrievalReport | None = None
         document_retrieval: RetrievalReport | None = None
+        document_ids: tuple[str, ...] = ()
         if scored:
             retrieval = evaluate_retrieval(
                 [list(r.retrieved_ids) for r in scored],
@@ -666,6 +699,7 @@ class EvalRunner:
             # level says whether the right passage ranked well, document level
             # says whether the right file was found at all.
             document_labelled = [r for r in scored if r.expected_documents]
+            document_ids = tuple(r.case.id for r in document_labelled)
             if document_labelled:
                 document_retrieval = evaluate_retrieval(
                     [list(r.retrieved_documents) for r in document_labelled],
@@ -702,6 +736,7 @@ class EvalRunner:
             document_retrieval=document_retrieval,
             answer_scores=answer_scores,
             scored_ids=tuple(r.case.id for r in scored),
+            document_ids=document_ids,
             ks=self.ks,
         )
 

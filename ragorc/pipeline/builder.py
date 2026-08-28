@@ -1374,11 +1374,14 @@ class RAGPipeline:
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, length=len(question))
 
-            hit = await self._cache_get(question, tenant, top_k, filters)
+            # The pipeline is resolved before the lookup, not after, because it is
+            # part of the cache identity: `auto` and an explicit name can select
+            # the same graph, and two different names must not share an entry.
+            name = self.select_graph(pipeline)
+            hit = await self._cache_get(question, tenant, top_k, filters, pipeline=name)
             if hit is not None:
                 return hit
 
-            name = self.select_graph(pipeline)
             spec = GRAPHS[name]
             final: RAGState = await self.graph(name).ainvoke(
                 initial_state(
@@ -1392,7 +1395,7 @@ class RAGPipeline:
             answer = self._finish(
                 final, name=name, request_id=request_id, trace=trace, ledger=ledger
             )
-            await self._cache_set(question, tenant, answer, final, top_k, filters)
+            await self._cache_set(question, tenant, answer, final, top_k, filters, pipeline=name)
             return answer
 
     async def stream(
@@ -1656,17 +1659,26 @@ class RAGPipeline:
         tenant: str | None,
         top_k: int | None = None,
         filters: dict[str, Any] | None = None,
+        pipeline: str | None = None,
     ) -> Answer | None:
         cache = self.semantic_cache
         if cache is None:
             return None
-        # Both are part of the identity, for the reason ``scope_key`` gives:
-        # ``top_k`` changes how much evidence the answer was built from, and
-        # filters narrow which passages were admissible. Keying on ``None``
-        # filters — which this path did, because it accepted none — would serve
-        # the unfiltered answer to a filtered request as soon as the parameter
-        # existed.
-        hit = await cache.get(question, tenant_id=tenant, scope=scope_key(filters, top_k))
+        # All three are part of the identity, for the reasons ``scope_key`` gives:
+        # ``top_k`` changes how much evidence the answer was built from, filters
+        # narrow which passages were admissible, and the pipeline decides how the
+        # question is answered at all.
+        #
+        # The pipeline was the one this path omitted, and ``scope_key``'s docstring
+        # names the consequence exactly: "whichever ran first answered for both —
+        # so a benchmark comparing two pipelines measured one of them twice". The
+        # HTTP layer passes it; this cache, which is the one `ragorc eval
+        # --compare` actually runs through, did not — so the candidate pipeline was
+        # served the baseline's answers and scored $0.00, zero LLM calls and 0.000
+        # retrieval, because a cached payload carries no chunks.
+        hit = await cache.get(
+            question, tenant_id=tenant, scope=scope_key(filters, top_k, pipeline=pipeline)
+        )
         if hit is None:
             return None
         answer = _answer_from_payload(hit.answer)
@@ -1689,6 +1701,7 @@ class RAGPipeline:
         state: RAGState,
         top_k: int | None = None,
         filters: dict[str, Any] | None = None,
+        pipeline: str | None = None,
     ) -> None:
         """Populate the cache, with two refusals.
 
@@ -1711,7 +1724,7 @@ class RAGPipeline:
             question,
             _answer_to_payload(answer),
             tenant_id=tenant,
-            scope=scope_key(filters, top_k),
+            scope=scope_key(filters, top_k, pipeline=pipeline),
             # The provenance the entry is invalidated by. Taken from the chunks the
             # answer was actually built from rather than from the citations: an
             # uncited passage still reached the generator, so an edit to it can
