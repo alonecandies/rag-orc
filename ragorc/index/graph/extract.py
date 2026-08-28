@@ -49,6 +49,7 @@ label is not worth an aborted ingest.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -141,6 +142,8 @@ class GraphExtraction:
     relations: list[Relation] = field(default_factory=list)
     chunks_processed: int = 0
     chunks_failed: int = 0
+    gleaning_failures: int = 0
+    """Gleaning passes that raised. The chunk keeps whatever pass 1 found."""
     llm_calls: int = 0
     gleaning_calls: int = 0
     dangling_dropped: int = 0
@@ -152,6 +155,7 @@ class GraphExtraction:
         self.relations.extend(other.relations)
         self.chunks_processed += other.chunks_processed
         self.chunks_failed += other.chunks_failed
+        self.gleaning_failures += other.gleaning_failures
         self.llm_calls += other.llm_calls
         self.gleaning_calls += other.gleaning_calls
         self.dangling_dropped += other.dangling_dropped
@@ -164,6 +168,7 @@ class GraphExtraction:
             "relations": len(self.relations),
             "chunks_processed": self.chunks_processed,
             "chunks_failed": self.chunks_failed,
+            "gleaning_failures": self.gleaning_failures,
             "llm_calls": self.llm_calls,
             "gleaning_calls": self.gleaning_calls,
             "dangling_dropped": self.dangling_dropped,
@@ -288,13 +293,37 @@ class EntityExtractor:
             existing = truncate_to_tokens(
                 self._render_existing(entities, relations), self._existing_budget
             )
-            gleaned, usage = await self.llm.structured(
-                self._gleaning_prompt.render(text=text, existing=existing),
-                ExtractionOutput,
-                system=self._gleaning_prompt.system,
-                model=model,
-                stage="extract_gleaning",
-            )
+            try:
+                gleaned, usage = await self.llm.structured(
+                    self._gleaning_prompt.render(text=text, existing=existing),
+                    ExtractionOutput,
+                    system=self._gleaning_prompt.system,
+                    model=model,
+                    stage="extract_gleaning",
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, MemoryError, SystemExit):
+                raise
+            except Exception as exc:  # noqa: BLE001 - gleaning is an improvement, not the job
+                # Keep pass 1. A gleaning failure used to propagate out of this
+                # method, and the caller treats any exception as "this chunk
+                # failed" — so a second-pass timeout discarded a *successful* first
+                # extraction, dropped the chunk from the graph entirely, and lost
+                # the first call's usage with it, under-reporting the spend for a
+                # call that had already been paid for.
+                #
+                # Gleaning exists to find what pass 1 missed. Losing what pass 1
+                # found is strictly worse than not gleaning at all.
+                result.gleaning_failures += 1
+                log.warning(
+                    "graph_gleaning_failed",
+                    chunk_id=chunk.id,
+                    pass_index=pass_index,
+                    kept_entities=len(entities),
+                    kept_relations=len(relations),
+                    error=str(exc)[:200],
+                    error_type=type(exc).__name__,
+                )
+                break
             usages.append(usage)
             result.llm_calls += 1
             result.gleaning_calls += 1

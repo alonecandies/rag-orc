@@ -647,3 +647,65 @@ async def test_deleting_a_document_leaves_entities_another_one_still_mentions(
             )
             await session.run("MATCH (c:Chunk) WHERE c.id STARTS WITH 'chunk-' DETACH DELETE c")
         await store.close()
+
+
+@pytest.mark.integration
+async def test_search_returns_dense_vectors_only_when_a_stage_reads_them(
+    settings: Settings,
+) -> None:
+    """Both halves against a real Qdrant: asked for, and attached on arrival.
+
+    `with_vectors` was hardcoded `False`, so `chunk.dense` was `None` on every
+    hit and MMR silently became `chunks[:k]`. Requesting them is only half a fix —
+    `_to_scored` builds the chunk from the payload, so vectors could travel the
+    wire and be dropped on receipt.
+    """
+    from ragorc.retrieve.noise import mmr_select
+    from ragorc.stores.qdrant.store import QdrantStore
+
+    def _store(mmr: bool) -> QdrantStore:
+        return QdrantStore(
+            Settings(
+                llm=settings.llm,
+                qdrant=settings.qdrant,
+                embedding={"dense_dimension": 32},
+                retrieval={"mmr_enabled": mmr, "compression_enabled": False},
+                security={"enforce_tenant_isolation": False},
+            )
+        )
+
+    store = _store(mmr=True)
+    try:
+        await store.ensure_collection()
+        chunks = []
+        for i in range(12):
+            chunk = Chunk(id=f"v{i}", content=f"refund paragraph {i}", document_id="d")
+            # Four directions among twelve chunks, so a diversity-aware pick and a
+            # relevance-ordered one cannot coincide by luck.
+            axis = np.zeros(32, dtype=np.float32)
+            axis[i % 4] = 1.0
+            chunk.dense = axis
+            chunks.append(chunk)
+        await store.upsert(chunks)
+        await store.flush()
+
+        query = Query(text="refund")
+        query.dense = (np.ones(32, dtype=np.float32) / np.sqrt(32)).astype(np.float32)
+
+        hits = await store.search(query, top_k=10)
+        assert hits and all(h.chunk.dense is not None for h in hits), (
+            "vectors were requested but not attached to the chunk"
+        )
+
+        picked = [c.chunk.id for c in mmr_select(hits, k=4, lambda_mult=0.5)]
+        assert picked != [h.chunk.id for h in hits[:4]], (
+            "MMR produced the relevance order, i.e. it is still inert"
+        )
+
+        # And the default configuration must not pay for what it will not read.
+        off = _store(mmr=False)
+        assert all(h.chunk.dense is None for h in await off.search(query, top_k=10))
+        await off.close()
+    finally:
+        await drop_collection(store)
+        await store.close()

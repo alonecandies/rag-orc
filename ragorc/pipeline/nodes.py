@@ -470,7 +470,15 @@ class PipelineNodes:
         if query is None:
             return {}
         route = _route_or_default(state)
-        top_k = state.get("top_k")
+        # `_fetch_k`, not `state["top_k"]`. Its docstring states the failure this
+        # line used to cause, verbatim: "A leg fetching only `top_k` makes the
+        # reranker reorder ten documents instead of choosing ten out of fifty."
+        # `store_node` a few methods down has always called it; this one read the
+        # state directly and passed `None`, so the retriever fell back to
+        # `retrieval.top_k` and `naive`, `self_rag` and `multihop` reranked ten
+        # candidates out of ten while `adaptive` and `graphrag` chose ten of fifty.
+        # Recall is bought at this stage and cannot be recovered afterwards.
+        top_k = self._fetch_k(state)
         try:
             with timed("retrieve"):
                 result, rrr_usage = await self._retrieve_with(

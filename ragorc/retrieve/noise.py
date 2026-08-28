@@ -256,6 +256,16 @@ class NoiseReport:
     near_duplicates: int = 0
     below_threshold: int = 0
     diversity_dropped: int = 0
+    """Dropped by MMR because they were redundant with a higher-ranked pick.
+
+    Only when MMR actually ran. This used to be assigned inside the
+    ``mmr_enabled`` branch whichever way the branch went, so when
+    :func:`mmr_select` fell back to ``chunks[:k]`` — which it did on every query,
+    because nothing on the search path carried a dense vector — plain truncation
+    was reported as ``diversity=17``. An operator reading the log had no way to
+    see that the feature they enabled was inert."""
+    truncated: int = 0
+    """Dropped by the plain ``[:k]`` cut, with no diversity signal involved."""
 
     @property
     def removed(self) -> int:
@@ -264,6 +274,7 @@ class NoiseReport:
             + self.near_duplicates
             + self.below_threshold
             + self.diversity_dropped
+            + self.truncated
         )
 
 
@@ -306,12 +317,31 @@ class NoiseFilter:
         k = top_k or cfg.top_k
         if cfg.mmr_enabled and len(working) > k:
             before = len(working)
+            # Asked *before* the call, because `mmr_select`'s fallback is
+            # indistinguishable from its success by the return value alone — both
+            # give k chunks in relevance order when the candidates happen to be
+            # diverse. Attributing on the input is the only honest option.
+            ran = all(c.chunk.dense is not None for c in working)
             working = mmr_select(
                 working, k=k, lambda_mult=cfg.mmr_lambda, query_vector=query_vector
             )
-            report.diversity_dropped = before - len(working)
+            dropped = before - len(working)
+            if ran:
+                report.diversity_dropped = dropped
+            else:
+                report.truncated = dropped
+                log.warning(
+                    "mmr_inert",
+                    dropped=dropped,
+                    hint=(
+                        "candidates carry no dense vectors, so retrieval.mmr_enabled "
+                        "degraded to plain truncation"
+                    ),
+                )
         else:
+            before = len(working)
             working = working[:k]
+            report.truncated = before - len(working)
 
         for rank, chunk in enumerate(working):
             chunk.rank = rank
@@ -325,6 +355,7 @@ class NoiseFilter:
                 near=report.near_duplicates,
                 threshold=report.below_threshold,
                 diversity=report.diversity_dropped,
+                truncated=report.truncated,
             )
         return working, report
 

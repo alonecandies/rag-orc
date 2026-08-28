@@ -406,7 +406,15 @@ def graph_build(
                     2,
                 )
 
-            builder = GraphBuilder(engine.llm, store, settings=settings)
+            # `embedder=` is not optional in practice. Without it
+            # `EntityResolver._merge_by_embedding` returns `{}` on its first line,
+            # so resolution stage 3 — the only stage that can merge "Meta" with
+            # "Facebook" or survive a transliteration — never runs, `Entity.embedding`
+            # is never populated, and `graph.resolution_threshold` is an inert knob
+            # that `docs/operations.md` tells operators to lower when graph search
+            # comes back empty. The engine has held a built dense embedder since
+            # `build()`; the examples pass it and this command did not.
+            builder = GraphBuilder(engine.llm, store, embedder=engine.dense, settings=settings)
             return await builder.build(chunks)
 
     report = _run(run)

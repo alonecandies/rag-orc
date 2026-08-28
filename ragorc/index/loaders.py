@@ -473,11 +473,20 @@ class BaseLoader:
         )
 
     async def _read(self, source: Any) -> tuple[str, str, dict[str, Any]]:
-        """Return ``(text, source_label, file_metadata)`` for a path or payload."""
+        """Return ``(text, source_label, file_metadata)`` for a path or payload.
+
+        The label goes through :meth:`_label`, like every other producer of one.
+        It used to be a bare ``str(path)``, which quietly excluded the three
+        loaders that read through here — JSON, JSONL and HTML — from the
+        ``source_root`` relabelling, so uploading a ``.html`` file still minted a
+        new document id on every request while a ``.md`` file did not. Six of the
+        nine sites were converted and these three were missed, because the test
+        that covered the fix used a Markdown file.
+        """
         path, payload = self._file_or_payload(source)
         if path is not None:
             text, meta = await asyncio.to_thread(_read_file_sync, path)
-            return text, str(path), meta
+            return text, self._label(path), meta
         assert payload is not None  # noqa: S101 - narrowing; _file_or_payload raises otherwise
         return payload, f"inline:{content_hash(payload, size=8)}", {"bytes": len(payload.encode())}
 

@@ -576,6 +576,12 @@ class QdrantStore:
         out: list[ScoredChunk] = []
         for rank, point in enumerate(points):
             chunk = _chunk_from_payload(point.id, point.payload)
+            # Only present when `_search_vectors` asked for them. Attaching here
+            # rather than leaving it to the caller is the half that was missing:
+            # requesting the vectors and then building the chunk from the payload
+            # alone would put them on the wire and drop them on arrival.
+            if getattr(point, "vector", None) is not None:
+                self._attach_vectors(chunk, point.vector)
             score = float(point.score)
             out.append(
                 ScoredChunk(
@@ -764,7 +770,7 @@ class QdrantStore:
                     search_params=params,
                     limit=limit,
                     with_payload=True,
-                    with_vectors=False,
+                    with_vectors=self._search_vectors(),
                     score_threshold=threshold,
                     timeout=self._timeout,
                 ),
@@ -802,7 +808,7 @@ class QdrantStore:
                 search_params=params,
                 limit=top_k,
                 with_payload=True,
-                with_vectors=False,
+                with_vectors=self._search_vectors(),
                 score_threshold=(
                     self.settings.retrieval.score_threshold if apply_threshold else None
                 ),
@@ -917,6 +923,37 @@ class QdrantStore:
         )
 
     # -- reads ------------------------------------------------------------
+    def _search_vectors(self) -> list[str] | bool:
+        """Which vectors the search path should bring back with each hit.
+
+        ``False`` — the default — because a hit's payload is what answers the
+        query and the vectors are dead weight on the wire: 50 candidates at 384
+        float32 is ~77 KB per request, and ColBERT's per-token matrix is an order
+        of magnitude worse.
+
+        But two downstream stages read ``chunk.dense`` and silently degrade
+        without it, and both used to degrade *always* because this was hardcoded
+        ``False``:
+
+        * :func:`~ragorc.retrieve.noise.mmr_select` returns ``chunks[:k]`` when any
+          candidate lacks a vector, so MMR was plain truncation on every query.
+        * :class:`~ragorc.retrieve.compress.EmbeddingFilterCompressor` documents
+          "vectors that came back from the store are reused; only the gaps are
+          embedded" and re-embedded every candidate instead — measured at ~7 s a
+          call against the 2 µs its own matmul takes.
+
+        So the cost is paid exactly when something will use it, and only for the
+        dense vector by name: asking for ``True`` would also drag back the sparse
+        and ColBERT vectors, which nothing on this path reads.
+        """
+        rs = self.settings.retrieval
+        # `both` is extract + embedding_filter, so it wants them too. Enumerated
+        # rather than tested with `in rs.compressor`, which would also match a
+        # future name that merely contains the substring.
+        embedding_filtered = rs.compressor in {"embedding_filter", "both"}
+        wanted = rs.mmr_enabled or (rs.compression_enabled and embedding_filtered)
+        return [DENSE_VECTOR] if wanted else False
+
     def _attach_vectors(self, chunk: Chunk, raw: Any) -> None:
         if not isinstance(raw, dict):
             return

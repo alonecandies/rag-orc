@@ -533,6 +533,54 @@ class PostgresStore:
         rows = await self._fetch(statement, params)
         return int(rows[0]["n"]) if rows else 0
 
+    async def document_summaries(
+        self,
+        *,
+        tenant_id: str | None = None,
+        source: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """One row per indexed document: id, source, chunk count.
+
+        A ``GROUP BY`` with a ``LIMIT``, which is the whole point of routing this
+        here rather than scrolling the vector store. The vector store has no
+        aggregate, so counting chunks per document there means reading every
+        point: measured at 2 000 chunks scanned to return three rows, and a
+        corpus is not 2 000 chunks. Postgres answers the same question from an
+        index and stops at the limit.
+
+        ``source`` is a case-insensitive substring match — the operator has a path
+        and wants the id, which is the question ``ragorc delete`` needs answered.
+        """
+        params: dict[str, Any] = {"limit": max(1, int(limit))}
+        clauses = self._filter_clauses(None, tenant_id, alias="c", params=params)
+        if source:
+            params["source"] = f"%{source}%"
+            clauses.append(SQL("d.source ILIKE {ph}").format(ph=Placeholder("source")))
+        statement = SQL(
+            "SELECT c.document_id AS document_id, "
+            "       max(d.source) AS source, "
+            "       count(*) AS chunks "
+            "FROM {chunks} AS c JOIN {docs} AS d ON d.id = c.document_id "
+            "{where} "
+            "GROUP BY c.document_id ORDER BY max(d.source), c.document_id "
+            "LIMIT {lim}"
+        ).format(
+            chunks=self._chunks,
+            docs=self._documents,
+            where=_where(clauses),
+            lim=Placeholder("limit"),
+        )
+        rows = await self._fetch(statement, params)
+        return [
+            {
+                "document_id": str(row["document_id"]),
+                "source": str(row["source"] or ""),
+                "chunks": int(row["chunks"]),
+            }
+            for row in rows
+        ]
+
     async def delete_document(self, document_id: str, *, tenant_id: str | None = None) -> int:
         """Delete a document and its chunks; return the number of rows removed.
 

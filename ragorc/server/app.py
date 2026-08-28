@@ -705,20 +705,17 @@ class _LinearEngine:
         raising — which is how ``recursive`` and ``metadata`` went unnoticed in the
         first place.
 
-        Assigned per call rather than passed through, because this pipeline is
-        long-lived and shared: mutating it for the duration of one ingest is the
-        same scoping mistake ``RAGPipeline.ingest`` was fixed for in round nine.
-        So the previous value is restored on the way out.
+        Passed through, not assigned. This used to set the attribute on the
+        long-lived shared pipeline and restore it in a ``finally``, which is worse
+        than not scoping at all once two ingests overlap: both runs saw whichever
+        options were assigned last, and the restore put the *first* run's options
+        back permanently, so every later request inherited them. Measured with two
+        concurrent calls — both observed caller B's metadata, and the pipeline was
+        left holding caller A's.
         """
-        pipeline = self.ingest_pipeline
-        if not loader_options:
-            return await pipeline.ingest(target, force=force)
-        previous = pipeline.loader_options
-        pipeline.loader_options = dict(loader_options)
-        try:
-            return await pipeline.ingest(target, force=force)
-        finally:
-            pipeline.loader_options = previous
+        return await self.ingest_pipeline.ingest(
+            target, force=force, loader_options=loader_options
+        )
 
     # -- stages ------------------------------------------------------------
     async def _route(self, query: Query) -> tuple[RouteDecision, Usage]:

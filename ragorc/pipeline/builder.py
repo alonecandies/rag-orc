@@ -1069,6 +1069,22 @@ class RAGPipeline:
         """
         self._ensure_open()
         tenant = self._scoped_tenant(tenant_id)
+
+        # Postgres when it is there: one GROUP BY with a LIMIT, answered from an
+        # index. The scroll below cannot stop early — a chunk count needs every
+        # chunk — so it read the whole collection whatever the limit said: 2 000
+        # points scanned to return three rows. That is a full scan on a lookup.
+        relational = self._relational
+        summaries = getattr(relational, "document_summaries", None) if relational else None
+        if callable(summaries):
+            try:
+                return list(await summaries(tenant_id=tenant, source=source, limit=limit))
+            except StoreUnavailable as exc:
+                # Fall through to the scroll. This is a read-only lookup and the
+                # vector store is the one every deployment has, so a Postgres
+                # outage should degrade it rather than fail it.
+                log.warning("documents_via_relational_failed", error=str(exc)[:200])
+
         found: dict[str, dict[str, Any]] = {}
         async for chunk in self.vector_store.scroll(tenant_id=tenant):
             document_id = chunk.document_id
@@ -1262,14 +1278,14 @@ class RAGPipeline:
         if target is None:
             raise ConfigError("ingest needs a source or documents=", hint="rag.ingest('./docs')")
         if loader_options:
-            # A scoped pipeline for the same reason ``kwargs`` gets one: these are
-            # per-call and must not outlive the call. Kept separate from ``kwargs``
-            # because they are not settings — ``_resolve_settings`` would reject
-            # them — and because they address the loader, which settings cannot.
+            # Passed as an argument, not assigned to the pipeline. A scoped
+            # pipeline made this safe here by accident — it is fresh per call —
+            # but the same code on the shared pipeline in ``_LinearEngine`` was a
+            # race, so neither reads the attribute now.
             scoped = _resolve_settings(self.settings, self._normalize_ingest_kwargs(kwargs))
-            pipeline = self._scoped_ingest_pipeline(scoped)
-            pipeline.loader_options = dict(loader_options)
-            return await pipeline.ingest(target)
+            return await self._scoped_ingest_pipeline(scoped).ingest(
+                target, loader_options=loader_options
+            )
         if kwargs:
             # Scoped to this call, which is what the docstring above promises and
             # what the previous version did not do: it assigned ``self.settings``,

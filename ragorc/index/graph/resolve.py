@@ -127,7 +127,27 @@ _LEGAL_SUFFIXES = frozenset(
 #: merge two nodes that must stay apart. Stage 3 can still merge them when they
 #: genuinely are the same thing, at the cost of one similarity comparison.
 
-_ARTICLES = frozenset({"the", "a", "an", "le", "la", "les", "el", "los", "der", "die", "das"})
+_ARTICLES = frozenset({"the", "a", "an"})
+"""Leading articles stripped before blocking, so ``"The Acme Corporation"`` and
+``"Acme Corp"`` reach the same normalized form.
+
+**English only, deliberately.** This used to include ``le la les el los der die
+das``, and stage 2 unions on ``(type, normalized_form)`` *unconditionally* — no
+threshold, no veto, since ``_cluster_conflict`` is reached only from stage 3. So
+every proper noun beginning with a foreign definite article lost its first word
+and merged with whatever remained: ``El Salvador`` with ``Salvador``,
+``Los Angeles`` with ``Angeles``, ``La Paz`` with ``Paz``, ``Der Spiegel`` with
+``Spiegel``. Reproduced: three LOCATION entities became two, one node carrying
+both "A country in Central America" and "A coastal city in Bahia, Brazil", and
+the graph asserting ``El Salvador -[CAPITAL_OF]-> Bahia``. Stage 3 scored that
+pair at 0.8167 against the 0.92 threshold — the guard that exists would have
+refused the merge it never saw.
+
+The difference is linguistic, not arbitrary. An English leading "the" is usually
+droppable from a proper noun ("The Times" is "Times"); a Romance or German
+article usually *is* the proper noun's first word. Losing the occasional
+``Der Spiegel``/``Spiegel`` merge costs one node that stage 3 can still join on
+similarity; the reverse error is unrecoverable and silent."""
 
 #: Types that carry no information, so they lose a vote when picking the merged
 #: entity's type.

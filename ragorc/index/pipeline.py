@@ -520,8 +520,11 @@ class IngestPipeline:
         #: an ingest pipeline download an ONNX model — which four unit tests caught
         #: immediately by opening a real connection.
         self.answer_cache = answer_cache
-        #: Keyword arguments for the :class:`~ragorc.index.loaders.DirectoryLoader`
-        #: this pipeline builds per run — ``recursive``, ``include``, ``exclude``,
+        #: Default keyword arguments for the
+        #: :class:`~ragorc.index.loaders.DirectoryLoader` this pipeline builds per
+        #: run. A per-call ``loader_options=`` argument to :meth:`ingest` overrides
+        #: it and is threaded down the call chain rather than assigned here, so
+        #: concurrent ingests cannot see each other's — ``recursive``, ``include``, ``exclude``,
         #: ``metadata``, ``source_root``.
         #:
         #: It exists because the server had no way to reach that loader.
@@ -536,7 +539,13 @@ class IngestPipeline:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    async def ingest(self, target: Any, *, force: bool = False) -> IngestReport:
+    async def ingest(
+        self,
+        target: Any,
+        *,
+        force: bool = False,
+        loader_options: Mapping[str, Any] | None = None,
+    ) -> IngestReport:
         """Ingest documents or a source, and report what happened.
 
         ``target`` is a :class:`~ragorc.core.models.Document`, a path to a file or
@@ -566,13 +575,28 @@ class IngestPipeline:
         # drops its buffer with its frame, and discarding is right because that
         # run's leaves were never written either. Its work is void and a retry
         # rebuilds it from content-derived ids.
-        return await self._ingest(target, report, run_started, force=force)
+        return await self._ingest(
+            target, report, run_started, force=force, loader_options=loader_options
+        )
 
     async def _ingest(
-        self, target: Any, report: IngestReport, run_started: float, *, force: bool
+        self,
+        target: Any,
+        report: IngestReport,
+        run_started: float,
+        *,
+        force: bool,
+        loader_options: Mapping[str, Any] | None = None,
     ) -> IngestReport:
         """The run itself. Split out so :meth:`ingest` owns the buffer's lifetime
         in one `finally` rather than at every return and raise inside it."""
+        # Resolved once, per call, and passed down — never read off `self`.
+        # `loader_options` was an attribute that `_LinearEngine.ingest` assigned
+        # before delegating and restored in a `finally`. Under two concurrent
+        # ingests that is worse than not scoping at all: both runs saw whichever
+        # options were assigned last, and the restore put the *first* run's
+        # options back permanently, so every later request inherited them.
+        options = dict(loader_options if loader_options is not None else self.loader_options)
         with timed("ingest"):
             strategy: ChunkingStrategy | None = None
             # One bulk-load window for the whole run, entered on the first batch
@@ -584,7 +608,7 @@ class IngestPipeline:
             # bulk-load mode exists to prevent, performed on a schedule.
             async with contextlib.AsyncExitStack() as bulk_stack:
                 bulk_loading = False
-                async for documents in self._document_windows(target, report):
+                async for documents in self._document_windows(target, report, options):
                     report.documents_in += len(documents)
                     accepted = await self._validate(documents, report)
                     if not accepted:
@@ -640,7 +664,7 @@ class IngestPipeline:
     # a. collect + validate
     # ------------------------------------------------------------------
     async def _document_windows(
-        self, target: Any, report: IngestReport
+        self, target: Any, report: IngestReport, options: Mapping[str, Any]
     ) -> AsyncIterator[list[Document]]:
         """Yield the documents to ingest, a window at a time.
 
@@ -663,7 +687,7 @@ class IngestPipeline:
             loader = DirectoryLoader(
                 tenant_id=self.settings.tenant_id,
                 settings=self.settings,
-                **self.loader_options,
+                **options,
             )
             async for batch in loader.iter_documents(root, window=window):
                 report.timings_ms["load"] = report.timings_ms.get("load", 0.0) + _elapsed_ms(
