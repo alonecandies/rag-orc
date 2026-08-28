@@ -248,6 +248,24 @@ class VectorRetriever:
         """
         vectors: list[FloatArray | None] = [None] * len(texts)
         pending = list(range(len(texts)))
+
+        # The wire HyDE was missing. `HyDETranslator` produces a hypothetical
+        # document, bills an LLM call for it and leaves it on the query — and
+        # `hyde_search_vector`, which turns it into the blended search vector, was
+        # documented as "called by the retriever instead of the plain query
+        # embedding" and called by nothing but its own two unit tests. So the
+        # question's vector did the searching and the document was paid for and
+        # discarded.
+        #
+        # Here rather than in the translator because the translator has no
+        # embedder, and `query.dense` is exactly the channel the paragraph below
+        # already treats as authoritative.
+        if query.dense is None and self.embedder is not None:
+            from ragorc.translate.hyde import carries_hypothetical, hyde_search_vector
+
+            if carries_hypothetical(query):
+                query.dense = await hyde_search_vector(query, self.embedder)
+
         if query.dense is not None:
             vectors[0] = query.dense
             pending = pending[1:]

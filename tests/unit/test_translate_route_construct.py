@@ -574,3 +574,98 @@ async def test_self_query_is_a_noop_without_a_schema(settings: Settings) -> None
     )
     assert result.filters == {}
     assert usage.calls == 0, "with no schema there is nothing to ask about"
+
+
+# ---------------------------------------------------------------------------
+# HyDE has to reach the search vector, not just the Query object
+# ---------------------------------------------------------------------------
+async def test_the_hypothetical_document_decides_what_is_searched() -> None:
+    """The call site. `hyde_search_vector` was written, documented as "called by
+    the retriever instead of the plain query embedding", covered by the two tests
+    above — and called by nothing. The translator billed an LLM call for a
+    document, left `Query.dense` as None, and the store embedded `query.text`.
+
+    So the module's opening line, "HyDE: embed a hypothetical answer instead of
+    the question", described the opposite of what happened.
+    """
+    import numpy as np
+
+    from ragorc.core.models import Query
+    from ragorc.core.settings import Settings
+    from ragorc.retrieve.vector import VectorRetriever
+    from ragorc.translate.hyde import HyDETranslator
+    from tests.fakes import StubEmbedder, StubLLM
+
+    settings = Settings(llm={"api_key": "k"}, embedding={"dense_dimension": 32})
+    embedder = StubEmbedder(dimension=32)
+    llm = StubLLM(text="Rotating the signing key requires keyctl rotate with the admin role.")
+
+    translated, _usage = await HyDETranslator(llm, settings=settings).translate(
+        Query(text="how do I rotate the signing key?")
+    )
+    assert translated.hypothetical, "the translator produced no document to embed"
+
+    retriever = VectorRetriever(store=None, embedder=embedder, settings=settings)
+    searched = (await retriever.embed_texts(translated, [translated.text]))[0]
+
+    def cosine(a: object, b: object) -> float:
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    question = await embedder.embed_query(translated.text)
+    document = (await embedder.embed_documents([translated.hypothetical]))[0]
+
+    assert cosine(searched, document) > cosine(searched, question), (
+        "the question still dominates the search vector, so HyDE is not being used"
+    )
+    assert cosine(searched, question) < 0.99, "the search vector is just the question"
+
+
+async def test_a_query_without_a_hypothetical_is_embedded_normally() -> None:
+    """HyDE is off by default and the trigger must not fire without it — the hot
+    path pays only a dict lookup."""
+    import numpy as np
+
+    from ragorc.core.models import Query
+    from ragorc.core.settings import Settings
+    from ragorc.retrieve.vector import VectorRetriever
+    from tests.fakes import StubEmbedder
+
+    settings = Settings(llm={"api_key": "k"}, embedding={"dense_dimension": 32})
+    # Unnormalized on purpose. `hyde_search_vector`'s no-document fallback returns
+    # `_l2(embed_query(text))`, which is indistinguishable from the plain path when
+    # the embedder already returns unit vectors — so with a normalizing stub, a
+    # trigger that fires on *every* query looks identical to one that fires on
+    # none. Caught by mutation.
+    embedder = StubEmbedder(dimension=32, normalize=False)
+    query = Query(text="how do I rotate the signing key?")
+
+    retriever = VectorRetriever(store=None, embedder=embedder, settings=settings)
+    searched = (await retriever.embed_texts(query, [query.text]))[0]
+
+    expected = await embedder.embed_query(query.text)
+    assert np.allclose(searched, expected)
+    assert not np.isclose(float(np.linalg.norm(searched)), 1.0), (
+        "the vector was normalized, so it went through the HyDE path"
+    )
+
+
+async def test_a_caller_supplied_vector_still_wins() -> None:
+    """`query.dense` is authoritative when already set — a caller who computed
+    their own search vector must not have it recomputed from a hypothetical."""
+    import numpy as np
+
+    from ragorc.core.models import Query
+    from ragorc.core.settings import Settings
+    from ragorc.retrieve.vector import VectorRetriever
+    from tests.fakes import StubEmbedder
+
+    settings = Settings(llm={"api_key": "k"}, embedding={"dense_dimension": 32})
+    embedder = StubEmbedder(dimension=32)
+    mine = np.ones(32, dtype=np.float32) / np.sqrt(32)
+    query = Query(text="q", hypothetical="a hypothetical answer document")
+    query.dense = mine
+
+    retriever = VectorRetriever(store=None, embedder=embedder, settings=settings)
+    searched = (await retriever.embed_texts(query, [query.text]))[0]
+
+    assert np.allclose(searched, mine)

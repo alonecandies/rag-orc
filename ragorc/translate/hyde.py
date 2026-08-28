@@ -149,34 +149,68 @@ class HyDETranslator(BaseTranslator):
     async def embed_for_search(self, query: Query, embedder: DenseEmbedder) -> FloatArray:
         """Compute the blended search vector.
 
-        Called by the retriever instead of the plain query embedding. Documents are
-        embedded with the *document*-side method and the question with the
-        *query*-side one, because asymmetric models expect different instruction
-        prefixes for each — using the wrong side here silently costs recall, which
-        is precisely the mistake HyDE was meant to avoid.
+        Kept as a method because it is the class's public surface; the work lives
+        in :func:`hyde_search_vector` so the retriever can reach it without
+        importing a translator.
         """
-        documents: list[str] = list(query.metadata.get("hyde_documents") or [])
-        if query.hypothetical and not documents:
-            documents = [query.hypothetical]
-        if not documents:
-            return _l2(await embedder.embed_query(query.text))
+        return await hyde_search_vector(query, embedder, blend=self.blend)
 
-        doc_vectors = await embedder.embed_documents(documents)
-        hypothesis = _l2(np.mean(np.asarray(doc_vectors, dtype=np.float32), axis=0))
 
-        blend = float(query.metadata.get("hyde_blend", self.blend))
-        if blend <= 0.0:
-            return hypothesis
+def carries_hypothetical(query: Query) -> bool:
+    """Whether this query has a HyDE document waiting to be embedded.
 
-        question = _l2(await embedder.embed_query(query.text))
-        if question.shape != hypothesis.shape:
-            # Mismatched dimensions mean the two sides used different models;
-            # blending them would produce a meaningless vector.
-            log.warning(
-                "hyde_blend_skipped",
-                reason="dimension_mismatch",
-                question_dim=int(question.shape[-1]),
-                hypothesis_dim=int(hypothesis.shape[-1]),
-            )
-            return hypothesis
-        return _l2(blend * question + (1.0 - blend) * hypothesis)
+    The retriever's trigger. Cheap and side-effect free, so the hot path pays a
+    dict lookup for a feature that is off by default.
+    """
+    return bool(query.metadata.get("hyde_documents") or query.hypothetical)
+
+
+async def hyde_search_vector(
+    query: Query, embedder: DenseEmbedder, *, blend: float = 0.3
+) -> FloatArray:
+    """The vector HyDE exists to produce, blended with the question's.
+
+    Documents are embedded with the *document*-side method and the question with
+    the *query*-side one, because asymmetric models expect different instruction
+    prefixes for each — using the wrong side here silently costs recall, which is
+    precisely the mistake HyDE was meant to avoid.
+
+    This was written, documented as "called by the retriever instead of the plain
+    query embedding", covered by two unit tests — and called by nothing. The
+    translator produced a hypothetical document, billed an LLM call for it, stored
+    it on ``Query.hypothetical`` and in ``metadata["hyde_documents"]``, and left
+    ``Query.dense`` as ``None``; the store then embedded ``query.text``. So every
+    HyDE query paid for a document that never reached a vector, and the module's
+    opening line — "HyDE: embed a hypothetical answer instead of the question" —
+    described the opposite of what happened.
+
+    ``ragorc/retrieve/vector.py`` states the other half of the contract twice:
+    "``query.dense`` is authoritative for ``texts[0]`` when it is already set:
+    that is how HyDE injects the embedding of a hypothetical document". The
+    consumer was ready; nothing filled the field.
+    """
+    documents: list[str] = list(query.metadata.get("hyde_documents") or [])
+    if query.hypothetical and not documents:
+        documents = [query.hypothetical]
+    if not documents:
+        return _l2(await embedder.embed_query(query.text))
+
+    doc_vectors = await embedder.embed_documents(documents)
+    hypothesis = _l2(np.mean(np.asarray(doc_vectors, dtype=np.float32), axis=0))
+
+    blend = float(query.metadata.get("hyde_blend", blend))
+    if blend <= 0.0:
+        return hypothesis
+
+    question = _l2(await embedder.embed_query(query.text))
+    if question.shape != hypothesis.shape:
+        # Mismatched dimensions mean the two sides used different models;
+        # blending them would produce a meaningless vector.
+        log.warning(
+            "hyde_blend_skipped",
+            reason="dimension_mismatch",
+            question_dim=int(question.shape[-1]),
+            hypothesis_dim=int(hypothesis.shape[-1]),
+        )
+        return hypothesis
+    return _l2(blend * question + (1.0 - blend) * hypothesis)
