@@ -493,6 +493,69 @@ and 2.87–3.25x field-for-field, and the ColBERT finding was nearly refuted
 because `_late_chunker()` reads an injected attribute that is `None` on a bare
 `IngestPipeline` and only becomes ColBERT once the builder wires it.
 
+## 11k. Closed: round twelve — the graph write side, the scoring inputs, and a live regression
+
+Nine findings. Four share one shape and two share a single cause, which is the
+most useful thing this round produced.
+
+**One hardcoded argument disabled two documented optimizations.**
+`QdrantStore.search` passed `with_vectors=False`, so no chunk on any shipped
+retrieval path carried a dense vector — and the two stages that read
+`chunk.dense` both degrade to something indistinguishable from working. MMR
+returned `chunks[:k]` on every query (verified against live Qdrant: every hit
+`dense is None`, output byte-identical to relevance order), and
+`EmbeddingFilterCompressor` re-embedded all 30 candidates at ~7 s a call against
+the 2 µs its own matmul takes, while documenting the opposite.
+
+Compounding it, `report.diversity_dropped` was assigned inside the
+`mmr_enabled` branch whichever way the branch went, so plain truncation was
+logged as `diversity=17`. That is what would have stopped anyone noticing.
+Vectors are now requested when a stage will read them, by name so the sparse and
+ColBERT vectors do not come too, and attribution is decided on the input —
+MMR's fallback is indistinguishable from its success by the return value alone.
+
+**Retrieval fetched ten and reranked ten.** `_fetch_k` exists for this and its
+docstring states the failure verbatim; `store_node` called it and
+`nodes.retrieve` read `state["top_k"]`, so `naive`, `self_rag` and `multihop`
+handed the reranker ten candidates out of ten while `adaptive` and `graphrag`
+gave it fifty. Same class, two call sites.
+
+**Entity resolution merged what its own guard would have refused.**
+`normalized_form` stripped leading articles in five languages and stage 2 unions
+on `(type, normalized_form)` unconditionally — `_cluster_conflict` is reached
+only from stage 3. `El Salvador` merged with `Salvador`, one node carrying both
+descriptions and the graph asserting `El Salvador -[CAPITAL_OF]-> Bahia`. Stage
+3 scored the pair 0.8167 against a 0.92 threshold. English articles only now:
+an English leading "the" is usually droppable from a proper noun, a Romance or
+German article usually is the proper noun's first word.
+
+**And stage 3 never ran anyway on the shipped path.** `ragorc graph build`
+omitted `embedder=`, so `_merge_by_embedding` returned `{}` on its first line,
+`Entity.embedding` was always None, and `docs/operations.md` advised lowering a
+`resolution_threshold` that did nothing. The engine had held a built dense
+embedder since `build()` and the example passes it.
+
+Also: a failed gleaning pass propagated out of `_extract_chunk`, whose caller
+treats any exception as "this chunk failed", so a second-pass timeout discarded
+a *successful* first extraction and the usage already paid for it.
+
+**Round eleven's own output produced a live regression.** Adding `source_root=`
+to the keyword set the directory walk passes each loader broke CSV, JSON, JSONL
+and PDF on *every* ingest — three subclasses override `__init__` without
+forwarding it — and the broad `except Exception` added in the same commit
+recorded each as a per-file warning. A four-file directory reported success
+having indexed one. Two changes that were each correct and together were not,
+found by parameterizing a test that had used a single `.md` file.
+
+The other two: the upload-identity fix covered six of nine label sites, because
+`_read` bypassed `_label`; and `_LinearEngine.ingest` assigned loader options on
+a shared pipeline and restored them in a `finally`, which under concurrency left
+the first run's options behind permanently.
+
+Mutation verification: 24 mutations, all caught, across four scripts. One
+mutation had to be rewritten because deleting a line broke the module rather
+than its behaviour — a syntax error is not a test of anything.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
@@ -599,6 +662,27 @@ Round eleven:
   or unit-cosine collision from a zero-token span, no splitter span violations
   under Hypothesis, no RAPTOR non-termination or leaf/summary id collision, and no
   token drop in the long-document windowing. The defects were all in the wiring.
+
+Round twelve:
+
+* The scoring mathematics is sound. MMR's lambda is not inverted and its
+  diversity term is computed against the selected set; BM25 has no negative-IDF
+  case, no misplaced k1/b and no index/query tokenization drift; a rerank batch
+  boundary does not change results and `argpartition` does not scramble order
+  within the top-k; `maxsim` handles the padding mask and empty documents.
+  Every defect was in what reached these stages.
+* Community ids are stable across rebuilds, so `prune_communities` neither
+  over-deletes nor orphans; community detection handles empty, single-node and
+  disconnected graphs; a gleaning pass does not duplicate pass 1's entities;
+  `normalize_relation_type` cannot emit a label the store's guard rejects.
+* `near_dupe_threshold=0.93` is not too aggressive for the shipped embedder, and
+  `NoiseFilter._threshold` does not fire on Qdrant's server-side RRF scores.
+* The broad `except Exception` in `DirectoryLoader._load_one` does not swallow
+  security refusals: `DocumentValidator` converts `GuardrailViolation` into
+  `ValidationFailed` upstream, deliberately, and says why.
+* The adaptive stream hold-back is complete — every PII pattern that spans
+  whitespace contains a `_SPANNING` trigger, and every pattern that does not span
+  whitespace is covered by holding the trailing run.
 
 ## 15. Deliberately unused, kept on purpose
 
