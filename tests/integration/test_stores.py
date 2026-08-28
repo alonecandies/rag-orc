@@ -697,10 +697,25 @@ async def test_search_returns_dense_vectors_only_when_a_stage_reads_them(
             "vectors were requested but not attached to the chunk"
         )
 
-        picked = [c.chunk.id for c in mmr_select(hits, k=4, lambda_mult=0.5)]
-        assert picked != [h.chunk.id for h in hits[:4]], (
-            "MMR produced the relevance order, i.e. it is still inert"
+        # Asserted as a property of the selection, not as "differs from the
+        # relevance order". The first version of this test used the latter and it
+        # is ill-posed: with twelve chunks on four axes the relevance order can
+        # already be diverse, and then a correctly-diversifying MMR reproduces it.
+        # It passed on the ordering Qdrant happened to return and failed on the
+        # next one, which is a flaky test, not a finding.
+        picked = mmr_select(hits, k=4, lambda_mult=0.5)
+        axes = {int(np.argmax(c.chunk.dense)) for c in picked}
+        assert len(axes) == 4, (
+            f"MMR picked {len(axes)} of the four available directions: "
+            f"{[c.chunk.id for c in picked]}"
         )
+
+        # And the inert path is still distinguishable: with the vectors stripped,
+        # `mmr_select` falls back to truncation and cannot cover them all.
+        for candidate in hits:
+            candidate.chunk.dense = None
+        blind = mmr_select(hits, k=4, lambda_mult=0.5)
+        assert [c.chunk.id for c in blind] == [h.chunk.id for h in hits[:4]]
 
         # And the default configuration must not pay for what it will not read.
         off = _store(mmr=False)
