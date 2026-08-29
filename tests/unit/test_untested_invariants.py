@@ -477,3 +477,84 @@ def test_cache_rerank_reaches_the_reranker_on_the_library_path() -> None:
     if not hasattr(reranker, "cache"):
         pytest.skip("the configured reranker declares no cache slot")
     assert reranker.cache is not None, "cache_rerank is on and the backend was never attached"
+
+
+# ---------------------------------------------------------------------------
+# Settings that describe behaviour must have a reader
+# ---------------------------------------------------------------------------
+def test_raptor_has_no_collapse_tree_knob() -> None:
+    """`indexing.raptor_collapse_tree` was documented as changing "how the
+    retriever queries", and had one `log.info` field and one `describe()` entry
+    as its only readers — both settings retrieved `levels=[1, 0, 0, 0, 0, 0, 0,
+    0]`. Removed rather than implemented, because the module's own docstring
+    argues at length that the branch it promised is worse.
+    """
+    from ragorc.core.settings import IndexingSettings
+
+    assert not hasattr(IndexingSettings(), "raptor_collapse_tree")
+
+
+def test_every_raptor_setting_has_a_behavioural_reader() -> None:
+    """The invariant, rather than a list of the knobs that happened to be inert.
+
+    A field read only by `log.info(...)` and `describe()` reports a feature as
+    configured while changing nothing — worse than never shipping it, because the
+    operator has no reason to check.
+
+    Walked over the AST, not the source text. The first draft stripped log calls
+    with a regex and scanned what was left, and it passed with the knob restored:
+    the paragraph *explaining the removal* mentions
+    `indexing.raptor_collapse_tree`, and a docstring is source text too. Same
+    failure as the round-thirteen test that a docstring containing the word
+    "rerank" satisfied. Only mutation tells the two apart.
+    """
+    import ast
+    from pathlib import Path
+
+    from ragorc.core.settings import IndexingSettings
+
+    fields = {f for f in IndexingSettings.model_fields if f.startswith("raptor_")}
+    behavioural: set[str] = set()
+
+    class _Reader(ast.NodeVisitor):
+        """Attribute reads that are not merely reporting the configuration."""
+
+        def __init__(self) -> None:
+            self.reporting = 0
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            is_log = (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "log"
+            )
+            self.reporting += is_log
+            self.generic_visit(node)
+            self.reporting -= is_log
+
+        def visit_Dict(self, node: ast.Dict) -> None:
+            # `describe()` renders configuration into a dict of literals. A value
+            # position there is a report; a key or a nested call is not.
+            for key in node.keys:
+                if key is not None:
+                    self.visit(key)
+            for value in node.values:
+                plain = isinstance(value, ast.Attribute)
+                self.reporting += plain
+                self.visit(value)
+                self.reporting -= plain
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if not self.reporting and node.attr in fields:
+                behavioural.add(node.attr)
+            self.generic_visit(node)
+
+    root = Path(__file__).resolve().parents[2] / "ragorc"
+    for path in root.rglob("*.py"):
+        if path.name == "settings.py":
+            continue
+        _Reader().visit(ast.parse(path.read_text()))
+
+    inert = sorted(fields - behavioural)
+    assert not inert, f"only ever reported, never read: {inert}"

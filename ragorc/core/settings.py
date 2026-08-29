@@ -596,9 +596,6 @@ class IndexingSettings(BaseModel):
     raptor_gmm_threshold: float = 0.1
     """Soft-clustering probability floor: a chunk may belong to several
     clusters, which is the point — topics overlap."""
-    raptor_collapse_tree: bool = True
-    """Query all levels at once rather than traversing top-down. Simpler and
-    empirically better in the RAPTOR paper."""
 
     # --- ingest pipeline -------------------------------------------------
     batch_size: int = 128

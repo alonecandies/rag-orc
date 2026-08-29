@@ -65,8 +65,9 @@ points), while the same fit over ``raptor_umap_components`` dimensions is stable
 Why the collapsed tree beats top-down traversal
 -----------------------------------------------
 Every level is written into the *same* collection, tagged with ``Chunk.level``,
-which lets ``indexing.raptor_collapse_tree`` query all of them at once — one
-flat search over leaves and summaries together, ranked against each other.
+so an ordinary search queries all of them at once — one flat search over leaves
+and summaries together, ranked against each other. There is no second mode and
+no switch: retrieval does not know RAPTOR ran.
 
 The alternative is tree traversal: search the root, descend into the best
 subtree, repeat. It sounds principled and it is worse, for a structural reason.
@@ -77,8 +78,13 @@ the root, where it knows least. Every wrong descent is unrecoverable: the leaf
 that held the answer is in a subtree the walk already abandoned. The collapsed
 query has no such commitment, costs one round trip instead of one per level, and
 the paper measured it as both simpler and better. This module therefore never
-prunes a level from the output; ``raptor_collapse_tree`` changes how the
-retriever *queries*, not what gets stored.
+prunes a level from the output.
+
+``indexing.raptor_collapse_tree`` used to sit here as a switch between the two.
+It had no behavioural reader — one ``log.info`` field and one ``describe()``
+entry — so both settings retrieved identically (``levels=[1, 0, 0, 0, 0, 0, 0,
+0]``), and it has been removed rather than implemented: a knob whose False branch
+this section argues against is a promise the module does not intend to keep.
 
 Cost, and why it is reported before anything is spent
 -----------------------------------------------------
@@ -445,7 +451,6 @@ class RaptorIndexer:
             leaves=len(leaves),
             max_levels=self.config.raptor_max_levels,
             model=self.router.model_for(Task.RAPTOR_SUMMARY),
-            collapse_tree=self.config.raptor_collapse_tree,
             **tree.forecast.report(),
         )
         self._check_budget(tree.forecast)
@@ -972,7 +977,6 @@ class RaptorIndexer:
             ],
             "gmm_threshold": self.config.raptor_gmm_threshold,
             "umap": [self.config.raptor_umap_neighbors, self.config.raptor_umap_components],
-            "collapse_tree": self.config.raptor_collapse_tree,
             "summary_tokens": self.summary_tokens,
             "model": self.router.model_for(Task.RAPTOR_SUMMARY),
         }
