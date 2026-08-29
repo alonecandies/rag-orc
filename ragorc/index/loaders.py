@@ -196,15 +196,6 @@ def _read_file_sync(path: Path) -> tuple[str, dict[str, Any]]:
     return text, meta
 
 
-def _read_bytes_sync(path: Path) -> tuple[bytes, dict[str, Any]]:
-    raw = path.read_bytes()
-    stat = path.stat()
-    return raw, {
-        "bytes": len(raw),
-        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
-    }
-
-
 def _as_path(source: Any) -> Path | None:
     """Interpret ``source`` as a filesystem path, or ``None`` if it cannot be one."""
     if isinstance(source, Path):

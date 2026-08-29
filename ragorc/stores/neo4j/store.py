@@ -45,7 +45,6 @@ conversion is needed anywhere in this file.
 from __future__ import annotations
 
 import asyncio
-import functools
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -138,8 +137,6 @@ _UNAVAILABLE = (
     ConnectionAcquisitionTimeoutError,
 )
 
-_CYPHER_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
-_CYPHER_LITERAL_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", re.DOTALL)
 _LEADING_PLAN_RE = re.compile(r"^\s*(?:EXPLAIN|PROFILE)\s+", re.IGNORECASE)
 
 # Lucene's query language is not Cypher. An unescaped ``?``, ``(`` or ``:`` in
@@ -148,28 +145,8 @@ _LEADING_PLAN_RE = re.compile(r"^\s*(?:EXPLAIN|PROFILE)\s+", re.IGNORECASE)
 _LUCENE_SPECIAL_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)')
 
 
-@functools.lru_cache(maxsize=256)
-def _keyword_pattern(keyword: str) -> re.Pattern[str]:
-    """Word-boundary matcher for a forbidden keyword, multi-word aware.
-
-    Compiled once per keyword: the guard runs on every generated query and
-    ``re.compile`` is not free.
-    """
-    body = r"\s+".join(re.escape(part) for part in keyword.split())
-    return re.compile(rf"\b{body}\b", re.IGNORECASE)
-
-
 def _lucene_escape(text: str) -> str:
     return _LUCENE_SPECIAL_RE.sub(r"\\\1", text.strip())
-
-
-def _strip_noise(cypher: str) -> str:
-    """Remove comments and string literals before keyword matching.
-
-    Without this, a query that merely *mentions* a forbidden word inside a
-    quoted value is rejected, and a comment can be used to hide one.
-    """
-    return _CYPHER_LITERAL_RE.sub("''", _CYPHER_COMMENT_RE.sub(" ", cypher))
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:
