@@ -86,7 +86,9 @@ async def test_a_later_hop_fetches_as_wide_as_the_first() -> None:
     assert retriever.asked == [50, 50], f"hop 0 and hop 1 disagree: {retriever.asked}"
 
 
-@pytest.mark.parametrize("node", ["retrieve", "hop", "bridge", "store_node"])
+@pytest.mark.parametrize(
+    "node", ["retrieve", "hop", "bridge", "store_node", "multihop_retrieve"]
+)
 def test_every_retrieval_leg_uses_the_shared_width(node: str) -> None:
     """Asserted per node, because four separate legs have now made this mistake
     and a fifth would be found the same way — by hand, rounds later.

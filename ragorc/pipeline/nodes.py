@@ -1470,7 +1470,13 @@ class PipelineNodes:
             return {}
         try:
             with timed("multihop"):
-                chunks = list(await self.multihop.retrieve(query, top_k=state.get("top_k")))
+                # `_fetch_k`, like every other retrieval leg. This node is wired
+                # into no shipped graph (OPEN-ITEMS §15) — it is the "multi-hop as
+                # one tool" shape for a caller assembling their own — which is
+                # exactly why it is fixed here rather than left: the last four
+                # occurrences of this bug were each found one round after the
+                # previous, and an inconsistent fifth site is how a sixth happens.
+                chunks = list(await self.multihop.retrieve(query, top_k=self._fetch_k(state)))
         except _FATAL:
             raise
         except Exception as exc:  # noqa: BLE001
