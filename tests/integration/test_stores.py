@@ -765,3 +765,65 @@ async def test_document_summaries_group_and_filter_in_postgres(settings: Setting
         assert len(await store.document_summaries(limit=1)) == 1
     finally:
         await store.close()
+
+
+@pytest.mark.integration
+async def test_a_join_keeps_every_column_and_every_decimal_digit(settings: Settings) -> None:
+    """Both halves of the text-to-SQL evidence path, against a real server.
+
+    `execute_readonly` used `dict_row`, and a dict cannot hold two columns of the
+    same name — so `SELECT * FROM a JOIN b`, the commonest shape a model
+    produces, returned three of six columns with the right-hand table's values
+    under the left-hand table's question. And `_json_safe` converted NUMERIC to
+    float, so `12.50` printed as `12.5` and `1234567890123456789.99` as
+    `1.2345678901234568e+18` in a table the generator is instructed to reproduce
+    verbatim.
+
+    Neither is observable against a fake: one needs a real cursor description,
+    the other a real NUMERIC column.
+    """
+    from ragorc.construct.text_to_sql import _cell, _columns
+    from ragorc.stores.postgres.store import PostgresStore
+
+    suffix = uuid.uuid4().hex[:8]
+    store = PostgresStore(settings)
+    orders, refunds = f"o_{suffix}", f"r_{suffix}"
+    try:
+        async with store._connection() as conn:
+            await conn.execute(
+                f"CREATE TABLE {orders} (id int, customer text, amount numeric(38,2))"
+            )
+            await conn.execute(
+                f"CREATE TABLE {refunds} (id int, customer text, amount numeric(38,2))"
+            )
+            await conn.execute(
+                f"INSERT INTO {orders} VALUES (1,'acme',12.50),"
+                f"(2,'globex',1234567890123456789.99)"
+            )
+            await conn.execute(
+                f"INSERT INTO {refunds} VALUES (1,'acme-refund',1.00),(2,'globex-refund',2.00)"
+            )
+
+        rows = await store.execute_readonly(
+            f"SELECT * FROM {orders} o JOIN {refunds} r ON o.id = r.id ORDER BY o.id"
+        )
+
+        assert len(rows[0]) == 6, f"the join projects six columns; got {sorted(rows[0])}"
+        assert list(_columns(rows)) == [
+            "id",
+            "customer",
+            "amount",
+            "id__2",
+            "customer__2",
+            "amount__2",
+        ]
+        assert rows[0]["customer"] == "acme", "the left table's value was overwritten"
+        assert rows[0]["customer__2"] == "acme-refund"
+
+        assert _cell(rows[0]["amount"]) == "12.50", "the stored scale was lost"
+        assert _cell(rows[1]["amount"]) == "1234567890123456789.99", "digits were lost"
+    finally:
+        async with store._connection() as conn:
+            for table in (orders, refunds):
+                await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+        await store.close()

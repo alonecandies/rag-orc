@@ -617,12 +617,21 @@ class _LinearEngine:
         async def retrieve(current: Query) -> RetrievalResult:
             return await self._retrieve_and_rerank(retriever, current, route=route)
 
+        # Every loop's bill, collected as it is spent. `SelfRAGResult.usage` and
+        # `RRRResult.usage` are computed by their owners and had no reader here,
+        # so a successful Self-RAG run — two answers, two groundedness grades, two
+        # utility grades, one rewrite — reported the single generation call the
+        # answer happened to carry, and the cost ceiling and every `$` in the eval
+        # output were understated by the whole loop.
+        loop_usage: list[Usage] = []
+
         async def retrieve_with_rrr(current: Query) -> RetrievalResult:
             if not gen.rrr_enabled:
                 return await retrieve(current)
             from ragorc.generate.rrr import RRR
 
             outcome = await RRR(self.llm, self.settings).run(current, retrieve)
+            loop_usage.append(outcome.usage)
             # Named keys rather than splatting ``report()``: a trace detail is a
             # few scalars, and splatting a collaborator's dict into a function
             # that also takes ``duration_ms`` and ``usage`` is a collision waiting
@@ -651,12 +660,19 @@ class _LinearEngine:
                 abstained=outcome.answer.abstained,
             )
             answer = outcome.answer
+            loop_usage.append(outcome.usage)
             # The full report goes on the answer, where a caller can read the
             # per-iteration verdicts. The trace gets the summary.
             answer.metadata.setdefault("self_rag", outcome.report())
         else:
             retrieval = await retrieve_with_rrr(query)
             answer = await generate(query, retrieval)
+
+        if loop_usage:
+            # Summed rather than assigned: the answer already carries the usage of
+            # the generation that produced it, and the loops' totals cover the
+            # calls around it.
+            answer.usage = Usage.sum([answer.usage, *loop_usage])
 
         answer.metadata["orchestrator"] = "linear"
         answer.metadata["pipeline"] = resolved.value

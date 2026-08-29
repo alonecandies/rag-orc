@@ -824,7 +824,15 @@ class PipelineNodes:
                 # that ignored the route would query every backend the deployment has
                 # while the router had already decided which ones the question needs.
                 result, usage = await self.crag.run(
-                    query, top_k=state.get("top_k"), route=state.get("route")
+                    query,
+                    top_k=state.get("top_k"),
+                    route=state.get("route"),
+                    # The graph owns the web step: `decide_after_grade` routes
+                    # AMBIGUOUS to a `web_search` node. Leaving CRAG's internal
+                    # fallback on as well searched the web twice per query — two
+                    # rewrite calls, two provider requests, and both sets fused as
+                    # though they were independent evidence.
+                    web=False,
                 )
         except _FATAL:
             raise
@@ -917,6 +925,20 @@ class PipelineNodes:
             return {}
         if self.web is None or not getattr(self.web, "enabled", True):
             log.info("web_search_skipped", reason="no web retriever enabled")
+            return {}
+        if not self.settings.retrieval.crag_web_fallback:
+            # The setting that turns the web leg off, honoured here as well as
+            # inside `CorrectiveRAG`. It was read in three places — CRAG's own
+            # fallback, the linear engine's retriever construction and
+            # `describe()` — and not by this node, so on the `crag` and `agentic`
+            # graphs an operator who switched it off still had every AMBIGUOUS and
+            # INCORRECT query sent to a search engine, while `/health` and
+            # `describe()` reported the feature as disabled.
+            #
+            # A web search is an egress of the user's question to a third party,
+            # so "configured off and still running" is the one direction this
+            # particular flag must not fail in.
+            log.info("web_search_skipped", reason="crag_web_fallback is off")
             return {}
         limit = self.settings.retrieval.web_search_results
         web_query = Query(
@@ -1168,6 +1190,27 @@ class PipelineNodes:
                 grounded=grounded,
                 groundedness_score=float(state.get("groundedness", answer.groundedness)),
             )
+        declined = decision is None or not decision.abstain
+        if declined and not self.settings.generation.allow_abstention:
+            # The policy already declined — `AbstentionPolicy` returns "do not
+            # abstain" whenever this setting is off — and the fallback below
+            # would overwrite the answer with the refusal anyway, so a
+            # deployment that switched abstention off still received it, with
+            # `gate="loop_exhausted"`.
+            #
+            # The answer is kept as-is, ungrounded and flagged. That is what
+            # the setting asks for: a caller who turned this off wants the
+            # model's best attempt plus the metadata to judge it by, not a
+            # refusal.
+            log.info(
+                "abstention_suppressed",
+                reason="generation.allow_abstention is off",
+                grounded=grounded,
+                useful=useful,
+                attempts=attempts,
+            )
+            return {}
+
         if decision is not None and decision.abstain:
             reason, gate, message, confidence = (
                 decision.reason,
@@ -1333,7 +1376,17 @@ class PipelineNodes:
                     self.retriever,
                     hop_query,
                     route=_route_or_default(state),
-                    top_k=state.get("top_k"),
+                    # `_fetch_k`, like every other retrieval site. This read the
+                    # state directly and passed `None`, so the retriever fell back
+                    # to `retrieval.top_k`: hop 0 fetched fifty and every hop after
+                    # it fetched ten, feeding the same reranker. The later hops are
+                    # what multi-hop is *for* — the first is just a normal search —
+                    # so the narrow leg was on exactly the queries that needed the
+                    # recall.
+                    #
+                    # Third site to make this mistake, after `nodes.retrieve` and
+                    # `naive`. Two of the three are in this file.
+                    top_k=self._fetch_k(state),
                 )
         except _FATAL:
             raise

@@ -383,6 +383,12 @@ def _cell(value: Any) -> str:
     if isinstance(value, Decimal):
         # str() preserves the stored scale: NUMERIC(10,2) '12.50' must not print
         # as 12.5 when the generator is told to reproduce figures exactly.
+        #
+        # Kept for a caller who hands `to_chunks` raw rows. On the shipped path
+        # `PostgresStore._json_safe` now renders Decimals as strings for the same
+        # reason, so this branch is a second line rather than the only one — it
+        # used to be the only one *and* unreachable, because that conversion ran
+        # first and produced a float.
         return str(value)
     if isinstance(value, datetime | date):
         return value.isoformat()

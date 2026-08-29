@@ -327,6 +327,24 @@ class SelfRAG:
     def _abstain(self, best: Answer | None, query: Query, attempts: list[SelfRAGAttempt]) -> Answer:
         gen = self.settings.generation
         reason = f"self-RAG exhausted {len(attempts)} attempt(s) without a grounded, useful answer"
+        if not gen.allow_abstention and best is not None:
+            # `generation.allow_abstention` is read by `AbstentionPolicy` and was
+            # not read here, so a deployment that switched abstention off still
+            # got the refusal from this loop. The best attempt is returned instead,
+            # marked ungrounded and carrying the verdicts, which is what the
+            # setting asks for: the model's best answer plus what is known about
+            # it, rather than a refusal.
+            log.info("self_rag_abstention_suppressed", attempts=len(attempts))
+            best.metadata = {
+                **best.metadata,
+                "self_rag": {
+                    "iterations": len(attempts),
+                    "verdicts": [a.verdict for a in attempts],
+                },
+                "abstention_suppressed": reason,
+            }
+            best.grounded = False
+            return best
         log.info("self_rag_abstained", attempts=len(attempts), reason=reason)
         answer = best or Answer(text="")
         answer.metadata = {

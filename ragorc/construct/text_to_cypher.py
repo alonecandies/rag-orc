@@ -44,7 +44,7 @@ use and what a citation can quote.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -318,9 +318,92 @@ def _is_path_like(value: Any) -> bool:
     return hasattr(value, "relationships") or hasattr(value, "nodes")
 
 
+class _SerializedNode:
+    """A serialized node wearing the driver's attribute names.
+
+    ``Neo4jStore._serialize`` flattens ``Node``/``Relationship``/``Path`` into
+    plain dicts for JSON safety, and it runs *before* this module sees a row. The
+    detectors below probe for attributes — ``.labels``, ``.nodes``,
+    ``.start_node`` — which a dict does not have however many matching *keys* it
+    carries, so every renderer here was unreachable and the generator was handed
+    ``{'_element_id': '4:1fd5a164-…:183', '_labels': ['AuditCo'], …}``: verbatim
+    the "unreadable noise" this module's docstring says it exists to prevent.
+
+    Adapting is the narrow fix. Rewriting the renderers to speak the serialized
+    dialect would leave them unable to handle real driver objects, which a caller
+    passing raw records still supplies; changing the store's output would change
+    what every JSON consumer of ``execute_readonly`` receives.
+    """
+
+    __slots__ = ("_data", "element_id")
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        self._data = data
+        self.element_id = data.get("_element_id")
+
+    @property
+    def labels(self) -> tuple[str, ...]:
+        return tuple(self._data.get("_labels") or ())
+
+    def items(self) -> Any:
+        # The underscore-prefixed keys are the driver's own bookkeeping, not
+        # properties the author of the graph wrote.
+        return {k: v for k, v in self._data.items() if not k.startswith("_")}.items()
+
+
+class _SerializedRelationship:
+    """A serialized relationship, with its endpoints resolved where possible.
+
+    ``_start``/``_end`` are element ids rather than nodes, so a relationship
+    returned on its own cannot name them and renders as ``-[TYPE]->`` — which is
+    what ``_render_relationship`` already does for missing endpoints. Inside a
+    path the node list supplies them, so the arrow gets its names and its
+    direction back.
+    """
+
+    __slots__ = ("_data", "end_node", "start_node")
+
+    def __init__(self, data: Mapping[str, Any], nodes: Mapping[str, Any] | None = None) -> None:
+        self._data = data
+        lookup = nodes or {}
+        self.start_node = lookup.get(str(data.get("_start") or ""))
+        self.end_node = lookup.get(str(data.get("_end") or ""))
+
+    @property
+    def type(self) -> str:
+        return str(self._data.get("_type") or "RELATED_TO")
+
+
+class _SerializedPath:
+    __slots__ = ("nodes", "relationships")
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        self.nodes = [_SerializedNode(n) for n in (data.get("_nodes") or []) if isinstance(n, dict)]
+        by_id: dict[str, Any] = {str(n.element_id): n for n in self.nodes if n.element_id}
+        self.relationships = [
+            _SerializedRelationship(r, by_id)
+            for r in (data.get("_relationships") or [])
+            if isinstance(r, dict)
+        ]
+
+
+def _adapt(value: Any) -> Any:
+    """Give a serialized driver structure the shape the renderers expect."""
+    if not isinstance(value, Mapping):
+        return value
+    if "_nodes" in value or "_relationships" in value:
+        return _SerializedPath(value)
+    if "_labels" in value:
+        return _SerializedNode(value)
+    if "_type" in value and "_start" in value:
+        return _SerializedRelationship(value)
+    return value
+
+
 def _render_value(value: Any) -> str:
     if value is None:
         return ""
+    value = _adapt(value)
     if _is_path_like(value):
         return _render_path(value)
     if _looks_like_node(value):

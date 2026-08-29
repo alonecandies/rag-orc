@@ -300,9 +300,20 @@ class CorrectiveRAG:
         return result.chunks
 
     async def run(
-        self, query: Query, *, top_k: int | None = None, **kwargs: Any
+        self, query: Query, *, top_k: int | None = None, web: bool = True, **kwargs: Any
     ) -> tuple[RetrievalResult, Usage]:
-        """Retrieve, grade, refine, optionally search the web, and report."""
+        """Retrieve, grade, refine, optionally search the web, and report.
+
+        ``web=False`` leaves the fallback to the caller. The ``crag`` and
+        ``agentic`` graphs have their own ``web_search`` node — ``decide_after_grade``
+        routes AMBIGUOUS to it — so with the internal leg also firing, every
+        AMBIGUOUS query searched the web twice and every INCORRECT iteration did
+        it again: two rewrite calls, two provider requests, two sets of results
+        fused as though they were independent evidence.
+
+        Defaulting to ``True`` keeps the linear engine — which has no graph nodes
+        and genuinely owns this decision itself — working unchanged.
+        """
         rs = self.settings.retrieval
         limit = int(top_k or query.top_k or rs.top_k)
         result = RetrievalResult()
@@ -379,7 +390,7 @@ class CorrectiveRAG:
             usages.append(refine_usage)
 
         web_chunks: list[ScoredChunk] = []
-        if self._web_wanted(decision.action):
+        if self._web_wanted(decision.action, allowed=web):
             with timed("crag_web") as clock:
                 web_chunks, web_usage = await self._web(query, irrelevant, result, decision)
             result.timings_ms["web"] = clock.elapsed_ms
@@ -621,7 +632,10 @@ class CorrectiveRAG:
                 decision.refined_documents += 1
         return list(out), usage
 
-    def _web_wanted(self, action: GradeLabel | None) -> bool:
+    def _web_wanted(self, action: GradeLabel | None, *, allowed: bool = True) -> bool:
+        if not allowed:
+            # The caller runs its own web step; see `run`.
+            return False
         if action is GradeLabel.CORRECT or action is None:
             return False
         if not self.settings.retrieval.crag_web_fallback:

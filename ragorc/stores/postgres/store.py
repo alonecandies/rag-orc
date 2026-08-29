@@ -77,7 +77,7 @@ import orjson
 import psycopg
 import structlog
 from psycopg import AsyncConnection
-from psycopg.rows import dict_row
+from psycopg.rows import tuple_row
 from psycopg.sql import SQL, Composable, Composed, Identifier, Literal, Placeholder
 from psycopg.types.json import Jsonb
 from psycopg_pool import PoolClosed, PoolTimeout
@@ -302,7 +302,17 @@ class PostgresStore:
 
         with timed("pg_execute_readonly", rows_cap=cap):
             async with self._connection(readonly=use_readonly_pool) as conn, conn.transaction():
-                cur = conn.cursor(binary=False, row_factory=dict_row)
+                # `tuple_row`, not `dict_row`. A dict cannot hold two columns of
+                # the same name, and `SELECT * FROM a JOIN b` — the commonest
+                # shape a text-to-SQL model produces — projects `id`, `customer`
+                # and `amount` twice. `dict_row` kept the *last* of each, so a
+                # six-column result came back as three columns carrying the
+                # right-hand table's values under the left-hand table's question,
+                # with no error and nothing in the row count to notice.
+                # `tuple_row` passed explicitly: the pool sets `dict_row` as the
+                # *connection's* factory (pool.py), so omitting it here inherits
+                # the very thing being avoided.
+                cur = conn.cursor(binary=False, row_factory=tuple_row)
                 await cur.execute("SET TRANSACTION READ ONLY")
                 await cur.execute(
                     SQL("SET LOCAL statement_timeout = {ms}").format(
@@ -311,8 +321,11 @@ class PostgresStore:
                 )
                 await cur.execute(statement, list(params) if params else None)
                 rows = await cur.fetchmany(cap)
+                names = _disambiguate(
+                    [column.name for column in (cur.description or ())]
+                )
 
-        out = [{str(k): _json_safe(v) for k, v in row.items()} for row in rows]
+        out = [dict(zip(names, (_json_safe(v) for v in row), strict=True)) for row in rows]
         log.info("pg_readonly_query", rows=len(out), readonly_role=use_readonly_pool)
         return out
 
@@ -987,6 +1000,28 @@ def _qualified_columns(alias: str) -> Composed:
     return SQL(", ").join(Identifier(alias, name) for name in CHUNK_READ_COLUMNS)
 
 
+def _disambiguate(names: Sequence[str]) -> list[str]:
+    """Column names, with repeats suffixed so none is lost to a dict.
+
+    A result set may legitimately carry the same name twice — `SELECT *` over a
+    join is the obvious case — and the caller needs a mapping, so the duplicates
+    have to be renamed rather than dropped. The second `customer` becomes
+    `customer__2`, which is visible in the rendered table and tells a model that
+    two columns share a source name instead of silently showing it one.
+
+    Positional, so the *first* occurrence keeps the bare name: a query written by
+    hand reads left to right, and renaming the column the author actually meant
+    would be the more surprising half.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for raw in names:
+        name = str(raw)
+        seen[name] = seen.get(name, 0) + 1
+        out.append(name if seen[name] == 1 else f"{name}__{seen[name]}")
+    return out
+
+
 def _where(clauses: Sequence[Composable]) -> Composable:
     if not clauses:
         return SQL("")
@@ -1091,9 +1126,18 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, str):
         return value if len(value) <= MAX_CELL_CHARS else value[:MAX_CELL_CHARS] + "..."
     if isinstance(value, Decimal):
-        # Prompts and JSON have no exact-decimal type; a float is the honest
-        # lossy rendering and is what a model can reason about.
-        return float(value)
+        # A *string*, not a float. Neither prompts nor JSON have an exact-decimal
+        # type, and this used to call `float()` on the grounds that it was "the
+        # honest lossy rendering". It is not honest: it changes the digits.
+        # NUMERIC(10,2) 12.50 printed as 12.5, and NUMERIC(38,2)
+        # 1234567890123456789.99 printed as 1.2345678901234568e+18 — in an
+        # evidence table the generator is instructed to reproduce verbatim.
+        #
+        # `str` is both printable and orjson-serializable, and preserves the
+        # stored scale exactly, which is what `text_to_sql._cell`'s own Decimal
+        # branch was written to do before this conversion ran first and made it
+        # unreachable.
+        return str(value)
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, timedelta):
