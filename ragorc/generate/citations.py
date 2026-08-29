@@ -28,7 +28,7 @@ from collections.abc import Sequence
 
 import structlog
 
-from ragorc.core.models import Chunk, Citation, ScoredChunk
+from ragorc.core.models import Chunk, Citation, Modality, ScoredChunk
 
 log = structlog.get_logger(__name__)
 
@@ -117,8 +117,42 @@ def _tokens(text: str) -> list[str]:
     return [w.lower() for w in _WORD.findall(text) if w.lower() not in _STOP and len(w) > 1]
 
 
-def _base_offset(chunk: Chunk) -> int:
-    """Document offset of the text the generator actually saw.
+def _has_document_span(chunk: Chunk) -> bool:
+    """Whether this chunk's own ``start_char`` describes real document text.
+
+    Three units in this library carry text that exists nowhere in the source: a
+    RAPTOR cluster summary (``level > 0``), an LLM chunk summary, and a
+    proposition the model rewrote rather than quoted. All three set ``start_char``
+    to zero, and both multi-representation indexers say so in a docstring — the
+    citation layer just never asked. So a citation for a summary reported
+    ``start=0 end=82`` against the real document: a span pointing at the first
+    82 characters of a file, quoting a sentence no human wrote, under the
+    document's own name.
+
+    A *verbatim* proposition is deliberately not in this set. Dense-X restores the
+    author's exact characters when it can find them, precisely so that
+    ``content == document.content[start:end]`` holds and the span is checkable.
+    """
+    if getattr(chunk, "level", 0) > 0:
+        return False
+    modality = getattr(chunk, "modality", None)
+    if modality is Modality.SUMMARY:
+        return False
+    if modality is Modality.PROPOSITION:
+        return bool((getattr(chunk, "metadata", None) or {}).get("verbatim"))
+    return True
+
+
+def _absolute(base: int | None, offset: int | None) -> int | None:
+    """A within-chunk offset as a document offset, when there is a document to
+    offset into. Either half being unknown makes the answer unknown."""
+    if base is None or offset is None:
+        return None
+    return base + offset
+
+
+def _base_offset(scored: ScoredChunk) -> int | None:
+    """Document offset of the text the generator actually saw, or ``None``.
 
     ``chunk.start_char`` describes the chunk as it was *indexed*. The context
     packer may have replaced ``content`` with a wider span — the sentence window,
@@ -128,14 +162,26 @@ def _base_offset(chunk: Chunk) -> int:
     (90, 111), which sliced to ``'unts apply in Q4 only'``.
 
     Both splitters that widen a chunk record the correct base for exactly this
-    purpose — ``window_start`` and ``parent_start_char`` — so this prefers them
-    and falls back to the chunk's own offset when no expansion happened.
+    purpose — ``window_start`` and ``parent_start_char`` — but only *after* the
+    substitution has happened, which is why this asks ``explain["expanded"]``
+    rather than trusting the presence of the key. Metadata written at index time
+    survives into a chunk the packer chose not to widen, and using it there is the
+    same off-by-a-whole-span error in the other direction.
+
+    ``None`` means "this text has no position in the document". Emitting no offset
+    is the honest answer for a derived unit, and the caller passes it straight
+    through to :class:`~ragorc.core.models.Citation`, whose offsets are already
+    optional for the case where no quote was matched at all.
     """
+    chunk = scored.chunk
     metadata = getattr(chunk, "metadata", None) or {}
-    for key in ("parent_start_char", "window_start"):
-        value = metadata.get(key)
-        if isinstance(value, int):
-            return value
+    if scored.explain.get("expanded"):
+        for key in ("parent_start_char", "window_start"):
+            value = metadata.get(key)
+            if isinstance(value, int):
+                return value
+    if not _has_document_span(chunk):
+        return None
     return int(getattr(chunk, "start_char", 0) or 0)
 
 
@@ -169,7 +215,8 @@ def extract_citations(
         for index in indices:
             if not 0 <= index < len(chunks):
                 continue
-            chunk = chunks[index].chunk
+            scored = chunks[index]
+            chunk = scored.chunk
             key = (chunk.id, claim[:80])
             if key in seen:
                 continue
@@ -177,6 +224,7 @@ def extract_citations(
             quote, start, end, support = ("", None, None, 1.0)
             if attribute and claim:
                 quote, start, end, support = attribute_spans(claim, chunk.content)
+            base = _base_offset(scored)
             citations.append(
                 Citation(
                     chunk_id=chunk.id,
@@ -185,8 +233,8 @@ def extract_citations(
                     claim=claim,
                     support=support,
                     source=chunk.metadata.get("source") or chunk.metadata.get("title"),
-                    start_char=(_base_offset(chunk) + start) if start is not None else None,
-                    end_char=(_base_offset(chunk) + end) if end is not None else None,
+                    start_char=_absolute(base, start),
+                    end_char=_absolute(base, end),
                 )
             )
     return citations

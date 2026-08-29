@@ -349,8 +349,8 @@ class PropositionIndexer:
         span = _verbatim_span(source.content, text, normalized, origins)
         metadata = dict(source.metadata)
         metadata["representation"] = "proposition"
-        metadata["source_start_char"] = source.start_char
-        metadata["source_end_char"] = source.end_char
+        metadata["parent_start_char"] = source.start_char
+        metadata["parent_end_char"] = source.end_char
         metadata["source_index"] = source.index
         metadata["verbatim"] = span is not None
         if truncated:

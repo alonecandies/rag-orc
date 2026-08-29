@@ -465,22 +465,37 @@ def test_packer_density_survives_negative_reranker_scores() -> None:
 def test_citation_offsets_follow_the_expanded_text() -> None:
     """After the packer swaps in a wider span, the chunk's own offsets no longer
     describe what the generator saw. Adding a within-quote offset to them lands on
-    unrelated text — measured (90, 111) slicing to 'unts apply in Q4 only'."""
+    unrelated text — measured (90, 111) slicing to 'unts apply in Q4 only'.
+
+    Packed by the real ``ContextPacker`` rather than by hand. The substitution and
+    the base offset are two halves of one decision, and a fixture that stages the
+    widened chunk itself can assert they agree while production never makes them
+    agree — which is how the same mismatch survived one frame up, in the metadata
+    key the citation layer reads.
+    """
     from ragorc.generate.citations import extract_citations
 
     document = "Discounts apply in Q4 only. The fee is 3 percent. Refunds take 14 days."
-    # A window chunk: content is the wide span, start_char still points at the child.
+    # A window chunk as the splitter emits it: content is the precise sentence,
+    # metadata carries the wide span the packer will substitute.
     chunk = Chunk(
         id="c1",
-        content=document,
+        content="The fee is 3 percent.",
         document_id="d1",
-        start_char=27,
-        end_char=48,
-        metadata={"window_start": 0, "source": "policy.md"},
+        start_char=28,
+        end_char=49,
+        metadata={"window_text": document, "window_start": 0, "source": "policy.md"},
     )
-    citations = extract_citations(
-        "The fee is 3 percent [1].", [ScoredChunk(chunk=chunk, score=0.9)]
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        retrieval={"parent_expansion": True, "dedupe_enabled": False},
     )
+    packed = ContextPacker(settings).build(
+        [ScoredChunk(chunk=chunk, score=0.9)], budget=400, isolate=False
+    )
+    assert packed.chunks[0].chunk.content == document, "the packer did not widen the chunk"
+
+    citations = extract_citations("The fee is 3 percent [1].", packed.chunks)
     assert citations
     citation = citations[0]
     assert citation.start_char is not None
@@ -489,6 +504,35 @@ def test_citation_offsets_follow_the_expanded_text() -> None:
         f"offsets ({citation.start_char}, {citation.end_char}) slice to {sliced!r}, "
         f"which is not the quote {citation.quote!r}"
     )
+
+
+def test_an_unexpanded_window_chunk_uses_its_own_offset() -> None:
+    """The other direction of the same error. ``window_start`` is written at index
+    time and survives into a chunk the packer chose *not* to widen; reading it
+    there re-bases the quote by a whole span."""
+    from ragorc.generate.citations import extract_citations
+
+    document = "Discounts apply in Q4 only. The fee is 3 percent. Refunds take 14 days."
+    chunk = Chunk(
+        id="c1",
+        content="The fee is 3 percent.",
+        document_id="d1",
+        start_char=28,
+        end_char=49,
+        metadata={"window_text": document, "window_start": 0},
+    )
+    settings = Settings(
+        security={"enforce_tenant_isolation": False},
+        retrieval={"parent_expansion": False, "dedupe_enabled": False},
+    )
+    packed = ContextPacker(settings).build(
+        [ScoredChunk(chunk=chunk, score=0.9)], budget=400, isolate=False
+    )
+    assert packed.chunks[0].chunk.content == "The fee is 3 percent."
+
+    citation = extract_citations("The fee is 3 percent [1].", packed.chunks)[0]
+    assert citation.start_char == 28, f"re-based to {citation.start_char} using a stale window"
+    assert document[citation.start_char : citation.end_char] == "The fee is 3 percent."
 
 
 def test_packer_budgets_the_scaffolding_it_renders() -> None:

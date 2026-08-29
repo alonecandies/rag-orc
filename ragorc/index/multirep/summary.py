@@ -300,8 +300,8 @@ class SummaryIndexer:
         """
         metadata = dict(source.metadata)
         metadata["representation"] = "summary"
-        metadata["source_start_char"] = source.start_char
-        metadata["source_end_char"] = source.end_char
+        metadata["parent_start_char"] = source.start_char
+        metadata["parent_end_char"] = source.end_char
         metadata["source_index"] = source.index
         if title:
             metadata["title"] = title
