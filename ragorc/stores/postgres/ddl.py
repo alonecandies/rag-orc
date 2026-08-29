@@ -53,11 +53,14 @@ failure mode worth designing out.
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from pgvector.psycopg import register_vector_async
 from psycopg.sql import SQL, Composed, Identifier, Literal
 from psycopg_pool import AsyncConnectionPool
 
+from ragorc.core.errors import ConfigError
 from ragorc.core.settings import PostgresSettings, get_settings
 
 log = structlog.get_logger(__name__)
@@ -318,6 +321,55 @@ def drop_statements(settings: PostgresSettings) -> list[Statement]:
     ]
 
 
+async def _assert_vector_width(conn: Any, settings: PostgresSettings) -> None:
+    """Refuse to proceed when the live column is not the width we are configured for.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already exists, so
+    a corpus indexed at 384 dimensions and then re-pointed at a 768-dimensional
+    model kept its ``vector(384)`` column and failed thousands of writes later with
+    ``query vector dimension mismatch (got=768 expected=384)`` — a message that
+    names neither the setting nor the model that disagree.
+
+    That was reachable from the *documented* path: ``dense_dimension`` is
+    "auto-detected from the model when left unset", and the lockstep assignment in
+    ``Settings.model_post_init`` only runs when it is set, so changing
+    ``dense_model`` alone — which its own docstring recommends, by name, twice —
+    moved Qdrant and left pgvector behind.
+
+    pgvector encodes the declared dimension directly in ``atttypmod``, so this is
+    one catalog read inside the DDL transaction. An absent column means a fresh
+    database mid-create, which is not a mismatch.
+    """
+    row = await (
+        await conn.execute(
+            """
+            SELECT a.atttypmod
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
+              AND a.attname = 'embedding' AND NOT a.attisdropped
+            """,
+            (settings.schema_name, settings.chunks_table),
+        )
+    ).fetchone()
+    if row is None:
+        return
+    actual = int(row[0] if not isinstance(row, dict) else row["atttypmod"])
+    wanted = int(settings.vector_dimension)
+    if actual > 0 and actual != wanted:
+        raise ConfigError(
+            "the chunks table's embedding column is not the configured width",
+            table=f"{settings.schema_name}.{settings.chunks_table}",
+            column_dimension=actual,
+            configured_dimension=wanted,
+            hint=(
+                "set embedding.dense_dimension (and so postgres.vector_dimension) to "
+                f"{actual}, or re-index into a new postgres.chunks_table at {wanted}"
+            ),
+        )
+
+
 async def ensure_schema(
     pool: AsyncConnectionPool,
     settings: PostgresSettings | None = None,
@@ -357,6 +409,8 @@ async def ensure_schema(
             await conn.execute(stmt)
         for stmt in index_statements(settings):
             await conn.execute(stmt)
+
+        await _assert_vector_width(conn, settings)
 
         for stmt in optional_statements(settings):
             try:

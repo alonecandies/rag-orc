@@ -408,7 +408,13 @@ class _LinearEngine:
             sparse_embedder=self.sparse,
             late_embedder=self.colbert,
         )
-        self.relational = PostgresStore(s, cache=self.cache)
+        # The width the embedder emits, not the settings default: changing
+        # `embedding.dense_model` moves Qdrant and leaves `vector_dimension`
+        # at 384, which fails every pgvector write with a message that names
+        # neither the model nor the setting.
+        self.relational = PostgresStore(
+            s, cache=self.cache, dimension=int(getattr(self.dense, "dimension", 0) or 0) or None
+        )
 
         self.hybrid = HybridRetriever(self.vector, postgres=self.relational, settings=s)
         # The vector leg as every route should see it. `parent_leg` is the

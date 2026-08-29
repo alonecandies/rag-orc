@@ -572,6 +572,25 @@ class RAGPipeline:
             )
         return self._vector
 
+    def _relational_dimension(self) -> int | None:
+        """The pgvector column width, taken from the embedder rather than a default.
+
+        ``postgres.vector_dimension`` only follows ``embedding.dense_dimension``,
+        which is documented as auto-detected when unset — so changing
+        ``dense_model`` (the documented way) moved Qdrant to 768 and left pgvector
+        declaring 384. The embedder knows the real number and resolves it from a
+        static model registry, with no download and no forward pass.
+
+        Degrades to ``None`` — today's behaviour — rather than turning a
+        text-to-SQL-only deployment into a startup failure over a number it will
+        never read.
+        """
+        try:
+            return int(getattr(self.dense_embedder, "dimension", 0) or 0) or None
+        except Exception as exc:  # noqa: BLE001 - a width we cannot resolve is not fatal
+            log.debug("relational_dimension_unresolved", error=str(exc)[:200])
+            return None
+
     async def relational_store(self) -> Any:
         """Postgres, built on demand. Async because building it is a connection.
 
@@ -581,7 +600,7 @@ class RAGPipeline:
         if self._relational is None:
             from ragorc.stores.postgres.store import PostgresStore
 
-            self._relational = PostgresStore(self.settings, cache=self.cache)
+            self._relational = PostgresStore(self.settings, cache=self.cache, dimension=self._relational_dimension())
         return self._relational
 
     async def graph_store(self) -> Any:
@@ -644,7 +663,7 @@ class RAGPipeline:
                 from ragorc.stores.postgres.store import PostgresStore
 
                 if self._relational is None:
-                    self._relational = PostgresStore(self.settings, cache=self.cache)
+                    self._relational = PostgresStore(self.settings, cache=self.cache, dimension=self._relational_dimension())
                 postgres = self._relational
             self._hybrid = HybridRetriever(
                 self.vector_store, postgres=postgres, settings=self.settings
@@ -688,7 +707,7 @@ class RAGPipeline:
         if self._relational is None:
             from ragorc.stores.postgres.store import PostgresStore
 
-            self._relational = PostgresStore(self.settings, cache=self.cache)
+            self._relational = PostgresStore(self.settings, cache=self.cache, dimension=self._relational_dimension())
         return self._relational
 
     @property

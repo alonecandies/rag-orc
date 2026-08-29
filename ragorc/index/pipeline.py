@@ -1044,7 +1044,12 @@ class IngestPipeline:
         if self.relational is None:
             from ragorc.stores.postgres.store import PostgresStore
 
-            self.relational = PostgresStore(self.settings)
+            # The width the embedder actually emits, not the one the settings
+            # default to: `_pin_dimension` has already established it with a real
+            # forward pass, and it is the only number here that cannot be wrong.
+            self.relational = PostgresStore(
+                self.settings, dimension=int(getattr(query_side, "dimension", 0) or 0) or None
+            )
             self._owns_stores = True
 
         # Concurrently: two independent databases, and a first run pays DDL on

@@ -95,7 +95,7 @@ from ragorc.core.models import (
 )
 from ragorc.core.protocols import Cache
 from ragorc.core.registry import register
-from ragorc.core.settings import Settings, get_settings
+from ragorc.core.settings import PostgresSettings, Settings, get_settings
 from ragorc.core.telemetry import timed
 from ragorc.security.tenancy import require_tenant
 from ragorc.stores.postgres.ddl import (
@@ -179,6 +179,32 @@ _PG_TYPES: dict[str, Composable] = {
 }
 
 
+def _pg_at_dimension(pg: PostgresSettings, dimension: int | None) -> PostgresSettings:
+    """The Postgres settings, with the vector width the caller actually measured.
+
+    ``postgres.vector_dimension`` is a literal default (384) that follows
+    ``embedding.dense_dimension`` and never ``embedding.dense_model``. Since
+    ``dense_dimension`` is documented as auto-detected when unset, the documented
+    way to change the model left this at 384 while Qdrant — which asks the
+    embedder — moved to 768.
+
+    Every reader of the width goes through ``self.pg``: the DDL, the query-vector
+    coercion in :meth:`search`, and the row builder in :meth:`upsert_chunks`. So
+    overriding it here is one seam rather than five, and the copy keeps the same
+    DSN, which is what the pool is keyed on — a re-pointed store shares the pool
+    it would have shared anyway.
+    """
+    if not dimension or int(dimension) == int(pg.vector_dimension):
+        return pg
+    log.info(
+        "postgres_vector_dimension_resolved",
+        configured=pg.vector_dimension,
+        measured=int(dimension),
+        source="embedder",
+    )
+    return pg.model_copy(update={"vector_dimension": int(dimension)})
+
+
 @register("store", "postgres")
 class PostgresStore:
     """``RelationalStore`` over psycopg3 + pgvector.
@@ -189,9 +215,15 @@ class PostgresStore:
 
     name = "postgres"
 
-    def __init__(self, settings: Settings | None = None, *, cache: Cache | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        cache: Cache | None = None,
+        dimension: int | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
-        self.pg = self.settings.postgres
+        self.pg = _pg_at_dimension(self.settings.postgres, dimension)
         self.cache = cache
         self._chunks = chunks_table(self.pg)
         self._documents = documents_table(self.pg)
