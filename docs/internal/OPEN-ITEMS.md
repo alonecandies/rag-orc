@@ -615,6 +615,63 @@ mistake in different clothes — asserting on a helper, a source string, or a
 parameter, rather than on what the caller does. One of them was defeated by a
 docstring I had just written containing the word the test was grepping for.
 
+## 11m. Closed: round fourteen — query construction and the loop decisions
+
+Eight findings across two areas neither previously audited: the thing the SQL and
+Cypher guards guard, and the decisions inside the feedback loops whose structure
+round eight checked.
+
+**Three renderers the stores made unreachable, for one shared reason.** Both
+stores normalize result values for JSON-safety and that normalization runs
+*before* the construct module's renderers. Each store's conversion is right for
+its own purpose and wrong as a preprocessing step for code written to handle raw
+types.
+
+The worst returned the wrong rows. `execute_readonly` read with `dict_row`, and
+a dict cannot hold two columns of the same name — so `SELECT * FROM a JOIN b`,
+the commonest shape a text-to-SQL model produces, kept the *last* of each
+duplicate and handed the generator a three-column table describing the
+right-hand table's rows under the left-hand table's question. No error, and
+nothing in the row count to notice.
+
+The second lost digits: `_json_safe` called `float()` on NUMERIC, so `12.50`
+printed as `12.5` and `1234567890123456789.99` as `1.2345678901234568e+18`, in
+the one chunk class the generator is instructed to reproduce verbatim.
+`text_to_sql._cell` had a Decimal branch documented for exactly this and the two
+comments contradicted each other outright — the store won by position.
+
+The third was the graph verbalizer. `to_chunks` exists because "handed to a model
+as a repr, they are unreadable noise", and `Neo4jStore._serialize` flattens
+`Node`/`Relationship`/`Path` to dicts first; every detector probes for
+*attributes* a dict does not have however many matching keys it carries.
+
+**A width, twice more.** `nodes.hop` and `nodes.bridge` read `state["top_k"]`
+where their siblings call `_fetch_k`, so later hops fetched a fifth as wide as
+hop 0 and fed the same reranker — on exactly the queries multi-hop exists for.
+Third and fourth sites after `nodes.retrieve` (round twelve) and `naive` (round
+thirteen), which makes the retrieval width the single most repeated defect in
+this codebase. Now pinned per node rather than by banning the pattern, because
+`validate` and `rerank` read the state's value correctly: the distinction is
+whether the number bounds a search or bounds the answer.
+
+**Two settings that did not do what they said.** `crag_web_fallback=False` left
+`nodes.web_search` searching — the flag is read by CRAG's own fallback, the
+linear engine and `describe()`, and not by the node — so an operator who
+switched it off still sent every AMBIGUOUS query to a third party while
+`/health` reported it disabled. And when it *was* on, the web was searched twice:
+CRAG's internal fallback plus the graph's node. `generation.allow_abstention=False`
+likewise did not stop either abstention path, so the policy's decision was made
+and then overwritten.
+
+**And a bill nobody collected.** `SelfRAGResult.usage` and `RRRResult.usage` had
+no reader in `_LinearEngine`, so a successful Self-RAG run reported one LLM call
+having made six — read by the cost ceiling, the eval `$` column and the metrics
+histogram alike.
+
+Mutation verification: 19 mutations across four scripts, all caught, with two
+tests initially passing for the wrong reason — both source-grep assertions that a
+behavioural mutation walked past, the same weakness round thirteen found.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
@@ -762,6 +819,30 @@ Round thirteen:
   Called Quest"/"Tribe Called Quest" all still merge.
 * Adding `truncated` to `NoiseReport.removed` changed no behaviour — every reader
   is a debug log line.
+
+Round fourteen:
+
+* The SQL guard's injected LIMIT cannot be escaped by a generated `UNION`, CTE,
+  subquery or OFFSET; a repaired statement does go back through the guard, and the
+  last failed attempt is not executed anyway; the repair's strong-model escalation
+  is billed to the ledger.
+* `self_query` does not let an LLM-invented filter key reach the store.
+* CRAG's AMBIGUOUS branch does combine refined corpus results with web results
+  rather than letting one win, and knowledge refinement does run and does reach
+  the generator.
+* Self-RAG's retry budget is bounded, decrements, and re-retrieves rather than
+  re-generating from the same context; multi-hop evidence accumulates rather than
+  overwriting, and the sufficiency check sees the newest hop (round eight's fix
+  held, and the bridge path has the property too).
+* No loop can exceed `cost.max_llm_calls_per_query`. RRR uses the rewritten
+  query's results *in addition to* the original's.
+* Round thirteen's own output holds: the newly-live HyDE path embeds once per
+  query rather than once per variant or per store leg; moving `select_graph` above
+  the cache did not disturb the tenant guard's precedence; dropping graphrag's
+  variants breaks nothing downstream.
+* The examples and docs are consistent with the API — every name the six examples
+  import resolves, 64 call sites pass no rejected keyword, and every
+  `from ragorc import X` in the docs exists.
 
 ## 15. Deliberately unused, kept on purpose
 
