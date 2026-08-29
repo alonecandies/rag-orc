@@ -67,7 +67,7 @@ import numpy as np
 import structlog
 
 from ragorc.core.concurrency import map_concurrent
-from ragorc.core.errors import RagOrcError
+from ragorc.core.errors import BudgetExceeded, RagOrcError
 from ragorc.core.ids import stable_uuid
 from ragorc.core.models import Chunk, IntArray, Modality, ScoredChunk, Usage
 from ragorc.core.protocols import LLM
@@ -281,6 +281,14 @@ class PropositionIndexer:
                 stage="dense_x",
                 max_tokens=self.max_per_chunk * _PROPOSITION_TOKENS + _JSON_ENVELOPE_TOKENS,
             )
+        except BudgetExceeded:
+            # A spent budget is a stop signal for the whole stage, not one chunk's
+            # bad luck: every remaining call would raise too, and swallowing it
+            # per chunk turns "the budget ran out after 40 of 720 chunks" into 680
+            # units silently indexed as their own source text, with `usage.calls`
+            # reporting zero and nothing on the report. RAPTOR already treats it
+            # this way (`_summarize_level`); these two did not.
+            raise
         except RagOrcError as exc:
             log.warning(
                 "propositions_failed",

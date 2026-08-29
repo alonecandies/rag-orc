@@ -1177,6 +1177,30 @@ class RagService:
 
     # -- shared request plumbing ------------------------------------------
     @contextlib.contextmanager
+    def _ingest_context(self, request_id: str) -> Iterator[CostLedger]:
+        """The same trace, with ceilings that describe a corpus rather than a query.
+
+        This route used `_request_context`, whose ceilings are per *query*: with
+        RAPTOR on, a 60-document corpus stopped after `max_llm_calls_per_query`
+        (40) and the response still said success. The stage's own warning was the
+        only evidence, on a field most callers do not read.
+
+        Defaults are `None` — an ingest is bounded by the corpus, and RAPTOR
+        forecasts and refuses an over-budget build before spending anything. An
+        operator who does set a ceiling now gets a visible failure, because every
+        stage propagates BudgetExceeded rather than degrading per chunk.
+        """
+        cost = self.settings.cost
+        with new_request_context(
+            request_id=request_id,
+            max_cost_usd=cost.max_cost_per_ingest_usd if cost.track_costs else None,
+            max_calls=cost.max_llm_calls_per_ingest,
+            max_tokens=cost.max_tokens_per_ingest,
+            trace=self.settings.observability.trace_enabled,
+        ) as (_trace, ledger):
+            yield ledger
+
+    @contextlib.contextmanager
     def _request_context(self, request_id: str) -> Iterator[CostLedger]:
         """Open the trace and the ledger, with this deployment's ceilings.
 
@@ -1399,7 +1423,7 @@ class RagService:
         would let a caller ingest anything another process had left in it.
         """
         request_id = request_id or _new_request_id()
-        with self._request_context(request_id):
+        with self._ingest_context(request_id):
             # Writes are bound to the credential for the same reason reads are:
             # unbound, a caller could file documents under another tenant's id and
             # have them answered back to that tenant.

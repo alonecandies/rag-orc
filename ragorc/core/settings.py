@@ -801,6 +801,30 @@ class CostSettings(BaseModel):
     quietly running up a bill on a pathological query."""
     max_llm_calls_per_query: int = 40
     max_tokens_per_query: int | None = 200_000
+
+    # --- ingest ----------------------------------------------------------
+    max_llm_calls_per_ingest: int | None = None
+    max_cost_per_ingest_usd: float | None = None
+    max_tokens_per_ingest: int | None = None
+    """Ceilings for an ingest, which are separate because an ingest is not a query.
+
+    The HTTP ingest route ran the whole corpus inside the *per-query* ledger, so a
+    60-document corpus with RAPTOR on stopped after ``max_llm_calls_per_query``
+    (40) documents and reported success:
+
+        documents that got a RAPTOR summary: 40 of 60
+        warnings: ['raptor stage disabled: LLM call budget exhausted']
+
+    ``None`` means "bounded by the corpus, not by a request ceiling", which is the
+    honest default: an ingest's size is known in advance, and
+    :meth:`~ragorc.index.raptor.RaptorIndexer.estimate_llm_calls` forecasts and
+    refuses an over-budget build *before* the first call rather than halfway
+    through. Picking an arbitrary larger number here would only move the same
+    silent truncation to a different corpus size.
+
+    Set them when an ingest is caller-triggered and you need a hard stop. Every
+    stage now propagates :class:`~ragorc.core.errors.BudgetExceeded` instead of
+    degrading per chunk, so a ceiling that is reached fails the run visibly."""
     price_table_path: str = ""
     refresh_prices: bool = True
     """Pull live per-model prices from OpenRouter's ``/models`` endpoint so
