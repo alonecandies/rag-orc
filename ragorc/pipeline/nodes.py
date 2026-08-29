@@ -1267,7 +1267,10 @@ class PipelineNodes:
             with timed("bridge"):
                 chunks = list(
                     await self._bounded(
-                        self.bridge_retriever.retrieve(query, top_k=state.get("top_k")),
+                        # `_fetch_k`, like `hop` and `retrieve`: this is a
+                        # retrieval leg and `rerank` follows it in the multihop
+                        # graph, so the recall is bought here and spent there.
+                        self.bridge_retriever.retrieve(query, top_k=self._fetch_k(state)),
                         store="graph_path",
                         retriever=getattr(self.bridge_retriever, "name", "bridge"),
                     )
