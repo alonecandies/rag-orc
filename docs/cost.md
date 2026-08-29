@@ -188,6 +188,31 @@ that satisfies the protocol without writing to the ledger leaves it at zero whil
 `answer.usage` — summed from what the nodes reported — still holds the total.
 
 
+## An ingest is not a query
+
+`cost.max_llm_calls_per_query` bounds one request. An ingest is a corpus, and the
+HTTP ingest route used to run inside the per-query ledger — so a 60-document
+corpus with RAPTOR on stopped enriching after 40 documents and still reported
+success:
+
+```
+documents indexed: 60
+documents that got a RAPTOR summary: 40 of 60
+warnings: ['raptor stage disabled: LLM call budget exhausted (calls=40 limit=40)']
+```
+
+Ingest has its own ceilings — `cost.max_llm_calls_per_ingest`,
+`max_cost_per_ingest_usd`, `max_tokens_per_ingest` — and all three default to
+`None`. That is deliberate: an ingest's size is known in advance, and
+`RaptorIndexer.estimate_llm_calls` forecasts the whole build and refuses an
+over-budget one *before* the first call. Any arbitrary number here would only
+move the same silent truncation to a different corpus size.
+
+Set them when ingest is caller-triggered and you need a hard stop. Every stage
+now propagates `BudgetExceeded` rather than degrading per chunk, so a ceiling
+that is reached fails the run visibly instead of leaving most of the corpus
+indexed unenriched with `usage.calls` reporting zero.
+
 ## Ceilings are reserved, not merely checked
 
 `cost.max_llm_calls_per_query`, `max_cost_per_query_usd` and

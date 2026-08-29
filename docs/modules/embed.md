@@ -94,10 +94,10 @@ ingest pipeline and the retriever: two instances mean two loaded ONNX sessions.
 | Setting | Effect |
 |---|---|
 `embedding.provider` | `fastembed` (default), `openai`, `voyage`, `cohere`, `sentence_transformers` |
-`embedding.dense_model` · `dense_dimension` | dimension is auto-detected when unset |
+`embedding.dense_model` · `dense_dimension` | dimension is auto-detected when unset, and `postgres.vector_dimension` follows the resolved embedder rather than its own default. A chunks table that already exists at a different width is refused at `ensure_schema` time with both numbers named |
 `embedding.query_prefix` · `document_prefix` | required by asymmetric models |
 `embedding.sparse_model` · `use_splade` · `splade_model` | BM25-as-sparse by default |
-`embedding.late_interaction_model` · `enable_late_interaction` · `late_interaction_max_tokens` | ColBERT is ~100x the storage; `max_tokens` is what that is proportional to, and the collection is sized from the model, so changing the model needs a new collection |
+`embedding.late_interaction_model` · `enable_late_interaction` · `late_interaction_max_tokens` | any of `enable_late_interaction`, `retrieval.colbert_rerank` or `retrieval.reranker = "colbert"` builds the embedder (`Settings.late_interaction_needed`). ColBERT is ~100x the storage; `max_tokens` is what that is proportional to, and the collection is sized from the model, so changing the model needs a new collection |
 `embedding.reranker_model` | ONNX cross-encoder, no torch |
 `embedding.batch_size` · `max_length` · `threads` | tuned for ONNX on CPU; raise batch size on GPU |
 `embedding.normalize` | L2 so cosine reduces to a dot product |

@@ -672,6 +672,99 @@ Mutation verification: 19 mutations across four scripts, all caught, with two
 tests initially passing for the wrong reason — both source-grep assertions that a
 behavioural mutation walked past, the same weakness round thirteen found.
 
+## 11n. Closed: round fifteen — the derived units, and the ColBERT wiring
+
+Eight findings. Two of them are the same defect one frame apart, and the round's
+lesson is that the codebase's signature failure has a *second* form: not only "a
+mechanism nothing calls", but "a predicate each wiring spells out differently".
+Three of the eight were a condition that one construction site knew and another
+did not.
+
+**The query-side half of multi-representation indexing had no caller.** All three
+stages index a stand-in — parent-document a small child, summary-index an LLM
+summary, dense-X a rewritten proposition — and put the source in the docstore.
+All three ship a query-time step that resolves it back. `expand_parents` is the
+only writer of `metadata["parent_text"]`, and its callers were
+`ParentDocumentRetriever` (never constructed outside tests) and three `expand()`
+methods with no caller anywhere, tests included. So the generator answered from
+the 299-character child, or from a paraphrase, while citing the document:
+
+```
+hit 6d85bb93 len 299 parent_id 3f5c5291 parent_text? False
+expand_parents called: []
+```
+
+What hid it: `ContextPacker._expand` reads `parent_text or window_text`, and the
+window half *does* arrive — the sentence-window splitter writes it at index time.
+The branch ran on every query and simply never found a parent. The module
+docstring is titled *"Why `parent_text` is not written at index time"* and argues
+the design correctly; only step two was never wired. A well-argued docstring is
+the strongest camouflage this codebase produces.
+
+**And one frame up, the same key.** `_base_offset` prefers `parent_start_char`,
+whose only writer lives inside the dead function; `summary.py` and `dense_x.py`
+wrote `source_start_char`, which nothing read, while their own docstrings
+promised `parent_start_char`; RAPTOR sets `start_char = 0`. Every derived unit
+therefore fell through to `chunk.start_char`, and a citation for a summary
+reported `start=0 end=82` against the real document — a span pointing at the
+first 82 characters of a file, quoting a sentence no human wrote, under the
+document's own name. Now `None`, except for a *verbatim* proposition, whose
+offset dense-X restores on purpose so the span stays checkable.
+
+**pgvector followed a default that the documented path never updates.**
+`Settings.model_post_init` keeps the two vector widths "in lockstep" — its
+comment says so — but only `if self.embedding.dense_dimension:`, a field
+documented as auto-detected when unset. So changing `dense_model`, which its own
+docstring recommends by name twice, moved Qdrant to 768 and left Postgres
+declaring 384: `UPSERT FAILED: query vector dimension mismatch (got=768
+expected=384)`. The width now comes from the resolved embedder at every
+construction site, and `ensure_schema` refuses a table whose existing column
+disagrees — `CREATE TABLE IF NOT EXISTS` had made that failure arrive thousands
+of writes later, naming neither the model nor the setting.
+
+**A corpus ran inside a per-query ledger.** The HTTP ingest route used
+`_request_context`, so `max_llm_calls_per_query` (40) truncated the enrichment of
+a 60-document corpus and the response reported success. RAPTOR at least warned;
+the two multirep stages caught the same `BudgetExceeded` per chunk and returned
+the source as its own unit — 680 of 720 chunks silently unenriched with
+`usage.calls == 0` and nothing on the report. Ingest now has its own ceilings,
+defaulting to `None` because an ingest is bounded by the corpus and RAPTOR
+forecasts the whole build before spending anything.
+
+**ColBERT: three consumers, three wirings, three different subsets.** The
+reranker's class docstring names reuse as the property that distinguishes it from
+a cross-encoder, and `_order_chunks` is written around it — but `_search_vectors`
+derived its answer from MMR and the compressor alone and had no branch that could
+ever return the multivector, so the embed-the-gaps fallback was the only path
+that ever ran: 289 ms of ONNX per query to avoid 0.86 ms of arithmetic over data
+already stored. Alongside it, `build_reranker` gave the stage no embedder so it
+built a second one with `cache=None`, and `retrieval.colbert_rerank` alone built
+nothing because the builder and the server gated on `enable_late_interaction` —
+a condition the embedding factory had already outgrown.
+`Settings.late_interaction_needed` is now the single predicate and knows the
+third consumer (`reranker == "colbert"`) that was in nobody's.
+
+**A knob whose False branch the module argues against.**
+`indexing.raptor_collapse_tree` had one `log.info` field and one `describe()`
+entry as its only readers; both values retrieved `levels=[1, 0, 0, 0, 0, 0, 0, 0]`.
+Removed rather than implemented — the section above it spends a paragraph
+explaining that top-down traversal "sounds principled and it is worse".
+
+**Two tests were caught passing for the wrong reason, both by mutation.**
+`late_embedder=self.late_embedder` already appears three times in `RAGPipeline`
+(it is how the Qdrant store is built), so a source grep for it survived the
+argument being deleted from the reranker call; both are now identity assertions.
+And the new "every raptor setting has a behavioural reader" invariant passed with
+the removed knob restored, because the paragraph *explaining the removal* names
+it and a docstring is source text too — the round-thirteen failure exactly. It
+now walks the AST and is verified to fail on a report-only knob and pass on a
+real one.
+
+**A near miss worth recording.** Inserting a module-level helper directly above
+`class PostgresStore` silently moved `@register("store", "postgres")` onto the
+helper. mypy caught it; nothing else would have, because the registry accepts
+whatever it is handed.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::
@@ -857,6 +950,12 @@ Round fourteen:
   does not advertise it, so nothing promises otherwise.
 * RAG-Fusion is reachable only through `translators=`, not a settings flag. Its
   fusion behaviour is on by default via `retrieval.fusion`.
+
+`ParentDocumentRetriever` used to sit in this list by omission — registered,
+tested and constructed nowhere. Round fifteen established that it was not
+deliberate: three indexing stages depended on it. The distinction this section
+turns on is whether *something else in the library assumes the code runs*, and
+that is the question to ask before adding an entry here.
 
 
 ## 16. Delete, and what it deliberately does not do

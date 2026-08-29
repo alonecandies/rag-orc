@@ -158,7 +158,7 @@ defers HNSW construction so ingest is an append and each graph is built once.
 `indexing.semantic_breakpoint` · `semantic_threshold` · `semantic_buffer_size` | `gradient` finds boundaries in uniformly dense prose that `percentile` misses |
 `indexing.chunking_strategy` | `auto` → LATE → CONTEXTUAL → EARLY (ADR-0002) |
 `indexing.contextual_enabled` · `contextual_prefix_tokens` | one LLM call per chunk; opt-in |
-`indexing.parent_document_enabled` · `summary_index_enabled` · `dense_x_enabled` | multi-representation stages |
+`indexing.parent_document_enabled` · `summary_index_enabled` · `dense_x_enabled` | multi-representation stages. Any of them turns on the query-side half too (`retrieve.parent_leg`), which resolves the derived unit back to its source before the generator sees it — see `retrieval.parent_expansion` |
 `indexing.raptor_*` | UMAP → soft GMM → summarize → recurse; needs `ragorc[raptor]` |
 `indexing.batch_size` · `max_concurrent_documents` | the backpressure window |
 `indexing.skip_unchanged` | the checksum skip — the single biggest re-ingest saving |
