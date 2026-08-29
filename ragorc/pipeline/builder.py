@@ -368,6 +368,7 @@ class RAGPipeline:
         self._cache = cache
         self._vector = vector_store
         self._relational = relational_store
+        self._vector_leg: Any = None
         self._graph = graph_store
         self._generator = generator
         self._translator_names = tuple(translators) if translators else _DEFAULT_TRANSLATORS
@@ -651,6 +652,46 @@ class RAGPipeline:
         return self._hybrid
 
     @property
+    def vector_leg(self) -> Any:
+        """The vector retriever as the rest of the pipeline should see it.
+
+        :func:`~ragorc.retrieve.parent.parent_leg` is the identity function unless
+        an indexing representation is on, so this is ``hybrid_retriever`` in a
+        default deployment. When one *is* on, the collection holds children,
+        summaries or propositions, and this is where they are resolved back to the
+        text they stand for — before ranking, so the ranker still sees the precise
+        unit, and before packing, which is what performs the substitution.
+
+        Separate from ``hybrid_retriever`` so that property keeps describing what
+        it builds. Every consumer of the vector leg reads this one instead, which
+        is the property that makes adding a fifth consumer safe.
+        """
+        if self._vector_leg is None:
+            from ragorc.retrieve.parent import parent_leg
+
+            self._vector_leg = parent_leg(
+                self.hybrid_retriever, self._parent_store(), settings=self.settings
+            )
+        return self._vector_leg
+
+    def _parent_store(self) -> Any:
+        """Where parent bodies live, without forcing Postgres on a run that has none.
+
+        Built eagerly for the same reason ``use_fulltext`` builds one eagerly: an
+        index that wrote sources into the docstore *is* a deployment with Postgres
+        in it, so deferring the construction only defers the error. Returns
+        ``None`` when no representation is enabled, so the default path does not
+        touch Postgres at all.
+        """
+        if not self.settings.indexing.multirep_enabled:
+            return None
+        if self._relational is None:
+            from ragorc.stores.postgres.store import PostgresStore
+
+            self._relational = PostgresStore(self.settings, cache=self.cache)
+        return self._relational
+
+    @property
     def retriever(self) -> Any:
         """The route-driven fan-out every graph retrieves through.
 
@@ -662,7 +703,7 @@ class RAGPipeline:
             from ragorc.retrieve.multi_store import MultiStoreRetriever
 
             self._multi_store = MultiStoreRetriever(
-                vector=self.hybrid_retriever,
+                vector=self.vector_leg,
                 relational=self._lazy_relational(),
                 graph=self._lazy_graph(),
                 web=self.web_retriever,
@@ -875,7 +916,7 @@ class RAGPipeline:
             retriever=self.retriever,
             settings=self.settings,
             store_retrievers={
-                DataStore.VECTOR: self.hybrid_retriever,
+                DataStore.VECTOR: self.vector_leg,
                 DataStore.RELATIONAL: self._lazy_relational(),
                 DataStore.GRAPH: self._lazy_graph(),
                 DataStore.WEB: self.web_retriever,

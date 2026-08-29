@@ -359,6 +359,7 @@ class _LinearEngine:
         self.relational: Any = None
         self.graph: Any = None
         self.hybrid: Any = None
+        self.vector_leg: Any = None
         self.reranker: Any = None
         self.generator: Any = None
         self.ingest_pipeline: Any = None
@@ -376,6 +377,7 @@ class _LinearEngine:
         from ragorc.llm.cache import LLMCache
         from ragorc.llm.openrouter import OpenRouterLLM
         from ragorc.retrieve import HybridRetriever, build_reranker
+        from ragorc.retrieve.parent import parent_leg
         from ragorc.stores.postgres.store import PostgresStore
         from ragorc.stores.qdrant.store import QdrantStore
 
@@ -409,6 +411,13 @@ class _LinearEngine:
         self.relational = PostgresStore(s, cache=self.cache)
 
         self.hybrid = HybridRetriever(self.vector, postgres=self.relational, settings=s)
+        # The vector leg as every route should see it. `parent_leg` is the
+        # identity unless an indexing representation is on; when one is, the
+        # collection holds children/summaries/propositions and this resolves
+        # them back to the source text. Assigned to its own attribute rather
+        # than folded into `self.hybrid`, so the name keeps describing the
+        # object — and so the five routes below read one thing, not two.
+        self.vector_leg = parent_leg(self.hybrid, self.relational, settings=s)
         self.reranker = build_reranker(llm=self.llm, settings=s)
         # Only the cross-encoder stage has scores worth memoizing, and it is the
         # one that declares a ``cache``. Attaching it after construction rather
@@ -556,7 +565,7 @@ class _LinearEngine:
 
         s = self.settings
         if pipeline is PipelineName.CRAG:
-            return CorrectiveRAG(self.hybrid, self.llm, s)
+            return CorrectiveRAG(self.vector_leg, self.llm, s)
         if pipeline is PipelineName.GRAPHRAG:
             graph = self.graph_store()
             # Local and global are not alternatives: local answers "what about
@@ -567,24 +576,24 @@ class _LinearEngine:
                 {
                     "graph_local": GraphLocalRetriever(graph, self.vector, settings=s),
                     "graph_global": GraphGlobalRetriever(self.llm, graph, settings=s),
-                    "vector": self.hybrid,
+                    "vector": self.vector_leg,
                 },
                 settings=s,
             )
         if pipeline is PipelineName.MULTIHOP:
             return MultiHopRetriever(
-                self.llm, self.hybrid, self.graph_store(), self.vector, settings=s
+                self.llm, self.vector_leg, self.graph_store(), self.vector, settings=s
             )
         if pipeline is PipelineName.ADAPTIVE:
             graph = self.graph_store() if s.graph.enabled else None
             return MultiStoreRetriever(
-                vector=self.hybrid,
+                vector=self.vector_leg,
                 relational=PgFullTextRetriever(self.relational, settings=s),
                 graph=GraphLocalRetriever(graph, self.vector, settings=s) if graph else None,
                 web=make_web_retriever(s) if s.retrieval.crag_web_fallback else None,
                 settings=s,
             )
-        return self.hybrid
+        return self.vector_leg
 
     def _router(self) -> Any:
         if self.router is None:

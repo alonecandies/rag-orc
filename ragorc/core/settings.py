@@ -570,6 +570,22 @@ class IndexingSettings(BaseModel):
     statements and index those. Best precision of the multi-rep options, and
     the most expensive (one LLM call per chunk)."""
 
+    @property
+    def multirep_enabled(self) -> bool:
+        """Whether the index holds *derived* units rather than source text.
+
+        Defined once and read from both sides, which is the point. All three
+        representations index something that stands in for a chunk — a child, a
+        summary, a proposition — and every one of them needs the query side to
+        resolve the stand-in back to the source before the generator sees it. The
+        index side had this predicate inline and the query side did not have it at
+        all, so switching a representation on produced an index whose retriever
+        did not know the representation existed.
+        """
+        return (
+            self.parent_document_enabled or self.summary_index_enabled or self.dense_x_enabled
+        )
+
     # --- RAPTOR ----------------------------------------------------------
     raptor_enabled: bool = False
     raptor_max_levels: int = 3

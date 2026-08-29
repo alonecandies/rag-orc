@@ -1237,11 +1237,7 @@ class IngestPipeline:
 
     def _stage_enabled(self, label: str) -> bool:
         if label == "multirep":
-            return (
-                self.config.parent_document_enabled
-                or self.config.summary_index_enabled
-                or self.config.dense_x_enabled
-            )
+            return self.config.multirep_enabled
         if label == "raptor":
             return self.config.raptor_enabled
         return False

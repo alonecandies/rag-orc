@@ -492,6 +492,25 @@ class FakeDocumentStore:
             self.chunks[chunk.id] = chunk
         return len(chunks)
 
+    async def get_chunks(self, ids: Sequence[str], *, tenant_id: str | None = None) -> list[Any]:
+        """The batched read parent expansion resolves derived units through.
+
+        Missing from this double for as long as the query-side half of
+        multi-representation indexing had no caller, which is not a coincidence:
+        ``expand_parents`` degrades silently when the store cannot answer, so a
+        fake without this method makes a working expansion and a dead one look
+        identical. Tenant-scoped like the real store for the same reason
+        :meth:`delete_document` is.
+        """
+        self.calls.append("get_chunks")
+        wanted = set(ids)
+        return [
+            chunk
+            for chunk_id, chunk in self.chunks.items()
+            if chunk_id in wanted
+            and (tenant_id is None or getattr(chunk, "tenant_id", None) == tenant_id)
+        ]
+
     async def delete_document(self, document_id: str, *, tenant_id: str | None = None) -> int:
         """Delete the row and cascade to its chunks, as the FK declares.
 
