@@ -558,3 +558,30 @@ def test_every_raptor_setting_has_a_behavioural_reader() -> None:
 
     inert = sorted(fields - behavioural)
     assert not inert, f"only ever reported, never read: {inert}"
+
+
+def test_the_unit_suite_does_not_read_the_developers_env() -> None:
+    """`ragorc/core/settings.py` sets `env_file=".env"`, resolved against the
+    *current working directory* — so running pytest from the repo root layered a
+    local deployment's configuration under every test that did not override the
+    field.
+
+    Measured on a clean worktree: 0 failures with `.env` present, 11 without.
+    `RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION` turned the library's fail-closed
+    default off, so eleven tests queried with no tenant and passed — testing a
+    configuration the library does not ship, on a public repository where
+    `git clone && pytest` is the first thing a contributor runs.
+    """
+    import os
+
+    from ragorc.core.settings import Settings
+
+    assert Settings.model_config.get("env_file") is None, (
+        "the suite reads .env again; a clean clone and a developer's machine will disagree"
+    )
+    assert not [k for k in os.environ if k.startswith("RAGORC_")], (
+        "an ambient RAGORC_* variable survived into the test process"
+    )
+    # The property that actually matters, asserted on a real object: the
+    # library's fail-closed default reaches a test that did not ask for it.
+    assert Settings(llm={"api_key": "k"}).security.enforce_tenant_isolation is True

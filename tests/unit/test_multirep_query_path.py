@@ -39,6 +39,8 @@ def _settings(**over: Any) -> Settings:
         "llm": {"api_key": "k"},
         "cache": {"enabled": False},
         "embedding": {"dense_dimension": 32},
+        # Not a tenancy test. See tests/conftest.py on the neutralized .env.
+        "security": {"enforce_tenant_isolation": False},
     }
     base.update(over)
     return Settings(**base)

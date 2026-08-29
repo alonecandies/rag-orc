@@ -760,6 +760,22 @@ it and a docstring is source text too — the round-thirteen failure exactly. It
 now walks the AST and is verified to fail on a report-only knob and pass on a
 real one.
 
+**The unit suite read the developer's `.env`.** Found by the per-commit
+verification worktree, not by an audit lens: a bare checkout failed seven tests
+that pass in the working copy. `Settings.model_config` sets `env_file=".env"`,
+resolved against the *current working directory*, so pytest from the repo root
+layered a local deployment under every test that did not override the field.
+Measured: 0 failures with `.env`, 11 without.
+
+They were not random failures. `RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION`
+turned the library's fail-closed default off, so eleven tests queried with no
+tenant and passed — testing a configuration the library does not ship, on a
+public repository where `git clone && pytest` is the first thing a contributor
+runs. §11b's promise that the suite needs "no network, no containers, no API keys
+and no model downloads" was true and incomplete: it also needed an untracked file.
+`tests/conftest.py` now clears `RAGORC_*` and nulls `env_file` before anything
+reads either, and the eleven tests say what they need.
+
 **A near miss worth recording.** Inserting a module-level helper directly above
 `class PostgresStore` silently moved `@register("store", "postgres")` onto the
 helper. mypy caught it; nothing else would have, because the registry accepts

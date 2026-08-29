@@ -30,7 +30,14 @@ from ragorc.validate.output import AnswerValidator
 def _settings(*, pii: bool = True) -> Settings:
     return Settings(
         llm={"api_key": "k"},
-        security={"enable_pii_redaction": pii, "pii_action": "redact"},
+        security={
+            "enable_pii_redaction": pii,
+            "pii_action": "redact",
+            # Not a tenancy test; these queries carry no tenant and the
+            # library fails closed by default. Inherited from the developer's
+            # .env until conftest stopped reading it.
+            "enforce_tenant_isolation": False,
+        },
         generation={"cite_sources": False},
     )
 
@@ -254,7 +261,12 @@ async def test_a_streamed_answer_is_audited_as_answered() -> None:
             result.chunks = _chunks()
             return result
 
-    settings = Settings(llm={"api_key": "k"}, cache={"enabled": False})
+    settings = Settings(
+        llm={"api_key": "k"},
+        cache={"enabled": False},
+        # Not a tenancy test; see tests/conftest.py on the neutralized .env.
+        security={"enforce_tenant_isolation": False},
+    )
     llm = Streaming()
     pipeline = RAGPipeline(
         settings=settings, llm=llm, retriever=Corpus(), generator=AnswerGenerator(llm, settings)
@@ -296,7 +308,12 @@ async def test_a_stream_abandoned_midway_is_still_audited() -> None:
             result.chunks = _chunks()
             return result
 
-    settings = Settings(llm={"api_key": "k"}, cache={"enabled": False})
+    settings = Settings(
+        llm={"api_key": "k"},
+        cache={"enabled": False},
+        # Not a tenancy test; see tests/conftest.py on the neutralized .env.
+        security={"enforce_tenant_isolation": False},
+    )
     llm = Endless()
     pipeline = RAGPipeline(
         settings=settings, llm=llm, retriever=Corpus(), generator=AnswerGenerator(llm, settings)

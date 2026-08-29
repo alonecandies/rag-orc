@@ -56,6 +56,10 @@ def _settings() -> Settings:
         llm={"api_key": "k"},
         embedding={"dense_dimension": 32},
         cache={"enabled": True, "semantic_enabled": True},
+        # Not a tenancy test. The library fails closed by default, and these
+        # queries carry no tenant; the suite used to inherit "off" from the
+        # developer's .env, which is now neutralized in conftest.
+        security={"enforce_tenant_isolation": False},
     )
 
 
