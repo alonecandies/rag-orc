@@ -305,12 +305,17 @@ class TextToCypherConstructor:
 def _render_row(row: dict[str, Any]) -> str:
     parts: list[str] = []
     for key, value in row.items():
-        rendered = _render_value(value)
+        adapted = _adapt(value)
+        rendered = _render_value(adapted)
         if not rendered:
             continue
         # A verbalized path is already a sentence; prefixing it with the return
         # alias ("p: A -[X]-> B") only adds noise.
-        parts.append(rendered if _is_path_like(value) else f"{key}: {rendered}")
+        #
+        # Asked of the *adapted* value. Probing the raw one left the prefix on
+        # every serialized path — the same attribute-versus-key mismatch that made
+        # the renderers unreachable, surviving one frame up after they were fixed.
+        parts.append(rendered if _is_path_like(adapted) else f"{key}: {rendered}")
     return " | ".join(parts)
 
 

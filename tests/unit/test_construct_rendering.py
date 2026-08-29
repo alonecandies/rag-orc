@@ -182,3 +182,27 @@ def test_a_half_formed_path_does_not_raise(missing: str) -> None:
     data = _serialized_path()
     data.pop(missing)
     _render_value(data)  # must not raise
+
+
+def test_a_verbalized_path_is_not_prefixed_with_its_return_alias() -> None:
+    """The same attribute-versus-key mismatch, one frame up.
+
+    `_render_row` decides whether to prefix a value with its RETURN alias by
+    asking `_is_path_like` — and it asked the *raw* value, so after the renderers
+    were adapted a path came out correct and still wearing `p: `. The comment
+    beside that line says the prefix "only adds noise" on a path, which is
+    precisely what it kept adding.
+    """
+    from ragorc.construct.text_to_cypher import _render_row
+
+    assert _render_row({"p": _serialized_path()}) == (
+        "Northwind -[SUPPLIES]-> Contoso -[OWNED_BY]-> Fabrikam"
+    )
+
+
+def test_a_scalar_projection_keeps_its_aliases() -> None:
+    """`RETURN n.name AS name, count(*) AS n` is not a sentence, and the aliases
+    are what make the row readable."""
+    from ragorc.construct.text_to_cypher import _render_row
+
+    assert _render_row({"name": "Northwind", "n": 3}) == "name: Northwind | n: 3"
