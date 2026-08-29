@@ -244,7 +244,7 @@ def build_late_interaction_embedder(
     """
     resolved = _resolved(settings)
     config = resolved.embedding
-    if not (config.enable_late_interaction or resolved.retrieval.colbert_rerank or required):
+    if not (resolved.late_interaction_needed or required):
         return None
     provider = _provider(resolved)
     if "late" not in PROVIDERS[provider]:

@@ -794,6 +794,11 @@ class GenerationSettings(BaseModel):
     reserved_output_tokens: int = 1200
 
 
+_COLBERT_RERANKER_NAMES: frozenset[str] = frozenset({"colbert", "late_interaction", "maxsim"})
+"""The user-facing spellings ``build_reranker`` resolves to :class:`ColBERTReranker`.
+Shared so a name added there cannot become a name this predicate does not know."""
+
+
 class CostSettings(BaseModel):
     track_costs: bool = True
     max_cost_per_query_usd: float | None = 0.50
@@ -922,6 +927,31 @@ class Settings(BaseSettings):
     @classmethod
     def _prod_hardening(cls, v: str) -> str:
         return v
+
+    @property
+    def late_interaction_needed(self) -> bool:
+        """Whether anything in this deployment will ask for ColBERT vectors.
+
+        Three consumers, and each wiring knew about a different subset. The
+        factory already read two of them (``enable_late_interaction`` or
+        ``colbert_rerank``); the pipeline builder and the server read only the
+        first, so turning on ``retrieval.colbert_rerank`` alone built no embedder,
+        left ``QdrantStore._has_colbert`` false and silently dropped the stage:
+
+            enable_late_interaction = False | colbert_rerank = True
+            builder.late_embedder -> None
+            store._has_colbert -> False
+            search() want_colbert -> False
+
+        The third consumer — ``retrieval.reranker == "colbert"`` — was in nobody's
+        condition, so selecting the ColBERT reranker by name built a second,
+        uncached embedder inside the reranker itself.
+        """
+        return (
+            self.embedding.enable_late_interaction
+            or self.retrieval.colbert_rerank
+            or self.retrieval.reranker in _COLBERT_RERANKER_NAMES
+        )
 
     def model_post_init(self, __context: Any) -> None:
         # Keep the two vector dimensions in lockstep. A mismatch between

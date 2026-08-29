@@ -80,7 +80,7 @@ from ragorc.core.models import (
 )
 from ragorc.core.protocols import DenseEmbedder, LateInteractionEmbedder, SparseEmbedder
 from ragorc.core.registry import register
-from ragorc.core.settings import Settings, get_settings
+from ragorc.core.settings import _COLBERT_RERANKER_NAMES, Settings, get_settings
 from ragorc.core.telemetry import timed
 from ragorc.security.tenancy import require_tenant
 from ragorc.stores.qdrant.client import build_client, release_client
@@ -951,8 +951,22 @@ class QdrantStore:
         # rather than tested with `in rs.compressor`, which would also match a
         # future name that merely contains the substring.
         embedding_filtered = rs.compressor in {"embedding_filter", "both"}
-        wanted = rs.mmr_enabled or (rs.compression_enabled and embedding_filtered)
-        return [DENSE_VECTOR] if wanted else False
+        names: list[str] = []
+        if rs.mmr_enabled or (rs.compression_enabled and embedding_filtered):
+            names.append(DENSE_VECTOR)
+        if rs.rerank_enabled and rs.reranker in _COLBERT_RERANKER_NAMES and self._has_colbert:
+            # The third consumer, and the one this function did not know about.
+            # ColBERTReranker._order_chunks is written around `c.chunk.multi` with
+            # an embed-the-gaps fallback, and its class docstring calls reuse the
+            # property that distinguishes it from a cross-encoder — "a chunk that
+            # came back from Qdrant with its multivector attached is scored for
+            # *free*". Because this never asked for the vector, the fallback was
+            # the only path that ever ran: 289 ms of ONNX per query at the default
+            # rerank width, to avoid 0.86 ms of arithmetic over data already
+            # stored. Matrices are heavy on the wire, so this is still asked for
+            # by name and only when the stage that reads them is selected.
+            names.append(COLBERT_VECTOR)
+        return names or False
 
     def _attach_vectors(self, chunk: Chunk, raw: Any) -> None:
         if not isinstance(raw, dict):

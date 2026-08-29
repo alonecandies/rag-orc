@@ -549,7 +549,7 @@ class RAGPipeline:
 
     @property
     def late_embedder(self) -> LateInteractionEmbedder | None:
-        if self._late is None and self.settings.embedding.enable_late_interaction:
+        if self._late is None and self.settings.late_interaction_needed:
             cls = self._provider_class("late_interaction_embedder", "fastembed")
             self._late = cls(cache=self._embeddings(), settings=self.settings)
         return self._late
@@ -622,7 +622,13 @@ class RAGPipeline:
     @property
     def reranker(self) -> Any:
         if self._reranker is None:
-            self._reranker = build_reranker(llm=self.llm, settings=self.settings)
+            # The ColBERT stage gets *this* embedder, which carries the shared
+            # embedding cache. Left to itself it constructs a second
+            # FastEmbedLateInteraction with `cache=None`, so every rerank-time
+            # embedding missed a cache the deployment had already paid for.
+            self._reranker = build_reranker(
+                llm=self.llm, settings=self.settings, late_embedder=self.late_embedder
+            )
             # Same post-attach the HTTP engine does. Without it
             # ``cache.cache_rerank`` was on by default and reached nothing on this
             # path: ``CrossEncoderReranker.cache_enabled`` requires a backend, the

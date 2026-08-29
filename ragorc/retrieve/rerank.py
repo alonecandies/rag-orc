@@ -63,7 +63,7 @@ from ragorc.core.ids import cache_key, content_hash
 from ragorc.core.models import FloatArray, IntArray, Query, ScoredChunk, Usage
 from ragorc.core.protocols import LLM, Cache, LateInteractionEmbedder, Reranker
 from ragorc.core.registry import available, register
-from ragorc.core.settings import Settings, get_settings
+from ragorc.core.settings import _COLBERT_RERANKER_NAMES, Settings, get_settings
 from ragorc.embed.base import cached_batch, l2_normalize, l2_normalize_list
 from ragorc.embed.fastembed_provider import FastEmbedLateInteraction, FastEmbedReranker
 
@@ -603,9 +603,14 @@ def build_reranker(
     *,
     llm: LLM | None = None,
     settings: Settings | None = None,
+    late_embedder: LateInteractionEmbedder | None = None,
     **kwargs: Any,
 ) -> BaseReranker:
     """Resolve ``settings.retrieval.reranker`` (or an explicit name) to a stage.
+
+    ``late_embedder`` is the deployment's ColBERT embedder, which carries the
+    shared embedding cache. Only the ColBERT stage receives it; passing it through
+    ``**kwargs`` would hand it to a cross-encoder that cannot use it.
 
     The aliases accepted here are the *user-facing* spellings from
     :class:`~ragorc.core.settings.RetrievalSettings`, which are not identical to
@@ -618,8 +623,10 @@ def build_reranker(
 
     if key in {"cross_encoder", "cross_encoder_stage", "crossencoder", "ce", "fastembed"}:
         return CrossEncoderReranker(settings=resolved, **kwargs)
-    if key in {"colbert", "late_interaction", "maxsim"}:
-        return ColBERTReranker(settings=resolved, **kwargs)
+    if key in _COLBERT_RERANKER_NAMES:
+        # Routed rather than passed through `**kwargs`: a cross-encoder has no
+        # use for a late-interaction embedder and would reject it.
+        return ColBERTReranker(late_embedder, settings=resolved, **kwargs)
     if key == "rankgpt":
         # Imported here rather than at module scope: the listwise reranker pulls
         # in the prompt library and the model router, and it subclasses

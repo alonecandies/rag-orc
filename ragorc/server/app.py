@@ -398,7 +398,7 @@ class _LinearEngine:
         )
         self.colbert = (
             _embedder("late_interaction_embedder", "fastembed", embedding_cache, s)
-            if s.embedding.enable_late_interaction
+            if s.late_interaction_needed
             else None
         )
 
@@ -424,7 +424,7 @@ class _LinearEngine:
         # than folded into `self.hybrid`, so the name keeps describing the
         # object — and so the five routes below read one thing, not two.
         self.vector_leg = parent_leg(self.hybrid, self.relational, settings=s)
-        self.reranker = build_reranker(llm=self.llm, settings=s)
+        self.reranker = build_reranker(llm=self.llm, settings=s, late_embedder=self.colbert)
         # Only the cross-encoder stage has scores worth memoizing, and it is the
         # one that declares a ``cache``. Attaching it after construction rather
         # than passing it through the factory avoids restating the factory's alias
