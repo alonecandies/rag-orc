@@ -209,6 +209,15 @@ class PropositionIndexer:
         verbatim = 0
         failures = 0
         for source, outcome in zip(chunks, outcomes, strict=True):
+            if isinstance(outcome, BudgetExceeded):
+                # A spent budget is a stop signal for the whole stage, not one
+                # chunk's bad luck: every remaining call would raise too. The
+                # re-raise in `_decompose` is undone here without this — `map_concurrent`
+                # returns the exception and the branch below reclassifies it as an
+                # unexpected per-chunk failure, which is exactly the outcome the
+                # re-raise exists to prevent. RaptorIndexer._summarize_level has
+                # had this line all along.
+                raise outcome
             if isinstance(outcome, BaseException):
                 failures += 1
                 log.warning(

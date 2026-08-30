@@ -417,6 +417,14 @@ class ContextPacker:
         seen_parents: set[str] = set()
         for scored in chunks:
             meta = scored.chunk.metadata
+            # *Which* expansion happened, not merely that one did. The citation
+            # layer needs the base offset of the text it substituted, and the two
+            # keys can both be present: a summary built from a sentence-window
+            # chunk inherits `window_*` from its source and gains `parent_*` from
+            # the expansion. Picking a key by fixed priority on the other side let
+            # the two halves disagree about which span the prompt actually held,
+            # and the citation was then off by a whole window.
+            expansion = "parent" if meta.get("parent_text") else "window"
             wider = meta.get("parent_text") or meta.get("window_text")
             if not wider or wider == scored.chunk.content:
                 out.append(scored)
@@ -431,7 +439,7 @@ class ContextPacker:
             # the wrapper shared the caller's `Chunk`, and assigning the wider body
             # to it rewrote the retrieved text under the caller — this substitution
             # is meant to change what the prompt shows, not what was retrieved.
-            out.append(_repacked(scored, wider, expanded=True))
+            out.append(_repacked(scored, wider, expanded=True, expansion=expansion))
         return out
 
     # -- rendering ---------------------------------------------------------

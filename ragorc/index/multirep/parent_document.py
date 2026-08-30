@@ -408,7 +408,9 @@ class ParentDocumentIndexer:
         return await expand_parents(chunks, store)
 
 
-async def expand_parents(chunks: Sequence[ScoredChunk], store: Any) -> list[ScoredChunk]:
+async def expand_parents(
+    chunks: Sequence[ScoredChunk], store: Any, *, tenant_id: str | None = None
+) -> list[ScoredChunk]:
     """Resolve every hit's parent body in ONE batched query.
 
     Deduplication happens before the fetch, not after: several children of one
@@ -426,6 +428,14 @@ async def expand_parents(chunks: Sequence[ScoredChunk], store: Any) -> list[Scor
     A parent that is missing from the docstore, or a docstore that is down, leaves
     its child untouched rather than dropping it. Losing breadth degrades the
     answer; losing the hit loses the evidence.
+
+    ``tenant_id`` is threaded from the query and is not optional in practice: the
+    docstore scopes its reads, so an unscoped fetch either raises under
+    ``enforce_tenant_isolation`` — the library default — or, with isolation off,
+    reads a parent without checking whose it is. The first turned the whole
+    expansion into a silent no-op on every multi-tenant deployment, since
+    :func:`_fetch_parents` degrades on any exception; the second is the hole the
+    scoping exists to close.
     """
     if not chunks:
         return []
@@ -436,7 +446,7 @@ async def expand_parents(chunks: Sequence[ScoredChunk], store: Any) -> list[Scor
         for scored in survivors
         if scored.chunk.parent_id and "parent_text" not in scored.chunk.metadata
     ]
-    parents = await _fetch_parents(store, list(dict.fromkeys(wanted)))
+    parents = await _fetch_parents(store, list(dict.fromkeys(wanted)), tenant_id=tenant_id)
 
     resolved = 0
     for rank, scored in enumerate(survivors):
@@ -491,7 +501,9 @@ def _dedupe_by_parent(chunks: Sequence[ScoredChunk]) -> list[ScoredChunk]:
     return out
 
 
-async def _fetch_parents(store: Any, ids: Sequence[str]) -> dict[str, Chunk]:
+async def _fetch_parents(
+    store: Any, ids: Sequence[str], *, tenant_id: str | None = None
+) -> dict[str, Chunk]:
     """One batched read, whichever docstore shape the caller passed.
 
     ``get_chunks`` is Postgres', ``get`` is the vector store's; both take a list
@@ -508,7 +520,7 @@ async def _fetch_parents(store: Any, ids: Sequence[str]) -> dict[str, Chunk]:
             store=type(store).__name__,
         )
     try:
-        rows = await getter(ids)
+        rows = await getter(ids, tenant_id=tenant_id)
     except Exception as exc:  # noqa: BLE001 - degrade to unexpanded children
         log.warning("parent_fetch_failed", error=str(exc), error_type=type(exc).__name__)
         return {}

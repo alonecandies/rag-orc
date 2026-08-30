@@ -86,7 +86,8 @@ class ParentDocumentRetriever:
             children = await self.inner.retrieve(query, top_k=wanted * self.overfetch, **kwargs)
             if not children:
                 return []
-            return self._finish(await self._expand(children), wanted, len(children))
+            expanded = await self._expand(children, self._tenant(query))
+            return self._finish(expanded, wanted, len(children))
 
     async def retrieve_detailed(
         self, query: Query, *, top_k: int | None = None, **kwargs: Any
@@ -116,7 +117,8 @@ class ParentDocumentRetriever:
             result = await inner_detailed(query, top_k=wanted * self.overfetch, **kwargs)
             children = list(result.chunks)
             if children:
-                result.chunks = self._finish(await self._expand(children), wanted, len(children))
+                expanded = await self._expand(children, self._tenant(query))
+                result.chunks = self._finish(expanded, wanted, len(children))
         return result
 
     def _wanted(self, top_k: int | None, query: Query) -> int:
@@ -136,7 +138,20 @@ class ParentDocumentRetriever:
         )
         return out
 
-    async def _expand(self, children: list[ScoredChunk]) -> list[ScoredChunk]:
+    def _tenant(self, query: Query) -> str | None:
+        """The scope the parent fetch runs under.
+
+        Same resolution the graph leg uses: the query's tenant, falling back to
+        the deployment's. The docstore scopes its reads, so omitting this does
+        not widen the fetch — it fails it, and `_fetch_parents` degrades on any
+        exception, so the whole expansion became a silent no-op wherever
+        `enforce_tenant_isolation` was on. Which is the default.
+        """
+        return query.tenant_id or self.settings.tenant_id
+
+    async def _expand(
+        self, children: list[ScoredChunk], tenant_id: str | None
+    ) -> list[ScoredChunk]:
         """Attach parent bodies, degrading to the children if that is impossible.
 
         A missing store or a failed lookup returns the children unchanged rather
@@ -151,7 +166,7 @@ class ParentDocumentRetriever:
         try:
             from ragorc.index.multirep.parent_document import expand_parents
 
-            return await expand_parents(children, self.store)
+            return await expand_parents(children, self.store, tenant_id=tenant_id)
         except Exception as exc:  # noqa: BLE001 - degrade, never fail the query
             log.warning(
                 "parent_expansion_failed",

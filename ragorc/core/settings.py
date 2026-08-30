@@ -806,7 +806,7 @@ class CostSettings(BaseModel):
 
     # --- ingest ----------------------------------------------------------
     max_llm_calls_per_ingest: int | None = None
-    max_cost_per_ingest_usd: float | None = None
+    max_cost_per_ingest_usd: float | None = 10.0
     max_tokens_per_ingest: int | None = None
     """Ceilings for an ingest, which are separate because an ingest is not a query.
 
@@ -817,16 +817,26 @@ class CostSettings(BaseModel):
         documents that got a RAPTOR summary: 40 of 60
         warnings: ['raptor stage disabled: LLM call budget exhausted']
 
-    ``None`` means "bounded by the corpus, not by a request ceiling", which is the
-    honest default: an ingest's size is known in advance, and
-    :meth:`~ragorc.index.raptor.RaptorIndexer.estimate_llm_calls` forecasts and
-    refuses an over-budget build *before* the first call rather than halfway
-    through. Picking an arbitrary larger number here would only move the same
-    silent truncation to a different corpus size.
+    **The cost ceiling is the one with a number**, because spend is the quantity
+    that does not scale with the corpus: $10 is twenty times the per-query ceiling
+    and still an unmistakable runaway. Call and token counts *do* scale with the
+    corpus and have no defensible default — an arbitrary one only moves the same
+    silent truncation to a different corpus size — so they are ``None`` and yours
+    to set.
 
-    Set them when an ingest is caller-triggered and you need a hard stop. Every
-    stage now propagates :class:`~ragorc.core.errors.BudgetExceeded` instead of
-    degrading per chunk, so a ceiling that is reached fails the run visibly."""
+    What makes leaving those open safe is that exhaustion is now *loud*. Every
+    stage propagates :class:`~ragorc.core.errors.BudgetExceeded`: the two
+    multi-representation indexers re-raise it out of their ``build()`` gather
+    rather than letting ``return_exceptions=True`` reclassify it as one chunk's
+    bad luck, and ``IngestPipeline._enrich`` lets it through instead of appending
+    "stage disabled" to a report field most callers never read.
+
+    Note what does *not* bound this. ``RaptorIndexer._check_budget`` returns early
+    when ``ledger.max_calls is None``, so its pre-flight forecast refuses nothing
+    unless you set ``max_llm_calls_per_ingest``; an earlier version of this
+    docstring cited that forecast as the compensating control for an unbounded
+    default, and it is not one. With ``track_costs=False`` the cost ceiling is
+    lifted as well. Set a call ceiling when an ingest is caller-triggered."""
     price_table_path: str = ""
     refresh_prices: bool = True
     """Pull live per-model prices from OpenRouter's ``/models`` endpoint so

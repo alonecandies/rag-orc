@@ -534,13 +534,19 @@ def test_every_raptor_setting_has_a_behavioural_reader() -> None:
             self.reporting -= is_log
 
         def visit_Dict(self, node: ast.Dict) -> None:
-            # `describe()` renders configuration into a dict of literals. A value
+            # `describe()`/`stats()` render configuration into a dict. A value
             # position there is a report; a key or a nested call is not.
+            #
+            # Attributes nested in a *list* count too: `stats()` renders four of
+            # its knobs as `"umap": [self.config.a, self.config.b]`, and a version
+            # that only recognized a bare `ast.Attribute` credited all four as
+            # behavioural readers — so stripping every real use of them left the
+            # invariant reporting nothing inert. Found by mutation.
             for key in node.keys:
                 if key is not None:
                     self.visit(key)
             for value in node.values:
-                plain = isinstance(value, ast.Attribute)
+                plain = isinstance(value, ast.Attribute | ast.List | ast.Tuple | ast.Set)
                 self.reporting += plain
                 self.visit(value)
                 self.reporting -= plain

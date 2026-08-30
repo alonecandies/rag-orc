@@ -35,12 +35,16 @@ def _required(value: str, name: str) -> str:
     return value
 
 
+from tests.integration.conftest import deployment_env_file  # noqa: E402
+
+
 @pytest.fixture
 def settings() -> Settings:
     """A settings object pointed at the compose stack, with an isolated namespace
     per run so concurrent runs and reruns cannot collide.
 
-    Connection details come from ``Settings()`` — the same ``.env`` the CLI and the
+    Connection details come from the deployment's own configuration — the same
+    ``.env`` the CLI and the
     service read — rather than from literals here. They used to be hardcoded
     defaults, which meant these tests ignored the port in ``.env`` and connected to
     whatever answered on 5432. On a machine already running an unrelated Postgres
@@ -50,7 +54,7 @@ def settings() -> Settings:
     Only the fields that make a run *isolated* are overridden below.
     """
     suffix = uuid.uuid4().hex[:8]
-    env = Settings()
+    env = Settings(_env_file=deployment_env_file())
     return Settings(
         security={"enforce_tenant_isolation": False},
         cache={"enabled": False},

@@ -950,6 +950,11 @@ class RaptorIndexer:
         on the pessimistic figure would reject trees that comfortably fit. The
         ledger still enforces the real ceiling call by call inside the LLM client,
         so this is an early exit, not the only guard.
+
+        And it is an early exit that does nothing when the ledger has no call
+        ceiling: ``max_calls is None`` returns before the forecast is compared.
+        Worth stating because ``cost.max_llm_calls_per_ingest`` defaults to
+        ``None`` — this forecast is not what bounds an ingest.
         """
         ledger = current_ledger()
         if ledger is None:
@@ -964,7 +969,11 @@ class RaptorIndexer:
                 required=forecast.total,
                 remaining=remaining,
                 limit=ledger.max_calls,
-                hint="lower indexing.raptor_max_levels or raise cost.max_llm_calls_per_query",
+                hint=(
+                    "lower indexing.raptor_max_levels, or raise "
+                    "cost.max_llm_calls_per_query (query path) / "
+                    "cost.max_llm_calls_per_ingest (ingest path)"
+                ),
             )
 
     def stats(self) -> dict[str, Any]:

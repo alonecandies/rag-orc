@@ -135,7 +135,7 @@ from ragorc.core.protocols import (
 )
 from ragorc.core.registry import resolve
 from ragorc.core.settings import IndexingSettings, Settings, get_settings
-from ragorc.core.telemetry import current_ledger, timed
+from ragorc.core.telemetry import timed
 from ragorc.embed.factory import build_late_chunking_embedder
 from ragorc.embed.late_chunking import LateChunkingEmbedder, resolve_strategy
 from ragorc.index.loaders import DirectoryLoader
@@ -1661,6 +1661,11 @@ class IngestPipeline:
         A stage that fails is disabled for the remainder of the run. The leaf
         chunks are already vectorized and writable at this point, and losing an
         enrichment is recoverable where losing the leaves is not.
+
+        :class:`~ragorc.core.errors.BudgetExceeded` is the exception: it is not a
+        stage failing, it is the operator's ceiling being reached, and every
+        remaining call would hit it too. Degrading it to a warning produces a
+        corpus that is half enriched and a report that says success.
         """
         if not self._stages:
             return
@@ -1678,6 +1683,15 @@ class IngestPipeline:
                     # after this document's row exists (see `_DeferredDocstore`).
                     relational_store=docstore if docstore is not None else self.relational,
                 )
+            except BudgetExceeded:
+                # Not a stage failure. A ceiling the operator set is a decision
+                # about how much this ingest may cost, and turning it into
+                # `report.warnings.append("<stage> disabled: ...")` is precisely
+                # the silent half-enriched corpus this round removed one layer
+                # down — restored here, on a field most callers never read. It
+                # propagates so the run ends visibly, with whatever was already
+                # written still written.
+                raise
             except Exception as exc:
                 log.warning(
                     "index_stage_failed",
@@ -1698,13 +1712,26 @@ class IngestPipeline:
         self._stages = survivors
 
     def _charge(self, report: IngestReport, usage: Usage, stage: str) -> None:
-        """Aggregate a stage's bill into the report and the ambient ledger."""
+        """Aggregate a stage's bill into the report.
+
+        Deliberately *not* into the ambient ledger. ``OpenRouterLLM._record``
+        already recorded every one of these calls as it made them, so adding the
+        stage's aggregate again counted each call twice::
+
+            real LLM calls issued : 6
+            ledger.total.calls    : 12
+            ledger.by_stage       : {'summary_index': 6, 'ingest.multirep': 6}
+
+        That was cosmetic while an ingest inherited the per-query ledger and its
+        ceiling was wrong anyway. Now that ``cost.max_*_per_ingest`` is
+        load-bearing it is a factor-of-two error in the ceiling an operator sets
+        and in the cost reported back. Nothing is lost by dropping it: the
+        per-stage attribution the second record provided is already present under
+        the stage name the client used.
+        """
         if usage.calls == 0 and usage.cost_usd == 0.0:
             return
         report.usage = report.usage + usage
-        ledger = current_ledger()
-        if ledger is not None:
-            ledger.record(usage, stage=f"ingest.{stage}")
 
     # ------------------------------------------------------------------
     # g. writes

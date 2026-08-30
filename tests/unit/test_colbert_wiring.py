@@ -167,16 +167,36 @@ def test_the_server_hands_its_own_embedder_to_the_reranker() -> None:
 def test_the_server_builds_a_late_embedder_for_every_consumer() -> None:
     """The server's own gate, which read `enable_late_interaction` alone — so a
     `colbert_rerank` deployment reached `build_reranker` with `self.colbert=None`
-    and got the uncached fallback anyway."""
+    and got the uncached fallback anyway.
+
+    Checked by orientation, not by presence. Swapping the ternary's branches keeps
+    both strings a grep would look for and produces `self.colbert = None` for every
+    deployment that needs ColBERT and an ONNX session for every one that does not —
+    strictly worse than the bug this fixed. Found by mutation.
+    """
+    import ast
     import inspect
+    import textwrap
 
     from ragorc.server.app import _LinearEngine
 
-    source = inspect.getsource(_LinearEngine.build)
-    assert "if s.late_interaction_needed" in source, (
-        "the server gates its ColBERT embedder on one consumer again"
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_LinearEngine.build)))
+    assigned = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "colbert" for t in node.targets
+        )
+    ]
+    assert len(assigned) == 1, f"expected one `self.colbert = ...`, found {len(assigned)}"
+    ternary = assigned[0]
+    assert isinstance(ternary, ast.IfExp), ast.unparse(ternary)
+    assert ast.unparse(ternary.test) == "s.late_interaction_needed", ast.unparse(ternary.test)
+    assert "_embedder(" in ast.unparse(ternary.body), (
+        f"the needed branch does not build one: {ast.unparse(ternary.body)}"
     )
-    assert "if s.embedding.enable_late_interaction" not in source
+    assert ast.unparse(ternary.orelse) == "None", ast.unparse(ternary.orelse)
 
 
 @pytest.mark.parametrize(
@@ -222,7 +242,7 @@ def _store(**over: Any) -> Any:
 def test_the_colbert_stage_gets_its_multivectors() -> None:
     from ragorc.stores.qdrant.collections import COLBERT_VECTOR
 
-    wanted = _store(retrieval={"reranker": "colbert"})._search_vectors()
+    wanted = _store(retrieval={"reranker": "colbert"})._search_vectors(colbert_ready=True)
     assert wanted is not False and COLBERT_VECTOR in wanted, (
         f"the reuse branch can never run: {wanted}"
     )
@@ -231,22 +251,16 @@ def test_the_colbert_stage_gets_its_multivectors() -> None:
 def test_a_cross_encoder_deployment_pays_nothing() -> None:
     """Matrices are heavy on the wire — ~96 KB a chunk at the default token cap —
     so they must be asked for only when the stage that reads them is selected."""
-    assert _store()._search_vectors() is False
+    assert _store()._search_vectors(colbert_ready=True) is False
 
 
 def test_reranking_switched_off_pays_nothing() -> None:
     assert (
-        _store(retrieval={"reranker": "colbert", "rerank_enabled": False})._search_vectors()
+        _store(retrieval={"reranker": "colbert", "rerank_enabled": False})._search_vectors(
+            colbert_ready=True
+        )
         is False
     )
-
-
-def test_a_collection_without_multivectors_is_not_asked_for_them() -> None:
-    from ragorc.stores.qdrant.store import QdrantStore
-
-    store = QdrantStore(_settings(retrieval={"reranker": "colbert"}), late_embedder=None)
-    assert store._has_colbert is False
-    assert store._search_vectors() is False
 
 
 def test_dense_and_colbert_coexist() -> None:
@@ -254,14 +268,113 @@ def test_dense_and_colbert_coexist() -> None:
     Returning one name instead of a list would silently disable the other."""
     from ragorc.stores.qdrant.collections import COLBERT_VECTOR, DENSE_VECTOR
 
-    wanted = _store(retrieval={"reranker": "colbert", "mmr_enabled": True})._search_vectors()
+    wanted = _store(retrieval={"reranker": "colbert", "mmr_enabled": True})._search_vectors(
+        colbert_ready=True
+    )
     assert set(wanted) == {DENSE_VECTOR, COLBERT_VECTOR}
 
 
 def test_mmr_alone_still_asks_only_for_dense() -> None:
     from ragorc.stores.qdrant.collections import DENSE_VECTOR
 
-    assert _store(retrieval={"mmr_enabled": True})._search_vectors() == [DENSE_VECTOR]
+    assert _store(retrieval={"mmr_enabled": True})._search_vectors(colbert_ready=True) == [
+        DENSE_VECTOR
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Configuration says what we want; the collection says what is there
+# ---------------------------------------------------------------------------
+class _Collection:
+    """A live collection whose named vectors are fixed at creation."""
+
+    def __init__(self, *names: str) -> None:
+        self.names = names
+
+    async def get_collection(self, name: str) -> Any:
+        vectors = {n: object() for n in self.names if n != "sparse"}
+        sparse = {n: object() for n in self.names if n == "sparse"}
+        params = type("P", (), {"vectors": vectors, "sparse_vectors": sparse})()
+        config = type("C", (), {"params": params})()
+        return type("I", (), {"config": config})()
+
+
+def _store_over(collection: Any, **over: Any) -> Any:
+    store = _store(**over)
+    store._client = collection
+    return store
+
+
+async def test_a_legacy_collection_does_not_get_a_vector_it_lacks() -> None:
+    """The regression the widened predicate introduced, and the reason
+    `_has_colbert` is not the right question.
+
+    A Qdrant collection's named vectors are fixed at creation and
+    `ensure_collection` is create-if-not-exists, so switching on
+    `retrieval.colbert_rerank` against an existing dense-only collection made
+    every query name a vector that is not there. Reproduced against live Qdrant
+    1.19: `Not existing vector name error: colbert`, on *every* search — a
+    silently-dropped stage turned into a total outage.
+    """
+    from ragorc.stores.qdrant.collections import DENSE_VECTOR
+
+    store = _store_over(_Collection(DENSE_VECTOR), retrieval={"reranker": "colbert"})
+
+    assert store._has_colbert is True, "the deployment is configured for ColBERT"
+    assert await store._colbert_ready() is False, "but the collection does not have the vector"
+    assert store._search_vectors(colbert_ready=False) is False
+
+
+async def test_a_collection_that_has_the_vector_is_used() -> None:
+    from ragorc.stores.qdrant.collections import COLBERT_VECTOR, DENSE_VECTOR
+
+    store = _store_over(
+        _Collection(DENSE_VECTOR, COLBERT_VECTOR), retrieval={"reranker": "colbert"}
+    )
+    assert await store._colbert_ready() is True
+
+
+async def test_an_unreachable_collection_does_not_disable_the_stage() -> None:
+    """Unknown is not the same as absent. A probe that failed must not silently
+    switch off a feature the operator configured — that is the failure this
+    round exists to stop, pointed the other way."""
+
+    class _Down:
+        async def get_collection(self, name: str) -> Any:
+            raise RuntimeError("qdrant is unreachable")
+
+    store = _store_over(_Down(), retrieval={"reranker": "colbert"})
+    assert await store._colbert_ready() is True
+
+
+async def test_the_probe_happens_once() -> None:
+    """A startup-shaped question, not a per-query one."""
+    from ragorc.stores.qdrant.collections import COLBERT_VECTOR, DENSE_VECTOR
+
+    calls = {"n": 0}
+
+    class _Counting(_Collection):
+        async def get_collection(self, name: str) -> Any:
+            calls["n"] += 1
+            return await super().get_collection(name)
+
+    store = _store_over(
+        _Counting(DENSE_VECTOR, COLBERT_VECTOR), retrieval={"reranker": "colbert"}
+    )
+    for _ in range(5):
+        await store._colbert_ready()
+    assert calls["n"] == 1
+
+
+async def test_a_configuration_the_collection_cannot_serve_is_reported_once() -> None:
+    """The remedy is to re-index into a new collection, which no amount of
+    retrying discovers — so the operator has to be told, and told once."""
+    from ragorc.stores.qdrant.collections import DENSE_VECTOR
+
+    store = _store_over(_Collection(DENSE_VECTOR), retrieval={"reranker": "colbert"})
+    assert store._colbert_warned is False
+    await store._colbert_ready()
+    assert store._colbert_warned is True
 
 
 # ---------------------------------------------------------------------------
@@ -286,4 +399,79 @@ async def test_an_attached_multivector_is_not_re_embedded() -> None:
 
     assert embedder.embedded == [[fresh.content]], (
         f"re-embedded a chunk that arrived with its matrix: {embedder.embedded}"
+    )
+
+
+class _StubClient:
+    """Enough of AsyncQdrantClient to see what a search actually requests."""
+
+    def __init__(self, *names: str) -> None:
+        self.names = names
+        self.requests: list[dict[str, Any]] = []
+
+    async def get_collection(self, name: str) -> Any:
+        vectors = {n: object() for n in self.names if n != "sparse"}
+        sparse = {n: object() for n in self.names if n == "sparse"}
+        params = type("P", (), {"vectors": vectors, "sparse_vectors": sparse})()
+        return type("I", (), {"config": type("C", (), {"params": params})()})()
+
+    async def query_points(self, **kw: Any) -> Any:
+        self.requests.append(kw)
+        return type("R", (), {"points": []})()
+
+
+async def test_a_search_never_names_a_vector_the_collection_lacks() -> None:
+    """End to end through `search()`, because that is where the outage was.
+
+    Reverting the readiness check to `self._has_colbert` — a configuration
+    question — left every other test in the suite green while restoring
+    `Not existing vector name error: colbert` on every query against a collection
+    built before ColBERT was switched on.
+    """
+    from ragorc.core.models import Query
+    from ragorc.stores.qdrant.collections import COLBERT_VECTOR, DENSE_VECTOR
+    from ragorc.stores.qdrant.store import QdrantStore
+    from tests.fakes import StubEmbedder
+
+    settings = _settings(
+        retrieval={"reranker": "colbert", "colbert_rerank": True, "use_sparse": False},
+        security={"enforce_tenant_isolation": False},
+    )
+    client = _StubClient(DENSE_VECTOR)
+    store = QdrantStore(settings, dense_embedder=StubEmbedder(32), late_embedder=_Embedder())
+    store._client = client
+
+    await store.search(Query(text="refunds?"), top_k=5)
+
+    assert client.requests, "no search was issued"
+    for request in client.requests:
+        assert request.get("using") != COLBERT_VECTOR, "queried a vector the collection lacks"
+        wanted = request.get("with_vectors")
+        if isinstance(wanted, list):
+            assert COLBERT_VECTOR not in wanted, f"asked for {wanted}"
+        prefetch = request.get("prefetch") or []
+        for branch in prefetch:
+            assert getattr(branch, "using", None) != COLBERT_VECTOR
+
+
+async def test_a_search_does_name_it_when_the_collection_has_it() -> None:
+    """The saving has to survive the fix: this is the whole point of the round."""
+    from ragorc.core.models import Query
+    from ragorc.stores.qdrant.collections import COLBERT_VECTOR, DENSE_VECTOR
+    from ragorc.stores.qdrant.store import QdrantStore
+    from tests.fakes import StubEmbedder
+
+    settings = _settings(
+        retrieval={"reranker": "colbert", "use_sparse": False},
+        security={"enforce_tenant_isolation": False},
+    )
+    client = _StubClient(DENSE_VECTOR, COLBERT_VECTOR)
+    store = QdrantStore(settings, dense_embedder=StubEmbedder(32), late_embedder=_Embedder())
+    store._client = client
+
+    await store.search(Query(text="refunds?"), top_k=5)
+
+    asked = [r.get("with_vectors") for r in client.requests]
+    assert any(isinstance(w, list) and COLBERT_VECTOR in w for w in asked), (
+        f"the stored multivectors were not requested: {asked}"
     )

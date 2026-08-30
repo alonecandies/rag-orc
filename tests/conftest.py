@@ -38,26 +38,6 @@ _FASTEMBED_CACHE = _CACHE_ROOT / "fastembed"
 _FASTEMBED_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("FASTEMBED_CACHE_PATH", str(_FASTEMBED_CACHE))
 
-#: The developer's own ``.env``, neutralized before anything reads it.
-#:
-#: ``Settings.model_config`` sets ``env_file=".env"``, resolved against the
-#: *current working directory* — so running pytest from the repo root silently
-#: layered a local deployment's configuration under every test that did not
-#: override the field. The suite's stated promise is that it runs "with no
-#: network, no containers, no API keys and no model downloads"; it also needed an
-#: untracked file. Measured on a clean worktree: 0 failures with ``.env`` present,
-#: 11 without, on a public repository where `git clone && pytest` is the first
-#: thing a contributor does.
-#:
-#: The failures were not random. ``RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION``
-#: turned the library's fail-closed default *off*, so eleven tests queried without
-#: a tenant and passed — testing a configuration the library does not ship.
-#:
-#: Both halves are needed: clearing the variables alone leaves the file, and
-#: clearing the file alone leaves an exported variable.
-for _key in [k for k in os.environ if k.startswith("RAGORC_")]:
-    del os.environ[_key]
-
 # Imported after the environment is set, not before: `tiktoken` reads
 # TIKTOKEN_CACHE_DIR at import time and `ragorc` pulls it in transitively.
 from ragorc.core.models import Chunk, Document, Query, ScoredChunk  # noqa: E402
@@ -72,10 +52,6 @@ from tests.fakes import (  # noqa: E402
     StubReranker,
     StubSparseEmbedder,
 )
-
-# The second half, after the import: point pydantic-settings at a file that
-# cannot exist rather than at the developer's.
-Settings.model_config["env_file"] = None
 
 _REAL_CONNECT = socket.socket.connect
 _REAL_CONNECT_EX = socket.socket.connect_ex

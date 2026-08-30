@@ -136,6 +136,120 @@ def test_the_indexers_write_the_key_their_docstrings_name(module: str) -> None:
     assert 'metadata["parent_start_char"]' in source
 
 
+@pytest.mark.parametrize(
+    ("module", "cls"),
+    [
+        ("ragorc.index.multirep.summary", "SummaryIndexer"),
+        ("ragorc.index.multirep.dense_x", "PropositionIndexer"),
+    ],
+)
+def test_the_written_offset_is_the_sources_offset(module: str, cls: str) -> None:
+    """The value, not the key. A grep for the name is satisfied by writing zero,
+    and a base offset of zero is exactly the false span this file exists to stop.
+    """
+    import importlib
+
+    from ragorc.core.settings import Settings
+
+    module_obj = importlib.import_module(module)
+    indexer = getattr(module_obj, cls)(object(), settings=Settings(llm={"api_key": "k"}))
+    source = Chunk(id="c1", content=_DOCUMENT, document_id="d1", start_char=137, end_char=200)
+
+    if cls == "SummaryIndexer":
+        unit = indexer._as_summary_unit(source, _SUMMARY, "Refunds")
+    else:
+        import numpy as np
+
+        # `_unit` is the proposition builder; `_as_source_unit` returns the source
+        # itself and carries no derived offset to check.
+        unit = indexer._unit(
+            source,
+            "Customers may return items.",
+            "",
+            np.zeros(0, dtype=np.int32),
+            truncated=False,
+        )
+
+    assert unit.metadata["parent_start_char"] == 137, unit.metadata
+    assert unit.metadata["parent_end_char"] == 200
+
+
+def test_a_window_expanded_derived_unit_keeps_its_window_base() -> None:
+    """The regression the rename introduced, and the reason the base is keyed on
+    the expansion rather than on a fixed priority.
+
+    A summary built from a sentence-window chunk inherits ``window_start`` from its
+    source *and* gains ``parent_start_char``. The packer substitutes
+    ``parent_text or window_text``; `_base_offset` read ``parent_start_char``
+    first. When only the window text was present the two halves disagreed about
+    which span the prompt held, and the citation moved by a whole window —
+    measured (88, 126), slicing to 'ing is never refundable. Closing notes'.
+    """
+    from ragorc.context.pack import ContextPacker
+    from ragorc.core.settings import Settings
+
+    document = (
+        "Opening remarks and preamble go here first. Refunds are available for thirty days. "
+        "Shipping is never refundable. Closing notes follow at the very end of the page."
+    )
+    sentence = "Refunds are available for thirty days."
+    unit = Chunk(
+        id="s1",
+        content=sentence,
+        document_id="d1",
+        modality=Modality.SUMMARY,
+        parent_id="p1",
+        metadata={
+            "window_text": document,
+            "window_start": 0,
+            "parent_start_char": document.index(sentence),
+        },
+    )
+    settings = Settings(
+        llm={"api_key": "k"},
+        security={"enforce_tenant_isolation": False},
+        retrieval={"parent_expansion": True, "dedupe_enabled": False},
+    )
+    packed = ContextPacker(settings).build(
+        [ScoredChunk(chunk=unit, score=0.9)], budget=400, isolate=False
+    )
+    assert packed.chunks[0].explain["expansion"] == "window", "the packer widened with the window"
+
+    citation = extract_citations("Refunds are available for thirty days [1].", packed.chunks)[0]
+    assert document[citation.start_char : citation.end_char] == sentence, (
+        f"({citation.start_char}, {citation.end_char}) slices to "
+        f"{document[citation.start_char : citation.end_char]!r}"
+    )
+
+
+def test_a_parent_expanded_unit_uses_the_parent_base() -> None:
+    """The other branch of the same decision."""
+    from ragorc.context.pack import ContextPacker
+    from ragorc.core.settings import Settings
+
+    document = "Preamble here. " + _DOCUMENT
+    unit = Chunk(
+        id="s1",
+        content=_SUMMARY,
+        document_id="d1",
+        modality=Modality.SUMMARY,
+        parent_id="p1",
+        metadata={"parent_text": _DOCUMENT, "parent_start_char": len("Preamble here. ")},
+    )
+    settings = Settings(
+        llm={"api_key": "k"},
+        security={"enforce_tenant_isolation": False},
+        retrieval={"parent_expansion": True, "dedupe_enabled": False},
+    )
+    packed = ContextPacker(settings).build(
+        [ScoredChunk(chunk=unit, score=0.9)], budget=400, isolate=False
+    )
+    assert packed.chunks[0].explain["expansion"] == "parent"
+
+    citation = extract_citations("Shipping costs are not refundable [1].", packed.chunks)[0]
+    assert citation.quote.strip() in document[citation.start_char : citation.end_char]
+
+
 def test_only_expansion_may_re_base_a_citation() -> None:
     """`parent_start_char` describes the *parent*, so it is the right base only
     once the packer has actually substituted the parent's text. Reading it off an

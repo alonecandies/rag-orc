@@ -76,6 +76,15 @@ def test_the_index_side_reads_the_same_predicate() -> None:
         "the index side spelled the predicate out again; it will drift"
     )
 
+    # And the answer, because `return not self.config.multirep_enabled` satisfies
+    # both greps while inverting the stage in every deployment.
+    pipeline = object.__new__(IngestPipeline)
+    for flag in ("parent_document_enabled", "summary_index_enabled", "dense_x_enabled"):
+        pipeline.config = _settings(indexing={flag: True}).indexing
+        assert pipeline._stage_enabled("multirep") is True, flag
+    pipeline.config = _settings().indexing
+    assert pipeline._stage_enabled("multirep") is False
+
 
 # ---------------------------------------------------------------------------
 # parent_leg
@@ -322,3 +331,111 @@ def test_the_server_routes_every_pipeline_through_the_wrap() -> None:
     source = inspect.getsource(_LinearEngine._build_retriever)
     assert "self.hybrid" not in source, "a route still retrieves through the unwrapped leg"
     assert source.count("self.vector_leg") == 5
+
+
+def test_the_server_actually_wraps_the_leg_it_routes_through() -> None:
+    """The other half, and the one that mattered.
+
+    The test above is about how the five routes *read* the attribute. The
+    attribute is *assigned* one method up, and replacing that assignment with
+    `self.vector_leg = self.hybrid` restores the entire defect while every route
+    still reads `self.vector_leg` five times — the whole suite stayed green.
+    A reader test and a writer test are not the same test.
+    """
+    import inspect
+
+    from ragorc.server.app import _LinearEngine
+
+    build = inspect.getsource(_LinearEngine.build)
+    assignments = [
+        line.strip() for line in build.splitlines() if line.strip().startswith("self.vector_leg")
+    ]
+    assert assignments == ["self.vector_leg = parent_leg(self.hybrid, self.relational, settings=s)"], (
+        f"the server's vector leg is not the wrapped one: {assignments}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The scope the parent fetch runs under
+# ---------------------------------------------------------------------------
+class _ScopedStore:
+    """A docstore that scopes its reads, which is what both shipped stores do."""
+
+    def __init__(self, *parents: Chunk, enforce: bool = True) -> None:
+        self.parents = {p.id: p for p in parents}
+        self.asked: list[str | None] = []
+        self.enforce = enforce
+
+    async def get_chunks(self, ids: Any, *, tenant_id: str | None = None) -> list[Chunk]:
+        self.asked.append(tenant_id)
+        if self.enforce and tenant_id is None:
+            from ragorc.core.errors import GuardrailViolation
+
+            raise GuardrailViolation("tenant_id is required when tenant isolation is enabled")
+        return [
+            p
+            for i in ids
+            if (p := self.parents.get(i)) is not None
+            and (tenant_id is None or p.tenant_id == tenant_id)
+        ]
+
+
+@pytest.mark.parametrize("isolation", [True, False])
+async def test_the_parent_fetch_carries_the_querys_tenant(isolation: bool) -> None:
+    """The fetch is scoped by the docstore, so omitting the tenant does not widen
+    it — it *fails* it, and `_fetch_parents` degrades on any exception. So on the
+    library's default configuration the whole fix was a silent no-op: the only
+    evidence was a `parent_fetch_failed` warning and `resolved=0` at debug level.
+
+    Asserted with isolation off as well, because an unscoped read is the hole the
+    scoping exists to close whether or not the guard is armed.
+    """
+    from ragorc.retrieve.parent import ParentDocumentRetriever
+
+    parent = Chunk(id="p1", content=_PARENT, document_id="d1", tenant_id="acme")
+    child = Chunk(id="c1", content=_CHILD, document_id="d1", parent_id="p1", tenant_id="acme")
+    store = _ScopedStore(parent, enforce=isolation)
+    settings = _settings(
+        indexing={"summary_index_enabled": True},
+        security={"enforce_tenant_isolation": isolation},
+    )
+
+    wrapped = ParentDocumentRetriever(_Inner([_scored(child)]), store, settings=settings)
+    out = await wrapped.retrieve(Query(text="refunds?", tenant_id="acme"), top_k=5)
+
+    assert store.asked == ["acme"], f"the docstore was asked with tenant={store.asked}"
+    assert out[0].chunk.metadata.get("parent_text") == _PARENT
+
+
+async def test_a_foreign_parent_is_not_returned() -> None:
+    """The scoping is not decoration: a child whose parent belongs to another
+    tenant must come back unexpanded rather than carrying that tenant's text."""
+    from ragorc.retrieve.parent import ParentDocumentRetriever
+
+    foreign = Chunk(id="p1", content=_PARENT, document_id="d1", tenant_id="globex")
+    child = Chunk(id="c1", content=_CHILD, document_id="d1", parent_id="p1", tenant_id="acme")
+    store = _ScopedStore(foreign)
+
+    wrapped = ParentDocumentRetriever(
+        _Inner([_scored(child)]), store, settings=_settings(indexing={"dense_x_enabled": True})
+    )
+    out = await wrapped.retrieve(Query(text="refunds?", tenant_id="acme"), top_k=5)
+
+    assert "parent_text" not in out[0].chunk.metadata
+    assert out[0].chunk.content == _CHILD
+
+
+async def test_the_deployment_tenant_is_the_fallback() -> None:
+    """Same resolution the graph leg uses: the query's tenant, then the
+    deployment's."""
+    from ragorc.retrieve.parent import ParentDocumentRetriever
+
+    parent = Chunk(id="p1", content=_PARENT, document_id="d1", tenant_id="acme")
+    child = Chunk(id="c1", content=_CHILD, document_id="d1", parent_id="p1")
+    store = _ScopedStore(parent)
+    settings = _settings(indexing={"summary_index_enabled": True}, tenant_id="acme")
+
+    wrapped = ParentDocumentRetriever(_Inner([_scored(child)]), store, settings=settings)
+    await wrapped.retrieve(Query(text="refunds?"), top_k=5)
+
+    assert store.asked == ["acme"]

@@ -143,6 +143,16 @@ def _has_document_span(chunk: Chunk) -> bool:
     return True
 
 
+_EXPANSION_BASES: dict[str, tuple[str, ...]] = {
+    "parent": ("parent_start_char",),
+    "window": ("window_start",),
+}
+"""Which metadata key holds the document offset of each widening the packer does.
+
+Not a priority list: a chunk can carry both keys, and only the packer knows which
+text it actually put in the prompt."""
+
+
 def _absolute(base: int | None, offset: int | None) -> int | None:
     """A within-chunk offset as a document offset, when there is a document to
     offset into. Either half being unknown makes the answer unknown."""
@@ -176,7 +186,19 @@ def _base_offset(scored: ScoredChunk) -> int | None:
     chunk = scored.chunk
     metadata = getattr(chunk, "metadata", None) or {}
     if scored.explain.get("expanded"):
-        for key in ("parent_start_char", "window_start"):
+        # Keyed on the expansion the packer performed, not on a fixed priority.
+        # Both keys can be present at once — a summary built from a sentence-window
+        # chunk inherits `window_start` from its source and gains
+        # `parent_start_char` from expansion — and the packer substitutes
+        # `parent_text or window_text`. Reading `parent_start_char` for a chunk the
+        # packer had widened with the *window* re-based the quote by a whole span:
+        # measured, a citation for "Refunds are available for thirty days." reported
+        # (88, 126), which slices to 'ing is never refundable. Closing notes'.
+        performed = str(scored.explain.get("expansion") or "")
+        # An unmarked chunk predates the marker (or was built by hand): try both,
+        # which is the old behaviour and is right whenever only one key is present.
+        keys = _EXPANSION_BASES.get(performed, ("parent_start_char", "window_start"))
+        for key in keys:
             value = metadata.get(key)
             if isinstance(value, int):
                 return value

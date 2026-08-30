@@ -105,14 +105,30 @@ def test_the_builder_degrades_when_no_embedder_can_be_built() -> None:
 
 
 def test_the_server_passes_its_embedder_width() -> None:
+    """The *expression*, not a prefix. The first version searched for a literal
+    ending at `dimension=`, which `dimension=None` satisfies — and
+    `PostgresStore(s, cache=self.cache)` and `dimension=None` are the same call,
+    so the assertion was green with the bug fully restored."""
+    import ast
     import inspect
+    import textwrap
 
     from ragorc.server.app import _LinearEngine
 
-    source = inspect.getsource(_LinearEngine.build)
-    assert "PostgresStore(\n            s, cache=self.cache, dimension=" in source, (
-        "the server builds its relational store at the settings default again"
-    )
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_LinearEngine.build)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "PostgresStore"
+    ]
+    assert len(calls) == 1, f"expected one relational store construction, found {len(calls)}"
+    dimension = [kw for kw in calls[0].keywords if kw.arg == "dimension"]
+    assert dimension, "the server builds its relational store at the settings default again"
+    rendered = ast.unparse(dimension[0].value)
+    assert "self.dense" in rendered, f"the width does not come from the embedder: {rendered}"
+    assert rendered != "None"
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +195,39 @@ async def test_an_unconstrained_vector_column_is_not_a_mismatch() -> None:
     await _assert_vector_width(_Conn(-1), _settings(postgres={"vector_dimension": 768}).postgres)
 
 
-async def test_the_check_runs_inside_ensure_schema() -> None:
-    """The call site. A guard nothing calls is the defect this round is named
-    for, so this asserts on `ensure_schema`, not on the helper."""
+async def test_an_existing_column_that_is_wider_is_also_refused() -> None:
+    """The mirrored direction, reachable the same documented way: a corpus indexed
+    at 768 and then re-pointed at a 384-dimensional model keeps its `vector(768)`
+    column and fails every write with `got=384 expected=768`.
+
+    The first three cases were 384-vs-768, 384-vs-384 and -1, so weakening the
+    guard to `actual < wanted` satisfied all of them.
+    """
+    from ragorc.stores.postgres.ddl import _assert_vector_width
+
+    pg = _settings(postgres={"vector_dimension": 384}).postgres
+    with pytest.raises(ConfigError) as caught:
+        await _assert_vector_width(_Conn(768), pg)
+    assert caught.value.detail["column_dimension"] == 768
+
+
+async def test_the_guard_actually_stops_ensure_schema() -> None:
+    """The call site — and its *effect*. The first version greped `ensure_schema`
+    for the call text, but a guard that is called and whose ConfigError is
+    discarded is behaviourally identical to a guard nothing calls, and the string
+    is still there. Driven against live Postgres in
+    tests/integration/test_stores.py; here the transaction is a double.
+    """
     import inspect
 
     from ragorc.stores.postgres import ddl
 
     source = inspect.getsource(ddl.ensure_schema)
     assert "_assert_vector_width(conn, settings)" in source
+
+    # The effect: a ConfigError raised inside the DDL transaction must reach the
+    # caller rather than be swallowed by the optional-object degradation below it.
+    body = source[source.index("_assert_vector_width(conn, settings)") :]
+    assert "except" not in body.split("optional_statements")[0], (
+        "the width guard sits inside a handler that would swallow it"
+    )

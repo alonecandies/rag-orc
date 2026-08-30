@@ -278,6 +278,10 @@ class QdrantStore:
         self._client = client
         self._owns_client = client is None
         self._breaker = CircuitBreaker(name="qdrant")
+        #: Named vectors the *live* collection has, probed once. See
+        #: :meth:`_colbert_ready` for why configuration is not enough.
+        self._live_vectors: frozenset[str] | None = None
+        self._colbert_warned = False
 
     # -- plumbing ---------------------------------------------------------
     @property
@@ -628,7 +632,11 @@ class QdrantStore:
 
         want_dense = bool(kwargs.get("use_dense", rs.use_dense))
         want_sparse = bool(kwargs.get("use_sparse", rs.use_sparse)) and self._has_sparse
-        want_colbert = bool(kwargs.get("colbert_rerank", rs.colbert_rerank)) and self._has_colbert
+        # Probed once against the live collection, not merely configured: see
+        # `_colbert_ready`. Both flags below name the `colbert` vector in the
+        # wire request, and naming one the collection lacks fails the search.
+        colbert_ready = await self._colbert_ready()
+        want_colbert = bool(kwargs.get("colbert_rerank", rs.colbert_rerank)) and colbert_ready
 
         await self._ensure_vectors(query, dense=want_dense, sparse=want_sparse, multi=want_colbert)
 
@@ -770,7 +778,7 @@ class QdrantStore:
                     search_params=params,
                     limit=limit,
                     with_payload=True,
-                    with_vectors=self._search_vectors(),
+                    with_vectors=self._search_vectors(colbert_ready),
                     score_threshold=threshold,
                     timeout=self._timeout,
                 ),
@@ -795,6 +803,7 @@ class QdrantStore:
         query_filter: models.Filter | None,
         prefetch: list[models.Prefetch] | None = None,
         apply_threshold: bool = True,
+        colbert_ready: bool = False,
     ) -> list[ScoredChunk]:
         params = self._search_params()
         response = await self._guard(
@@ -808,7 +817,7 @@ class QdrantStore:
                 search_params=params,
                 limit=top_k,
                 with_payload=True,
-                with_vectors=self._search_vectors(),
+                with_vectors=self._search_vectors(colbert_ready),
                 score_threshold=(
                     self.settings.retrieval.score_threshold if apply_threshold else None
                 ),
@@ -923,7 +932,68 @@ class QdrantStore:
         )
 
     # -- reads ------------------------------------------------------------
-    def _search_vectors(self) -> list[str] | bool:
+    async def _live_vector_names(self) -> frozenset[str] | None:
+        """Named vectors the collection actually has, or ``None`` if unknowable.
+
+        A Qdrant collection's named vectors are fixed at creation and
+        ``ensure_collection`` is create-if-not-exists, so a collection built by
+        one configuration does not gain a vector when the configuration changes.
+        Probed once and cached: this is a startup-shaped question, not a per-query
+        one.
+        """
+        if self._live_vectors is None:
+            try:
+                info = await self.client.get_collection(self.collection)
+                params = info.config.params
+                names: set[str] = set()
+                vectors = getattr(params, "vectors", None)
+                if isinstance(vectors, dict):
+                    names |= set(vectors)
+                elif vectors is not None:
+                    names.add(DENSE_VECTOR)
+                names |= set(getattr(params, "sparse_vectors", None) or {})
+                self._live_vectors = frozenset(names)
+            except Exception as exc:  # noqa: BLE001 - unknown is not the same as absent
+                log.debug("qdrant_vector_probe_failed", error=str(exc)[:200])
+                return None
+        return self._live_vectors
+
+    async def _colbert_ready(self) -> bool:
+        """Whether a ColBERT query can actually be issued against this collection.
+
+        ``_has_colbert`` answers a *configuration* question — is a late embedder
+        present, or is the feature switched on — and that was the only question
+        asked. Widening the configuration predicate so `retrieval.colbert_rerank`
+        and `reranker="colbert"` build an embedder therefore turned a silently
+        dropped stage into a hard failure on every collection created before the
+        change: the query named a vector the collection does not have, and Qdrant
+        answered ``Not existing vector name error: colbert`` on *every* search.
+
+        Configuration says what we want; the collection says what is there. Both
+        have to agree, and when they do not the operator needs to hear it once —
+        the remedy is to re-index into a new collection, which no amount of
+        retrying will discover.
+        """
+        if not self._has_colbert:
+            return False
+        available = await self._live_vector_names()
+        if available is None or COLBERT_VECTOR in available:
+            return True
+        if not self._colbert_warned:
+            self._colbert_warned = True
+            log.warning(
+                "qdrant_colbert_vector_absent",
+                collection=self.collection,
+                has=sorted(available),
+                effect="late-interaction stages are skipped for this collection",
+                hint=(
+                    "the named vectors are fixed at creation: re-index into a new "
+                    "qdrant.collection, or ensure_collection(recreate=True)"
+                ),
+            )
+        return False
+
+    def _search_vectors(self, colbert_ready: bool = False) -> list[str] | bool:
         """Which vectors the search path should bring back with each hit.
 
         ``False`` — the default — because a hit's payload is what answers the
@@ -954,7 +1024,7 @@ class QdrantStore:
         names: list[str] = []
         if rs.mmr_enabled or (rs.compression_enabled and embedding_filtered):
             names.append(DENSE_VECTOR)
-        if rs.rerank_enabled and rs.reranker in _COLBERT_RERANKER_NAMES and self._has_colbert:
+        if rs.rerank_enabled and rs.reranker in _COLBERT_RERANKER_NAMES and colbert_ready:
             # The third consumer, and the one this function did not know about.
             # ColBERTReranker._order_chunks is written around `c.chunk.multi` with
             # an embed-the-gaps fallback, and its class docstring calls reuse the
