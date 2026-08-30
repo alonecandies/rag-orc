@@ -1567,8 +1567,20 @@ async def _bench(
                     )
                     started = time.perf_counter()
                     try:
-                        result = await engine.hybrid.retrieve_detailed(
-                            query, top_k=limit, use_variants=False, **legs
+                        # `vector_leg`, not `hybrid`: that is what every route
+                        # retrieves through, and on a multi-representation index
+                        # the two differ by the docstore round trip that resolves
+                        # a derived unit back to its source — measured at 19.7 ms
+                        # against 34.8 ms on a 48-chunk toy corpus, a gap that
+                        # grows with the docstore. A benchmark of a path nothing
+                        # serves is a number with no referent.
+                        #
+                        # `fetch_k` too, because `retrieve_detailed` returns
+                        # `max(fetch_k, top_k)` candidates: below the default 50,
+                        # `--top-k` moved a floor and left the measured width at
+                        # 50, so `-k 10` and `-k 20` benchmarked the same work.
+                        result = await engine.vector_leg.retrieve_detailed(
+                            query, top_k=limit, fetch_k=limit, use_variants=False, **legs
                         )
                         chunks = result.chunks
                         if rerank and chunks:

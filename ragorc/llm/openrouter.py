@@ -41,6 +41,7 @@ from ragorc.core.errors import (
 from ragorc.core.models import Usage
 from ragorc.core.settings import LLMSettings, get_settings
 from ragorc.core.telemetry import current_ledger, redact_identifiers
+from ragorc.core.tokens import count_tokens
 
 log = structlog.get_logger(__name__)
 
@@ -278,8 +279,27 @@ class OpenRouterLLM:
             retry_on=(TransientError,),
         )(self._post_once)(body)
 
+    def _token_cost(self, body: dict[str, Any]) -> int:
+        """What this request may spend, for the rate limiter to reserve.
+
+        Prompt plus the reserved completion, because a TPM ceiling is a ceiling on
+        what leaves the process, and a limiter that debits after the fact cannot
+        stop the call that breaches it — the same reason `CostLedger.reserve`
+        claims budget before a request rather than recording it after.
+
+        `llm.tokens_per_minute` was a fully implemented token bucket that nothing
+        debited: `acquire()` defaults to `tokens=0`, so 2000 tokens of traffic
+        against a 60-TPM ceiling elapsed in 0.003s with the allowance still at 60.
+        """
+        text = "".join(
+            str(message.get("content") or "")
+            for message in body.get("messages") or []
+            if isinstance(message, dict)
+        )
+        return count_tokens(text) + int(body.get("max_tokens") or 0)
+
     async def _post_once(self, body: dict[str, Any]) -> dict[str, Any]:
-        await self._limiter.acquire()
+        await self._limiter.acquire(self._token_cost(body))
         async with self._semaphore:
             loop = asyncio.get_running_loop()
             started = loop.time()

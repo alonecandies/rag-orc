@@ -37,6 +37,7 @@ removal was :meth:`clear`, which drops the collection for every tenant at once.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -100,10 +101,26 @@ class SemanticCache:
         self._client = client
         self.collection = self.settings.cache.semantic_collection
         self._ready = False
+        self._init_lock = asyncio.Lock()
         self.hits = 0
         self.misses = 0
 
     async def _ensure(self) -> Any:
+        """Build the client and the collection, once, even under a cold fan-out.
+
+        There are two awaits between the `_ready` check and the assignment, so two
+        concurrent first requests both saw `_ready` false, both called
+        `create_collection`, and the loser's write failed with
+        `409 Collection already exists` — silently, since `set` degrades. Measured:
+        two concurrent cold writes, one point stored.
+
+        A lock rather than a `collection_exists` retry, because the race is the
+        whole of the initialization and not just the create.
+        """
+        async with self._init_lock:
+            return await self._ensure_locked()
+
+    async def _ensure_locked(self) -> Any:
         if self._client is None:
             from ragorc.stores.qdrant.client import build_client
 
