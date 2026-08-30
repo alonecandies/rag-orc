@@ -281,7 +281,7 @@ class QdrantStore:
         #: Named vectors the *live* collection has, probed once. See
         #: :meth:`_colbert_ready` for why configuration is not enough.
         self._live_vectors: frozenset[str] | None = None
-        self._colbert_warned = False
+        self._absent_warned: set[str] = set()
 
     # -- plumbing ---------------------------------------------------------
     @property
@@ -396,6 +396,16 @@ class QdrantStore:
             "ensure_payload_indexes",
             lambda: ensure_payload_indexes(self.client, self.settings, collection=self.collection),
         )
+        # This is the one operation in the library that changes a collection's
+        # shape, so it is where the probe's answer stops being true. Without this
+        # the remedy `_colbert_ready` prints — "re-index into a new
+        # qdrant.collection, or ensure_collection(recreate=True)" — does nothing
+        # in-process: the collection gains its `colbert` vector and the cached
+        # answer still says it has only `dense`, so the stage stays off and no
+        # multivector is ever attached. A warning that names an inert remedy is
+        # worse than no warning.
+        self._live_vectors = None
+        self._absent_warned.clear()
         log.info("qdrant_ready", collection=self.collection, created=created, dense_dim=dim)
 
     def bulk_load(self) -> AbstractAsyncContextManager[None]:
@@ -631,7 +641,7 @@ class QdrantStore:
         fetch_k = max(int(kwargs.get("fetch_k") or rs.fetch_k), limit)
 
         want_dense = bool(kwargs.get("use_dense", rs.use_dense))
-        want_sparse = bool(kwargs.get("use_sparse", rs.use_sparse)) and self._has_sparse
+        want_sparse = bool(kwargs.get("use_sparse", rs.use_sparse)) and await self._sparse_ready()
         # Probed once against the live collection, not merely configured: see
         # `_colbert_ready`. Both flags below name the `colbert` vector in the
         # wire request, and naming one the collection lacks fails the search.
@@ -958,6 +968,48 @@ class QdrantStore:
                 return None
         return self._live_vectors
 
+    async def _vector_ready(self, name: str, configured: bool) -> bool:
+        """Whether a named vector can actually be *queried* on this collection.
+
+        Configuration says what we want; the collection says what is there. The
+        two are separate questions and the store only ever asked the first, which
+        is how switching a modality on against an existing index turned a
+        gracefully-absent stage into a hard failure: the query names a vector that
+        does not exist and Qdrant rejects the whole search.
+
+        Both named vectors need this, not just ColBERT. ``use_sparse`` has exactly
+        the same shape — measured, enabling it on a dense-only collection made
+        every hybrid query return zero chunks with
+        ``Not existing vector name error: sparse`` — and fixing one modality and
+        not its sibling is the asymmetry this codebase keeps producing.
+
+        Unknown is not absent: a probe that failed leaves the stage on, because
+        silently disabling a feature the operator configured is the failure this
+        exists to prevent, pointed the other way.
+        """
+        if not configured:
+            return False
+        available = await self._live_vector_names()
+        if available is None or name in available:
+            return True
+        if name not in self._absent_warned:
+            self._absent_warned.add(name)
+            log.warning(
+                "qdrant_vector_absent",
+                collection=self.collection,
+                vector=name,
+                has=sorted(available),
+                effect=f"stages that need the {name!r} vector are skipped for this collection",
+                hint=(
+                    "a collection's named vectors are fixed at creation: re-index into a "
+                    "new qdrant.collection, or ensure_collection(recreate=True)"
+                ),
+            )
+        return False
+
+    async def _sparse_ready(self) -> bool:
+        return await self._vector_ready(SPARSE_VECTOR, self._has_sparse)
+
     async def _colbert_ready(self) -> bool:
         """Whether a ColBERT query can actually be issued against this collection.
 
@@ -974,24 +1026,7 @@ class QdrantStore:
         the remedy is to re-index into a new collection, which no amount of
         retrying will discover.
         """
-        if not self._has_colbert:
-            return False
-        available = await self._live_vector_names()
-        if available is None or COLBERT_VECTOR in available:
-            return True
-        if not self._colbert_warned:
-            self._colbert_warned = True
-            log.warning(
-                "qdrant_colbert_vector_absent",
-                collection=self.collection,
-                has=sorted(available),
-                effect="late-interaction stages are skipped for this collection",
-                hint=(
-                    "the named vectors are fixed at creation: re-index into a new "
-                    "qdrant.collection, or ensure_collection(recreate=True)"
-                ),
-            )
-        return False
+        return await self._vector_ready(COLBERT_VECTOR, self._has_colbert)
 
     def _search_vectors(self, colbert_ready: bool = False) -> list[str] | bool:
         """Which vectors the search path should bring back with each hit.

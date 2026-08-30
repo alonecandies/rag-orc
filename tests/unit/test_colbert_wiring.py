@@ -369,12 +369,12 @@ async def test_the_probe_happens_once() -> None:
 async def test_a_configuration_the_collection_cannot_serve_is_reported_once() -> None:
     """The remedy is to re-index into a new collection, which no amount of
     retrying discovers — so the operator has to be told, and told once."""
-    from ragorc.stores.qdrant.collections import DENSE_VECTOR
+    from ragorc.stores.qdrant.collections import COLBERT_VECTOR, DENSE_VECTOR
 
     store = _store_over(_Collection(DENSE_VECTOR), retrieval={"reranker": "colbert"})
-    assert store._colbert_warned is False
+    assert not store._absent_warned
     await store._colbert_ready()
-    assert store._colbert_warned is True
+    assert store._absent_warned == {COLBERT_VECTOR}
 
 
 # ---------------------------------------------------------------------------
@@ -475,3 +475,80 @@ async def test_a_search_does_name_it_when_the_collection_has_it() -> None:
     assert any(isinstance(w, list) and COLBERT_VECTOR in w for w in asked), (
         f"the stored multivectors were not requested: {asked}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Both named vectors, not just the one that was fixed first
+# ---------------------------------------------------------------------------
+async def test_sparse_is_probed_the_same_way() -> None:
+    """`_has_sparse` had the identical configuration-not-collection shape, and
+    fixing one modality and not its sibling is the asymmetry this codebase keeps
+    producing. Measured before this: enabling `use_sparse` on a dense-only
+    collection made every hybrid query return zero chunks with
+    `Not existing vector name error: sparse`.
+    """
+    from ragorc.stores.qdrant.collections import DENSE_VECTOR, SPARSE_VECTOR
+
+    store = _store_over(_Collection(DENSE_VECTOR), retrieval={"use_sparse": True})
+    assert store._has_sparse is True, "the deployment is configured for sparse"
+    assert await store._sparse_ready() is False, "but the collection has no sparse vector"
+    assert store._absent_warned == {SPARSE_VECTOR}
+
+    with_sparse = _store_over(_Collection(DENSE_VECTOR, "sparse"), retrieval={"use_sparse": True})
+    assert await with_sparse._sparse_ready() is True
+
+
+async def test_a_search_never_names_the_sparse_vector_either() -> None:
+    """End to end, because the outage was in `search()`."""
+    from ragorc.core.models import Query
+    from ragorc.stores.qdrant.collections import DENSE_VECTOR, SPARSE_VECTOR
+    from ragorc.stores.qdrant.store import QdrantStore
+    from tests.fakes import StubEmbedder, StubSparseEmbedder
+
+    settings = _settings(
+        retrieval={"use_sparse": True}, security={"enforce_tenant_isolation": False}
+    )
+    client = _StubClient(DENSE_VECTOR)
+    store = QdrantStore(
+        settings, dense_embedder=StubEmbedder(32), sparse_embedder=StubSparseEmbedder()
+    )
+    store._client = client
+
+    await store.search(Query(text="refunds?"), top_k=5)
+
+    assert client.requests
+    for request in client.requests:
+        assert request.get("using") != SPARSE_VECTOR
+        for branch in request.get("prefetch") or []:
+            assert getattr(branch, "using", None) != SPARSE_VECTOR
+
+
+@pytest.mark.parametrize("vector", ["sparse", "colbert"])
+async def test_the_probe_is_invalidated_when_the_collection_is_replaced(vector: str) -> None:
+    """`ensure_collection(recreate=True)` is the remedy the warning names, and
+    without invalidation it does nothing in-process: the collection gains the
+    vector and the cached answer still says it has only `dense`.
+
+    Measured: `collection now has: ['colbert', 'dense']` / `_live_vectors:
+    ['dense']` / `colbert ready: False`. A warning that names an inert remedy is
+    worse than no warning.
+    """
+    import inspect
+
+    from ragorc.stores.qdrant.store import QdrantStore
+
+    source = inspect.getsource(QdrantStore.ensure_collection)
+    assert "self._live_vectors = None" in source
+    assert "self._absent_warned.clear()" in source
+
+    # Behaviour: a probe, then a replacement, then the new answer.
+    from ragorc.stores.qdrant.collections import DENSE_VECTOR
+
+    store = _store_over(_Collection(DENSE_VECTOR), retrieval={"use_sparse": True})
+    await store._live_vector_names()
+    assert store._live_vectors == frozenset({DENSE_VECTOR})
+
+    store._client = _Collection(DENSE_VECTOR, vector)  # the recreated collection
+    store._live_vectors = None  # what ensure_collection does
+    store._absent_warned.clear()
+    assert vector in (await store._live_vector_names() or set())
