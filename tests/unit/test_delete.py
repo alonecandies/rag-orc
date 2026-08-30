@@ -143,7 +143,19 @@ class _CountingScroll(FakeVectorStore):
             yield chunk
 
 
-async def test_the_graph_is_skipped_when_it_is_not_enabled() -> None:
+async def test_the_graph_is_torn_down_even_with_the_pipeline_flag_off() -> None:
+    """A deliberate reversal, recorded because this test asserted the opposite.
+
+    It codified `graph.enabled` as the teardown's predicate. That flag is the
+    *pipeline's* gate on whether to query a graph — `GraphBuilder`'s docstring
+    says so outright, and `ragorc graph build` writes to Neo4j regardless of it.
+    So a deployment that had built a graph and left the query flag off got
+    `deleted: true, complete: true, entities: 0` while the entities survived, and
+    the vectors removed in the same call were the graph's only remaining handle
+    on them.
+
+    "Is there a graph to ask" is not "does the pipeline read one".
+    """
     graph = FakeGraphDeleter()
     pipeline, _store = await _pipeline(
         graph=graph, settings=_settings(graph=False), chunks=[_chunk("c1", "policy")]
@@ -151,7 +163,26 @@ async def test_the_graph_is_skipped_when_it_is_not_enabled() -> None:
 
     report = await pipeline.delete(["policy"])
 
-    assert graph.deleted == []
+    assert graph.deleted == [["c1"]], f"the graph was not consulted: {graph.deleted}"
+    assert not report.skipped
+
+
+async def test_a_deployment_without_a_graph_records_a_skip_not_a_failure() -> None:
+    """Not having a graph is not a failed delete — but it is also not a delete
+    that checked one, and `complete` must not claim what it did not verify."""
+    from ragorc.core.errors import StoreUnavailable
+
+    class _NoGraph:
+        async def delete_chunks(self, ids: Any) -> Any:
+            raise StoreUnavailable("neo4j", "connection refused")
+
+    pipeline, _store = await _pipeline(
+        graph=_NoGraph(), settings=_settings(graph=False), chunks=[_chunk("c1", "policy")]
+    )
+
+    report = await pipeline.delete(["policy"])
+
+    assert report.skipped or report.errors, "an unreachable graph was silently ignored"
     assert report.entities == 0
 
 

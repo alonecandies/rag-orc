@@ -311,6 +311,13 @@ class DeleteReport:
     communities: int = 0
     answers_invalidated: int = 0
     errors: dict[str, str] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)
+    """Stores that were not consulted, and why.
+
+    Distinct from :attr:`errors`, which is a store that was asked and failed. A
+    deployment with no Neo4j is not a failed delete — but it is also not a delete
+    that checked Neo4j, and the difference has to be visible or ``complete`` is
+    claiming something it did not verify."""
 
     @property
     def complete(self) -> bool:
@@ -331,6 +338,62 @@ class DeleteReport:
         confirming a removal should read this, not :attr:`complete`.
         """
         return not self.errors and self.found == self.documents
+
+
+def select_pipeline(settings: Settings) -> tuple[str, str]:
+    """Resolve ``auto`` to a graph name, and say why.
+
+    One definition, because there were two and they disagreed. The HTTP service
+    had its own three-branch version reading `crag_enabled` and `graph.enabled`
+    only, so on the same configuration the CLI and the service answered
+    differently — four of five configurations, including the shipped default:
+
+        configuration                      builder    server
+        graph + multihop, no communities   adaptive   graphrag
+        self_rag only                      self_rag   naive
+        crag + self_rag                    agentic    crag
+        plain                              adaptive   naive
+
+    `/health` reported the builder's answer, so the service advertised a pipeline
+    it would not use — and `adaptive` fans out to four stores where `naive` runs
+    one hybrid leg, which is a different answer at a different cost.
+
+    Returns the reason as well as the name because the caller logs it, and a
+    selection whose rationale is not recorded is one nobody can debug.
+    """
+    s = settings
+    crag = s.retrieval.crag_enabled
+    self_rag = s.generation.self_rag_enabled
+    graph_on = s.graph.enabled and not graph_legs_refused(s)
+    # ``auto`` must not select a pipeline that is guaranteed to be refused.
+    # With tenant isolation on and ``graph_tenant_isolation='reject'`` every
+    # graph leg raises, so choosing ``graphrag`` here would turn a
+    # configuration decision into a 400 on every query. An explicitly
+    # requested ``graphrag`` still reaches the guard and still refuses —
+    # asking for it by name deserves the real error, not a silent
+    # substitution.
+    if s.graph.enabled and not graph_on:
+        log.warning(
+            "graph_pipeline_not_selectable",
+            reason="tenant isolation is enforced and security.graph_tenant_isolation='reject'",
+            hint="set security.graph_tenant_isolation='trusted' for one graph per tenant",
+        )
+
+    if crag and self_rag:
+        return "agentic", "crag and self_rag both enabled"
+    if graph_on and (crag or self_rag):
+        return "agentic", "graph enabled alongside a feedback loop"
+    if graph_on and s.graph.detect_communities:
+        return "graphrag", "graph enabled with community summaries"
+    if graph_on and s.graph.multihop_enabled:
+        return "multihop", "graph enabled without community detection"
+    if graph_on:
+        return "graphrag", "graph enabled"
+    if crag:
+        return "crag", "crag_enabled"
+    if self_rag:
+        return "self_rag", "self_rag_enabled"
+    return "adaptive", "no feedback loop enabled"
 
 
 class RAGPipeline:
@@ -1038,39 +1101,10 @@ class RAGPipeline:
             return pipeline
 
         s = self.settings
+        name, reason = select_pipeline(s)
         crag = s.retrieval.crag_enabled
         self_rag = s.generation.self_rag_enabled
         graph_on = s.graph.enabled and not graph_legs_refused(s)
-        # ``auto`` must not select a pipeline that is guaranteed to be refused.
-        # With tenant isolation on and ``graph_tenant_isolation='reject'`` every
-        # graph leg raises, so choosing ``graphrag`` here would turn a
-        # configuration decision into a 400 on every query. An explicitly
-        # requested ``graphrag`` still reaches the guard and still refuses —
-        # asking for it by name deserves the real error, not a silent
-        # substitution.
-        if s.graph.enabled and not graph_on:
-            log.warning(
-                "graph_pipeline_not_selectable",
-                reason="tenant isolation is enforced and security.graph_tenant_isolation='reject'",
-                hint="set security.graph_tenant_isolation='trusted' for one graph per tenant",
-            )
-
-        if crag and self_rag:
-            name, reason = "agentic", "crag and self_rag both enabled"
-        elif graph_on and (crag or self_rag):
-            name, reason = "agentic", "graph enabled alongside a feedback loop"
-        elif graph_on and s.graph.detect_communities:
-            name, reason = "graphrag", "graph enabled with community summaries"
-        elif graph_on and s.graph.multihop_enabled:
-            name, reason = "multihop", "graph enabled without community detection"
-        elif graph_on:
-            name, reason = "graphrag", "graph enabled"
-        elif crag:
-            name, reason = "crag", "crag_enabled"
-        elif self_rag:
-            name, reason = "self_rag", "self_rag_enabled"
-        else:
-            name, reason = "adaptive", "no feedback loop enabled"
 
         log.info(
             "pipeline_selected",
@@ -1232,13 +1266,34 @@ class RAGPipeline:
                     or 0
                 )
             report.rows = rows
-        if self.settings.graph.enabled and chunk_ids:
-            graph = await self.graph_store()
-            counts = await self._try(report, "graph", graph.delete_chunks(chunk_ids))
-            if counts:
-                report.entities = counts["entities"]
-                report.communities = counts["communities"]
-                report.graph_chunks = counts["chunks"]
+        if chunk_ids:
+            # "Is there a graph to ask", not "does the pipeline read one".
+            # `graph.enabled` is the *pipeline's* gate — `GraphBuilder`'s docstring
+            # says so outright and `ragorc graph build` writes to Neo4j regardless
+            # of it — so guarding the teardown with it alone reported
+            # `deleted: true, complete: true, entities: 0` while the entities that
+            # command had written survived, and the vectors removed in the same
+            # call were the graph's only remaining handle on them.
+            #
+            # Attempting unconditionally is the other wrong answer: a
+            # Postgres+Qdrant deployment would reach for Neo4j on every delete and
+            # record its absence as an error, turning a false confirmation into a
+            # false denial. So the skip is *recorded* instead. For the
+            # compliance-driven removal this API exists to serve, "I did not ask
+            # Neo4j" is a fact the operator needs and `complete` must not swallow.
+            if self.settings.graph.enabled or self._graph is not None:
+                graph = await self.graph_store()
+                counts = await self._try(report, "graph", graph.delete_chunks(chunk_ids))
+                if counts:
+                    report.entities = counts["entities"]
+                    report.communities = counts["communities"]
+                    report.graph_chunks = counts["chunks"]
+            else:
+                report.skipped["graph"] = (
+                    "graph.enabled is off and no graph store is built; `ragorc graph "
+                    "build` writes to Neo4j regardless of that flag, so re-run this "
+                    "delete with graph.enabled=true if a graph was ever built here"
+                )
         cache = self.semantic_cache
         if cache is not None:
             await self._try(report, "cache", cache.invalidate(ids, tenant_id=tenant))

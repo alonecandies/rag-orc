@@ -444,10 +444,27 @@ def graph_build(
             return await builder.build(chunks)
 
     report = _run(run)
+    if not settings.graph.enabled:
+        # This command writes to Neo4j regardless of the flag — deliberately, since
+        # the flag gates *querying* — but `delete` uses the presence of a graph to
+        # decide whether to tear one down, and in a fresh process that is the same
+        # flag. So a graph built here and left un-flagged is a graph no delete will
+        # ever reach. Said where the trap is set rather than where it springs.
+        err.print(
+            "[yellow]graph.enabled is off[/yellow] — this graph was written, but "
+            "`ragorc delete` will not remove from it. Set RAGORC_GRAPH__ENABLED=true "
+            "for the pipeline to query it and for deletes to reach it."
+        )
+    failed = int(report.stages.get("extract", {}).get("chunks_failed", 0) or 0)
+    # Computed before the branch, so both renderings reach the same verdict below.
+    # `--json` used to return here, above the "no entities extracted" check, so a
+    # build where every extraction failed exited 3 without the flag and 0 with it.
+    empty = bool(report.chunks_used and not report.entities)
     if as_json:
         console.print_json(data=report.summary())
+        if empty:
+            raise typer.Exit(3)
         return
-    failed = int(report.stages.get("extract", {}).get("chunks_failed", 0) or 0)
     table = Table(title="graph build", box=None)
     table.add_column("stage")
     table.add_column("count", justify="right")
@@ -472,7 +489,7 @@ def graph_build(
     # A clean table over an empty graph is the wrong thing to print. Extraction
     # failing on every chunk — an exhausted key, a model that stopped answering —
     # otherwise reads as "your corpus has no entities in it".
-    if report.chunks_used and not report.entities:
+    if empty:
         _fail(
             "No entities extracted",
             f"{report.chunks_used} chunk(s) were read and none produced an entity"
@@ -672,6 +689,18 @@ def documents(
     _run(run)
 
 
+def _delete_exit(report: Any) -> None:
+    """Exit non-zero for the two outcomes a caller must not read as success.
+
+    Shared by both rendering modes, because it is the *outcome* that decides.
+    `--json` returned before these checks, so the same failing delete exited 0
+    with the flag and 1 without it — and a pipeline that parses the JSON is
+    exactly the caller that cannot afford to miss it.
+    """
+    if not report.complete or not report.deleted:
+        raise typer.Exit(EXIT_ERROR)
+
+
 @app.command()
 def delete(
     document_ids: list[str] = typer.Argument(..., help="Document ids to remove."),
@@ -713,6 +742,10 @@ def delete(
         async with _service(settings) as service:
             report = await service.engine.delete(ids, tenant_id=tenant)
 
+        # The exit status is a property of the outcome, not of the rendering.
+        # `--json` used to `return` from inside this branch, above both checks
+        # below, so a delete that matched nothing exited 0 with the flag and 1
+        # without it — and CI that reads the JSON saw success.
         if as_json:
             _print_json(
                 {
@@ -726,8 +759,10 @@ def delete(
                     "answers_invalidated": report.answers_invalidated,
                     "complete": report.complete,
                     "errors": report.errors,
+                    "skipped": report.skipped,
                 }
             )
+            _delete_exit(report)
             return
 
         # Two columns, because half these numbers are requests and half are
@@ -748,22 +783,26 @@ def delete(
         table.add_row("cache invalidated for", f"{report.answers_invalidated} document(s)")
         console.print(table)
 
+        for store, why in report.skipped.items():
+            # A store that was not consulted is not a store that answered. Silence
+            # here is how `complete: true` came to mean "except the one I did not
+            # ask", which for a compliance delete is the wrong kind of quiet.
+            err.print(f"[yellow]{store} not consulted[/yellow]: {why}")
+
         if report.complete and not report.deleted:
             missing = report.documents - report.found
             err.print(
                 f"[yellow]{missing} of {report.documents} id(s) matched nothing[/yellow] — "
                 "unknown id, already deleted, or owned by another tenant"
             )
-            raise typer.Exit(EXIT_ERROR)
-
-        if not report.complete:
+        elif not report.complete:
             # Not an exception: the stores that succeeded are already done, and a
             # caller needs to know which ones to retry rather than being told the
             # whole thing failed.
             for store, message in report.errors.items():
                 err.print(f"[red]{store}[/red]: {message}")
             err.print("[yellow]the document may still be retrievable — retry[/yellow]")
-            raise typer.Exit(EXIT_ERROR)
+        _delete_exit(report)
 
     _run(run)
 

@@ -513,11 +513,29 @@ class _LinearEngine:
             pipeline = PipelineName.ADAPTIVE
         if pipeline is not PipelineName.AUTO:
             return pipeline, warnings
-        if self.settings.retrieval.crag_enabled:
-            return PipelineName.CRAG, warnings
-        if self.settings.graph.enabled:
-            return PipelineName.GRAPHRAG, warnings
-        return PipelineName.NAIVE, warnings
+
+        # The shared resolver, not a second three-branch version of it. This used
+        # to read `crag_enabled` and `graph.enabled` only, so the CLI and the
+        # service answered `auto` differently on four of five configurations —
+        # including the shipped default, where the library chose `adaptive` (four
+        # stores) and the service chose `naive` (one hybrid leg). `/health`
+        # reported the library's answer, so the service advertised a pipeline it
+        # would not use.
+        from ragorc.pipeline.builder import select_pipeline
+
+        chosen, _reason = select_pipeline(self.settings)
+        resolved = PipelineName(chosen)
+        if resolved in _LINEAR_UNSUPPORTED:
+            # The substitution this method already performs for an explicit
+            # request, applied to a resolved one: the linear engine cannot run an
+            # agentic graph, and saying so is better than quietly resolving to
+            # something else.
+            warnings.append(
+                f"pipeline {resolved.value!r} needs the orchestration layer; "
+                f"answered with {PipelineName.ADAPTIVE.value!r} instead"
+            )
+            resolved = PipelineName.ADAPTIVE
+        return resolved, warnings
 
     def notes_for(self, pipeline: PipelineName) -> list[str]:
         """The substitutions answering ``pipeline`` here would require, named.

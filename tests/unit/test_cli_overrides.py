@@ -113,3 +113,60 @@ def test_the_scoping_flags_reach_the_settings_the_stores_are_built_from() -> Non
     assert seen.keys() == wanted, f"could not find both commands: {sorted(seen)}"
     for name, keys in seen.items():
         assert "RAGORC_QDRANT__COLLECTION" in keys, f"{name} does not scope its collection: {keys}"
+
+
+# ---------------------------------------------------------------------------
+# Exit status is a property of the outcome, not of the rendering
+# ---------------------------------------------------------------------------
+def test_the_delete_exit_check_is_shared_by_both_renderings() -> None:
+    """`--json` returned from inside its branch, above both checks below it, so
+    the same failing delete exited 0 with the flag and 1 without — and a pipeline
+    that parses the JSON is exactly the caller that cannot afford to miss it."""
+    import ast
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(cli.delete))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_delete_exit"
+    ]
+    assert len(calls) == 2, f"both renderings must reach the exit check, found {len(calls)}"
+
+
+@pytest.mark.parametrize(
+    ("complete", "deleted", "code"),
+    [(True, True, None), (True, False, 1), (False, True, 1), (False, False, 1)],
+)
+def test_the_exit_check_itself(complete: bool, deleted: bool, code: int | None) -> None:
+    import typer
+
+    report = type("R", (), {"complete": complete, "deleted": deleted})()
+    if code is None:
+        cli._delete_exit(report)  # must not raise
+    else:
+        with pytest.raises(typer.Exit) as caught:
+            cli._delete_exit(report)
+        assert caught.value.exit_code == code
+
+
+def test_graph_build_reaches_its_failure_check_in_json_mode() -> None:
+    """A build where every extraction failed exited 3 in text mode and 0 with
+    `--json`, emitting a body with no failure field at all."""
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cli.graph_build)))
+    branches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "as_json"
+    ]
+    assert len(branches) == 1, "expected one --json branch"
+    body = "\n".join(ast.unparse(stmt) for stmt in branches[0].body)
+    assert "raise typer.Exit(3)" in body, (
+        f"the json branch returns without reaching the failure check: {body}"
+    )
