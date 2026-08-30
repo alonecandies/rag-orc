@@ -1942,11 +1942,14 @@ def _replace(chunks: list[Chunk], produced: Sequence[Chunk]) -> None:
 def _dedupe_exact(chunks: list[Chunk]) -> list[Chunk]:
     """Drop byte-identical chunks within one document, keeping the first.
 
-    Exact duplicates only. ``indexing.dedupe_threshold`` describes a *similarity*
-    pass, which belongs at query time (:mod:`ragorc.retrieve.noise`) for two
+    Exact duplicates only. A *similarity* pass belongs at query time
+    (:mod:`ragorc.retrieve.noise`, ``retrieval.near_dupe_threshold``) for two
     reasons: it needs the vectors this stage has not computed yet, and choosing
     which of two near-identical chunks to keep depends on the query that retrieved
-    them.
+    them. ``indexing.dedupe_threshold`` used to sit beside ``dedupe_chunks`` as
+    though it configured this function; it had no reader, and this paragraph was
+    the explanation of why. Removed rather than implemented — the knob that does
+    this job already exists, one module over, with a name that says where it runs.
     """
     seen: set[str] = set()
     out: list[Chunk] = []

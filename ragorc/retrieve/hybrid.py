@@ -146,9 +146,20 @@ class HybridRetriever:
         fetch_k = max(int(kw.pop("fetch_k", None) or rs.fetch_k), k)
         filters, tenant = resolve_filters(query, kw, self.settings)
 
+        # `hybrid_enabled` narrows the *defaults*, so an explicit per-call
+        # override still wins — the same precedence the three finer flags have.
+        # It had no behavioural reader at all: two `describe()` dicts and nothing
+        # else, so `/health` reported `"hybrid": false` while the sparse leg ran
+        # and fusion ran, returning the identical result set. docs/modules/
+        # retrieve.md lists it beside use_dense/use_sparse/use_fulltext under
+        # "which legs run", which is the meaning restored here: hybrid off means
+        # one leg, not a fusion of several.
+        hybrid = rs.hybrid_enabled
         use_dense = bool(kw.get("use_dense", rs.use_dense))
-        use_sparse = bool(kw.get("use_sparse", rs.use_sparse))
-        use_fulltext = bool(kw.get("use_fulltext", rs.use_fulltext)) and self.postgres is not None
+        use_sparse = bool(kw.get("use_sparse", rs.use_sparse and hybrid))
+        use_fulltext = (
+            bool(kw.get("use_fulltext", rs.use_fulltext and hybrid)) and self.postgres is not None
+        )
         use_variants = bool(kw.get("use_variants", True))
         texts = list(query.all_texts) if use_variants else [query.text]
 

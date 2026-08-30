@@ -617,7 +617,6 @@ class IndexingSettings(BaseModel):
     """Checksum comparison before embedding. Turns a full re-ingest into a
     no-op for unchanged documents."""
     dedupe_chunks: bool = True
-    dedupe_threshold: float = 0.98
 
 
 class GraphSettings(BaseModel):

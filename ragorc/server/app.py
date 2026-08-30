@@ -1010,6 +1010,7 @@ class RagService:
                 cost_usd=ledger.total.cost_usd,
                 chunks=len(answer.chunks),
                 grounded=answer.grounded,
+                answer=answer.text,
             )
             log.info(
                 "query_answered",
@@ -1249,7 +1250,9 @@ class RagService:
         )
         query.tenant_id = tenant
         query.filters = scope_filter(request.filters, tenant, self.settings.security)
-        self.audit.query(tenant_id=tenant, principal=principal, length=len(request.question))
+        self.audit.query(
+            tenant_id=tenant, principal=principal, question=request.question
+        )
         if validated.injection_risk:
             log.info(
                 "query_injection_risk",

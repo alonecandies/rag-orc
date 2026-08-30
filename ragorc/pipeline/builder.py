@@ -1438,7 +1438,7 @@ class RAGPipeline:
             trace=self.settings.observability.trace_enabled,
         ) as (trace, ledger):
             await self._rate_limit(tenant)
-            self._audit.query(tenant_id=tenant, principal=None, length=len(question))
+            self._audit.query(tenant_id=tenant, principal=None, question=question)
 
             # The pipeline is resolved before the lookup, not after, because it is
             # part of the cache identity: `auto` and an explicit name can select
@@ -1505,7 +1505,7 @@ class RAGPipeline:
             trace=self.settings.observability.trace_enabled,
         ) as (_trace, ledger):
             await self._rate_limit(tenant)
-            self._audit.query(tenant_id=tenant, principal=None, length=len(question))
+            self._audit.query(tenant_id=tenant, principal=None, question=question)
             chunks = 0
             try:
                 state, nodes = await self._retrieve_for_stream(
@@ -1666,6 +1666,7 @@ class RAGPipeline:
             cost_usd=answer.usage.cost_usd,
             chunks=len(answer.chunks),
             grounded=answer.grounded,
+            answer=answer.text,
         )
         log.info(
             "query_answered",
@@ -1819,7 +1820,11 @@ class RAGPipeline:
                 "hybrid": s.retrieval.hybrid_enabled,
                 "sparse": s.retrieval.use_sparse,
                 "fulltext": s.retrieval.use_fulltext,
-                "late_interaction": s.embedding.enable_late_interaction,
+                # The predicate, not the narrowest of the three flags that satisfy
+                # it. `reranker="colbert"` builds the embedder and runs the stage,
+                # and this reported `false` while it did — the last reader of
+                # `enable_late_interaction` left behind when the wirings moved.
+                "late_interaction": s.late_interaction_needed,
                 "rerank": s.retrieval.rerank_enabled and s.retrieval.reranker,
                 "compression": s.retrieval.compression_enabled and s.retrieval.compressor,
                 "crag": s.retrieval.crag_enabled,

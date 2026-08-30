@@ -25,7 +25,14 @@ from ragorc.core.settings import Settings, get_settings
 
 log = structlog.get_logger("ragorc.audit")
 
-__all__ = ["AuditEvent", "AuditLog"]
+__all__ = ["MAX_LOGGED_CHARS", "AuditEvent", "AuditLog"]
+
+MAX_LOGGED_CHARS = 4000
+"""Cap on recorded question and answer text.
+
+An audit line is meant to be greppable and shippable to a log pipeline; an
+unbounded answer would put a whole context window on one line. Generous enough
+that the truncation is rare and the text is still useful when it happens."""
 
 
 @dataclass(slots=True)
@@ -55,6 +62,17 @@ class AuditLog:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self.enabled = self.settings.security.audit_log_enabled
+        #: Whether question and answer text is recorded alongside the metadata.
+        #:
+        #: This module's docstring already said "Set ``observability.log_prompts``
+        #: deliberately if you need them" and docs/security.md documents it as a
+        #: control — and nothing read it. `model_post_init` even forces it off in
+        #: prod, so it had a writer and no reader: an operator who turned it on
+        #: for an incident got the same metadata-only lines and no way to tell.
+        #:
+        #: Decided here rather than at the eight call sites, because a predicate
+        #: each caller spells out is the shape half this library's defects take.
+        self.log_prompts = self.settings.observability.log_prompts
         self._path: Path | None = None
         if self.settings.security.audit_log_path:
             self._path = Path(self.settings.security.audit_log_path)
@@ -76,11 +94,18 @@ class AuditLog:
                 os.close(fd)
 
     # -- convenience recorders --------------------------------------------
-    def query(self, *, tenant_id: str | None, principal: str | None, length: int) -> None:
+    def query(self, *, tenant_id: str | None, principal: str | None, question: str) -> None:
+        """Record that a question was asked, and its text only if asked to.
+
+        Takes the question rather than its length so the *log* decides what to
+        keep. A caller that passed `len(question)` had already made the decision,
+        which is why `observability.log_prompts` had nowhere to be read.
+        """
+        detail: dict[str, Any] = {"query_length": len(question)}
+        if self.log_prompts:
+            detail["question"] = question[:MAX_LOGGED_CHARS]
         self.record(
-            AuditEvent(
-                "query", tenant_id=tenant_id, principal=principal, detail={"query_length": length}
-            )
+            AuditEvent("query", tenant_id=tenant_id, principal=principal, detail=detail)
         )
 
     def deleted(self, *, tenant_id: str | None, documents: int) -> None:
@@ -118,6 +143,7 @@ class AuditLog:
         chunks: int,
         grounded: bool,
         streamed: bool = False,
+        answer: str = "",
     ) -> None:
         """Record that a question was answered, and what it cost.
 
@@ -135,6 +161,7 @@ class AuditLog:
                     "chunks": chunks,
                     "grounded": grounded,
                     "streamed": streamed,
+                    **({"answer": answer[:MAX_LOGGED_CHARS]} if self.log_prompts and answer else {}),
                 },
             )
         )
