@@ -781,6 +781,64 @@ reads either, and the eleven tests say what they need.
 helper. mypy caught it; nothing else would have, because the registry accepts
 whatever it is handed.
 
+## 11o. Closed: round fifteen, verified — six regressions in the fixes themselves
+
+An adversarial pass over §11n's commits returned nineteen items. Its judging
+phase never ran — every judge died on a rate limit, and the harness classified an
+absent verdict as "refuted", so the run reported nineteen refutations and zero
+confirmations while having checked none of them. Verified by hand instead. All
+six code findings reproduced; nine of the eleven test findings were real.
+
+The lesson is narrower than "audits find things". **Four of the six regressions
+are the round's own signature defect applied to the round's own fixes:** a
+mechanism written, wired, documented — and undone one frame up.
+
+* `except BudgetExceeded: raise` in `_summarize`/`_decompose`, undone by
+  `map_concurrent(..., return_exceptions=True)` in their only caller, which
+  reclassified it as one chunk's bad luck. The new tests asserted on exactly the
+  two methods that were fixed.
+* The same signal undone again by `IngestPipeline._enrich`, whose
+  `except Exception` turned the operator's ceiling into
+  `report.warnings.append("raptor stage disabled: ...")`.
+* `parent_leg` wired into both query paths and inert on every multi-tenant
+  deployment, because `expand_parents` never received the query's tenant and
+  `_fetch_parents` degrades on any exception. The library fails closed by
+  default, so the default configuration was the broken one.
+* `_base_offset` keyed on `parent_start_char` while `ContextPacker._expand`
+  substitutes `parent_text or window_text`. A summary built from a
+  sentence-window chunk carries both keys; the two halves disagreed about which
+  span the prompt held, and the citation moved by a whole window. The packer now
+  records *which* expansion it performed.
+
+The two that are not that shape are worse in their own way, because both were
+**arguments rather than oversights**:
+
+* Widening the ColBERT predicate was correct and turned a silently dropped stage
+  into a total outage. A Qdrant collection's named vectors are fixed at creation,
+  so every query against an index built before the change named a vector that is
+  not there: `Not existing vector name error: colbert`. `_has_colbert` answers a
+  configuration question and was being asked a collection question.
+* The `None` ingest ceiling was justified in a docstring by
+  `RaptorIndexer._check_budget` — which returns early when `max_calls is None`.
+  The cited compensating control does not run, so POST /ingest had no ceiling of
+  any kind. A written justification is not a verified one, and this one was
+  falsifiable in four lines.
+
+**Nine of eleven test findings were real, all the same weakness.** Every
+`inspect.getsource` assertion that survived a behavioural mutation did so because
+the searched string appears somewhere else in the same scope, or stops short of
+the part that matters: `"dimension="` is satisfied by `dimension=None`;
+`"if s.late_interaction_needed"` survives the ternary's branches being swapped;
+the server-wrap test checked the five *readers* of `self.vector_leg` and never
+its *assignment*, so replacing the assignment with `self.hybrid` restored the
+whole defect with the suite green. The AST-walking raptor invariant — itself
+written this round to replace a defeated regex — credited `stats()`'s
+*list-valued* entries as behavioural readers.
+
+Standing conclusion for future rounds: **a source-text assertion is a smoke
+alarm, not a test.** Where one is unavoidable, parse rather than grep, and pin it
+with the mutation that should break it.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::

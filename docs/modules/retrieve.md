@@ -119,8 +119,9 @@ print(graded.grade, graded.per_store.keys())  # CORRECT / AMBIGUOUS / INCORRECT
 `retrieval.rerank_enabled` · `reranker` · `rerank_top_k` · `rerank_batch_size` | the one retrieval stage worth tuning |
 `retrieval.rankgpt_window` · `rankgpt_step` | sliding-window listwise reranking |
 `retrieval.colbert_rerank` | MaxSim over multivectors, nested in the prefetch |
-`retrieval.reranker = "colbert"` | client-side MaxSim. The store returns the stored multivectors so candidates are rescored without re-embedding — ~289 ms of ONNX saved per query at the default rerank width |
+`retrieval.reranker = "colbert"` | client-side MaxSim. The store returns the stored multivectors so candidates are rescored without re-embedding — ~289 ms of ONNX saved per query at the default rerank width. A collection's named vectors are fixed at creation, so switching this on against an index built without ColBERT skips the stage and warns; the remedy is to re-index into a new `qdrant.collection` |
 `retrieval.parent_expansion` | resolve a derived unit (child chunk, summary, proposition) back to its source. Gates both the fetch and the substitution; off means neither |
+`security.enforce_tenant_isolation` | the parent fetch is scoped to the query's tenant, so a child whose parent belongs to another tenant comes back unexpanded rather than carrying that tenant's text |
 `retrieval.relative_score_cutoff` · `score_threshold` · `dedupe_enabled` · `near_dupe_threshold` | noise filter |
 `retrieval.mmr_enabled` · `mmr_lambda` · `reorder_lost_in_middle` | diversity and placement |
 `retrieval.compression_enabled` · `compressor` · `compression_ratio` | post-retrieval refinement |

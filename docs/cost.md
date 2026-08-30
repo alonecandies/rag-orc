@@ -202,16 +202,26 @@ warnings: ['raptor stage disabled: LLM call budget exhausted (calls=40 limit=40)
 ```
 
 Ingest has its own ceilings — `cost.max_llm_calls_per_ingest`,
-`max_cost_per_ingest_usd`, `max_tokens_per_ingest` — and all three default to
-`None`. That is deliberate: an ingest's size is known in advance, and
-`RaptorIndexer.estimate_llm_calls` forecasts the whole build and refuses an
-over-budget one *before* the first call. Any arbitrary number here would only
+`max_cost_per_ingest_usd`, `max_tokens_per_ingest`. Only the **cost** one has a
+default (`10.0`), because spend is the quantity that does not scale with the
+corpus: twenty times the per-query ceiling, and still an unmistakable runaway.
+Call and token counts *do* scale, and an arbitrary default for them would only
 move the same silent truncation to a different corpus size.
 
-Set them when ingest is caller-triggered and you need a hard stop. Every stage
-now propagates `BudgetExceeded` rather than degrading per chunk, so a ceiling
-that is reached fails the run visibly instead of leaving most of the corpus
-indexed unenriched with `usage.calls` reporting zero.
+What makes leaving those two open safe is that exhaustion is now loud. Every
+stage propagates `BudgetExceeded`: the multi-representation indexers re-raise it
+out of their `build()` gather rather than letting `return_exceptions=True`
+reclassify it as one chunk's bad luck, and `IngestPipeline._enrich` lets it
+through instead of appending "stage disabled" to a report field most callers
+never read.
+
+Two things that do **not** bound an ingest, both of which were once believed to:
+
+* `RaptorIndexer._check_budget` returns early when the ledger has no call
+  ceiling, so its pre-flight forecast refuses nothing unless you set
+  `max_llm_calls_per_ingest`. Set one when ingest is caller-triggered.
+* With `track_costs=false` the cost ceiling is lifted too, exactly as on the
+  query path.
 
 ## Ceilings are reserved, not merely checked
 
