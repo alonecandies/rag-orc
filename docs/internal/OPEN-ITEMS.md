@@ -839,6 +839,60 @@ Standing conclusion for future rounds: **a source-text assertion is a smoke
 alarm, not a test.** Where one is unavoidable, parse rather than grep, and pin it
 with the mutation that should break it.
 
+## 11p. Closed: round sixteen — the CLI, the adapters, and one process over time
+
+Seventeen findings, and the first round to audit the two surfaces a *user* touches
+first. Every previous round audited the engine. Eleven of the seventeen are the
+same defect — a flag parsed, documented and wired to nothing — and the most
+destructive one in the project was sitting one layer above the engine, in a
+two-word spelling difference between six call sites and two.
+
+**`ragorc delete --collection X` deleted from the default collection.** `_apply`
+publishes overrides as environment variables and pydantic-settings reads only
+`RAGORC_`-prefixed names. Six commands spelled the key as the variable; the two
+added last spelled it as their own typer parameter, writing `os.environ["collection"]`.
+Told `--collection r16_b`, the command emptied `r16_a` (2 -> 0 points) and printed
+`documents found 1 / vectors removed 2` — a report identical to a correct delete,
+from the one command whose docstring says "the blast radius is kept equal to what
+was typed". The confirmation prompt names ids, never the collection.
+
+**Two wirings resolved `auto` differently.** The server had its own three-branch
+version; the library read six flags. Four of five configurations disagreed,
+*including the shipped default* — `adaptive` (four stores) against `naive` (one
+hybrid leg) — and `/health` reported the library's answer, so the service
+advertised a pipeline it would not use.
+
+**The adapter was a third policy.** On the same index and the same settings a
+LangChain consumer got a different tenant filter (inert when the tenant came from
+settings), different text (no parent/window substitution), a different width
+(`top_k` pinned to `Query`'s truthy default of 10), and a `TypeError` on the LCEL
+dict shape the module itself documents. None of those is visible from inside the
+adapter; each is a defect only *relative* to the pipeline it wraps, which is why
+the tests assert the two agree.
+
+**Two of my own fixes from round fifteen had gaps.** The live-vector probe guarded
+`colbert` and not `sparse` — identical shape, so enabling `use_sparse` on an
+existing collection made every query return zero chunks — and `_live_vectors` was
+never invalidated, so `ensure_collection(recreate=True)`, the remedy the warning
+itself prints, did nothing in-process. Fixing one modality and not its sibling,
+and shipping a warning whose remedy is inert, are both this codebase's recurring
+shape applied to a fix for that shape.
+
+**The invariant that was too narrow.** Round fifteen removed one inert setting and
+added a guard scoped to `raptor_*`. Widening the same AST walk to all 268 settings
+found `retrieval.hybrid_enabled` — the library's headline switch, listed in the
+docs under "which legs run", reported in `/health`, read by nothing — plus
+`observability.log_prompts` (a writer, forced off in prod, and no reader, while
+`docs/security.md` documented it as a control) and `indexing.dedupe_threshold`
+(superseded, and the docs claimed near-duplicate rejection at ingest that never
+happened). **A guard written to describe the bug just fixed is usually narrower
+than the bug's class.**
+
+**Refuted:** `ragorc bench --top-k` was reported as reaching nothing. It reaches
+retrieval; the effect was invisible because `retrieve_detailed` returns
+`max(fetch_k, top_k)`, so below the default 50 the flag moved a floor. Fixed as
+the milder thing it is.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::

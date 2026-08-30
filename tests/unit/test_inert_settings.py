@@ -291,3 +291,24 @@ def test_the_call_sites_hand_over_the_text_rather_than_its_length() -> None:
     for module in (builder, app):
         source = _p.Path(inspect.getfile(module)).read_text()
         assert "length=len(" not in source, f"{module.__name__} still decides for the audit log"
+
+
+def test_health_reports_the_predicate_not_its_narrowest_flag() -> None:
+    """`/health` said `late_interaction: false` while a ColBERT embedder was
+    loaded and the stage was running — the last reader of
+    `enable_late_interaction`, left behind when the three wirings moved to
+    `late_interaction_needed`. A features dict that reports configuration rather
+    than capability is how two of these were wrong at once."""
+    from ragorc.pipeline.builder import RAGPipeline
+
+    settings = _settings(retrieval={"reranker": "colbert"})
+    pipeline = RAGPipeline(settings=settings, llm=object())
+
+    features = pipeline.describe()["features"]
+
+    assert features["late_interaction"] is True, (
+        "health reports the stage off while the deployment builds and runs it"
+    )
+    assert settings.embedding.enable_late_interaction is False, (
+        "the narrow flag is still off — which is exactly why reporting it lied"
+    )

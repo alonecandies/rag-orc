@@ -563,3 +563,20 @@ async def test_documents_falls_back_to_the_scroll_when_postgres_is_down() -> Non
     rows = await pipeline.documents()
 
     assert [r["document_id"] for r in rows] == ["policy"]
+
+
+async def test_a_skipped_store_is_named_in_the_report() -> None:
+    """Silence is how `complete: true` came to mean "except the one I did not
+    ask". For the compliance-driven removal this API exists to serve, "I did not
+    consult Neo4j" is a fact the operator needs and `complete` must not swallow.
+    """
+    pipeline, _store = await _pipeline(
+        graph=None, settings=_settings(graph=False), chunks=[_chunk("c1", "policy")]
+    )
+
+    report = await pipeline.delete(["policy"])
+
+    assert "graph" in report.skipped, f"the graph was skipped silently: {report.skipped}"
+    assert "graph build" in report.skipped["graph"], "the note does not name the remedy"
+    # A skip is not an error: the stores that were asked all answered.
+    assert report.complete

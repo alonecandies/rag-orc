@@ -162,6 +162,6 @@ defers HNSW construction so ingest is an append and each graph is built once.
 `indexing.raptor_*` | UMAP → soft GMM → summarize → recurse; needs `ragorc[raptor]` |
 `indexing.batch_size` · `max_concurrent_documents` | the backpressure window |
 `indexing.skip_unchanged` | the checksum skip — the single biggest re-ingest saving |
-`indexing.dedupe_chunks` · `dedupe_threshold` | drop duplicate chunks before writing |
+`indexing.dedupe_chunks` | drop byte-identical chunks before writing. The *similarity* pass is `retrieval.near_dupe_threshold`, at query time |
 `graph.enabled` and the `graph.*` block | GraphRAG construction; needs `ragorc[graphrag]` |
 `qdrant.indexing_threshold` · `upsert_batch_size` · `parallel_upserts` | ingest write throughput |

@@ -113,7 +113,7 @@ print(graded.grade, graded.per_store.keys())  # CORRECT / AMBIGUOUS / INCORRECT
 | Setting | Effect |
 |---|---|
 `retrieval.top_k` · `fetch_k` | what the generator sees vs what recall is bought at |
-`retrieval.hybrid_enabled` · `use_dense` · `use_sparse` · `use_fulltext` | which legs run |
+`retrieval.hybrid_enabled` · `use_dense` · `use_sparse` · `use_fulltext` | which legs run. `hybrid_enabled=false` narrows the *defaults* to a single dense leg; the three finer flags and a per-call override still win |
 `retrieval.server_side_fusion` | one round trip vs two |
 `retrieval.fusion` · `rrf_k` · `fusion_weights` | RRF is rank-based, so it is the only merge unaffected by scores with no common scale |
 `retrieval.rerank_enabled` · `reranker` · `rerank_top_k` · `rerank_batch_size` | the one retrieval stage worth tuning |

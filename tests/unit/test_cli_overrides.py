@@ -170,3 +170,34 @@ def test_graph_build_reaches_its_failure_check_in_json_mode() -> None:
     assert "raise typer.Exit(3)" in body, (
         f"the json branch returns without reaching the failure check: {body}"
     )
+
+
+def test_bench_times_the_path_the_service_serves() -> None:
+    """`engine.hybrid` and `engine.vector_leg` differ by the docstore round trip
+    that resolves a derived unit back to its source — 19.7 ms against 34.8 ms on a
+    48-chunk toy corpus, a gap that grows with the docstore. A benchmark of a path
+    nothing serves is a number with no referent.
+
+    `--top-k` is asserted too: `retrieve_detailed` returns `max(fetch_k, top_k)`,
+    so below the default 50 the flag moved a floor and left the measured width at
+    50 — `-k 10` and `-k 20` benchmarked the same work.
+    """
+    import ast
+    import textwrap
+
+    # `_bench` is the coroutine the command delegates to; `bench` itself is the
+    # typer entry point and holds no retrieval.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cli._bench)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "retrieve_detailed"
+    ]
+    assert len(calls) == 1, f"expected one retrieval in bench, found {len(calls)}"
+    target = ast.unparse(calls[0].func)
+    assert "vector_leg" in target, f"bench times {target}, which no route uses"
+
+    passed = {kw.arg for kw in calls[0].keywords}
+    assert "fetch_k" in passed, "--top-k cannot narrow the measured width without fetch_k"

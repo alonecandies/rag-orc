@@ -314,7 +314,10 @@ after redaction), `flag`.
 - The log processor redacts any key containing `api_key`, `password`, `token`,
   `secret`, `authorization`, `dsn`.
 - `observability.log_prompts` is **off by default** — prompts contain retrieved
-  customer data.
+  customer data, and an audit log that copies it becomes the thing it was meant
+  to protect against. Turning it on records the question on the `query` line and
+  the answer on the `answer` line, capped at `audit.MAX_LOGGED_CHARS`. In `prod`
+  it is forced off by `Settings.model_post_init` and cannot be enabled.
 - The audit log records decisions, not content: generated statements, guard
   verdicts, injection signals, PII actions, cost.
 

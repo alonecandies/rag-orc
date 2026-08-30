@@ -76,4 +76,4 @@ if output.invalid_citations:
 `generation.verify_citations` | confirms each cited span exists in the cited chunk |
 `generation.cite_sources` · `citation_style` | `inline` \| `footnote` \| `json` |
 `indexing.min_chunk_size` · `max_chunk_size` | the floor and ceiling `validate_chunks` applies |
-`indexing.dedupe_chunks` · `dedupe_threshold` | exact and near-duplicate rejection at ingest |
+`indexing.dedupe_chunks` | **exact** duplicate rejection at ingest. Near-duplicate collapse is `retrieval.near_dupe_threshold`, at query time: it needs the vectors the ingest has not computed yet, and which of two near-identical chunks to keep depends on the query that retrieved them |
