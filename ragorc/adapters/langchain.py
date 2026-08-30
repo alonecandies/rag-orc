@@ -67,6 +67,7 @@ from typing import Any
 
 import structlog
 
+from ragorc.context.pack import expand_units
 from ragorc.core.errors import ConfigError
 from ragorc.core.ids import chunk_id as make_chunk_id
 from ragorc.core.models import (
@@ -366,7 +367,13 @@ async def _retrieve_as_documents(
     settings: Settings,
     extra: dict[str, Any] | None,
 ) -> list[Any]:
-    query = _as_query(value, top_k=top_k, filters=filters, tenant=tenant_id)
+    # Resolved here rather than left to the retriever. `Query.top_k` defaults to a
+    # hardcoded 10, and that default is *truthy*, so passing it down suppressed
+    # every `top_k or query.top_k or settings.retrieval.top_k` fallback below:
+    # a consumer with `retrieval.top_k = 25` got 10 from a wrapped retriever and
+    # 25 from `rag.query()` on the same settings.
+    resolved_top_k = top_k or settings.retrieval.top_k
+    query = _as_query(value, top_k=resolved_top_k, filters=filters, tenant=tenant_id)
     kwargs: dict[str, Any] = dict(extra or {})
     if filters:
         kwargs.setdefault("filters", filters)
@@ -380,7 +387,13 @@ async def _retrieve_as_documents(
             retriever=getattr(retriever, "name", type(retriever).__name__),
         ),
     ):
-        chunks = await retriever.retrieve(query, top_k=top_k or query.top_k, **kwargs)
+        chunks = await retriever.retrieve(query, top_k=resolved_top_k, **kwargs)
+        # The same substitution `ContextPacker` performs before a prompt is
+        # rendered. Without it a LangChain consumer answered from the 299-character
+        # child, or from the LLM's summary, where a ragorc consumer on the same
+        # index and the same settings got the source — and nothing indicated the
+        # two differed. `retrieval.parent_expansion` gates it in both places.
+        chunks = expand_units(chunks, settings)
     log.debug(
         "langchain_retriever_bridged",
         retriever=getattr(retriever, "name", type(retriever).__name__),
@@ -532,7 +545,14 @@ class LangChainRetriever:
         self, query: Query, *, top_k: int | None = None, **kwargs: Any
     ) -> list[ScoredChunk]:
         """:class:`~ragorc.core.protocols.Retriever` entry point."""
-        tenant = kwargs.get("tenant_id") or query.tenant_id
+        # `settings.tenant_id` is the third source and was missing. A
+        # single-tenant deployment names its tenant there rather than on every
+        # Query, and `_scoped` returns early when it has no tenant to compare
+        # against — so `foreign_retriever_tenant_isolation="filter"` was inert on
+        # exactly the deployments that configure a tenant once, and a foreign
+        # document reached the fused result. The mode documents itself as closing
+        # that leak.
+        tenant = kwargs.get("tenant_id") or query.tenant_id or self.settings.tenant_id
         require_foreign_retriever_isolation(self.name, self.settings)
         limit = int(top_k or query.top_k or self.settings.retrieval.top_k)
         with timed("adapter.langchain.reverse", retriever=self.name):
@@ -780,12 +800,22 @@ async def _dispatch(
 
     if method == "query":
         if isinstance(value, dict):
-            text = value.get("question") or value.get("query") or value.get("input") or ""
             extra = {k: v for k, v in value.items() if k not in ("question", "query", "input")}
         else:
-            text = str(value)
             extra = {}
-        return await fn(text, **{**defaults, **extra})
+        # Through `_as_query` like every other branch. `str(value)` turned a
+        # `Query` into its dataclass repr and asked *that* as the question:
+        #   "Query(text='why is late chunking cheaper?', original=..., top_k=10, ...)"
+        text = _as_query(value, top_k=None, filters=None, tenant=None).text
+        # LCEL dicts routinely carry keys the target has never heard of —
+        # `chat_history` is the canonical one — and forwarding them verbatim
+        # raised `TypeError: query() got an unexpected keyword argument`. Dropping
+        # them with a note is the behaviour a chain can actually use; the
+        # alternative is that adding memory to a chain breaks retrieval.
+        accepted, dropped = _split_kwargs(fn, {**defaults, **extra})
+        if dropped:
+            log.debug("langchain_runnable_kwargs_dropped", method=method, dropped=sorted(dropped))
+        return await fn(text, **accepted)
 
     if method in ("generate", "compress", "rerank"):
         if not isinstance(value, dict):
@@ -810,6 +840,25 @@ async def _dispatch(
         return await fn(str(primary), value[second], top_k=defaults.get("top_k"))
 
     return await fn(value, **defaults)
+
+
+def _split_kwargs(fn: Any, candidates: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+    """Split keyword arguments into those ``fn`` accepts and those it does not.
+
+    A callable taking ``**kwargs`` accepts everything, which is the common case
+    for this library's own entry points; anything narrower gets only what its
+    signature names.
+    """
+    import inspect
+
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins and C callables
+        return candidates, set()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return candidates, set()
+    accepted = {k: v for k, v in candidates.items() if k in parameters}
+    return accepted, set(candidates) - set(accepted)
 
 
 _TWO_ARG_KEYS: dict[str, tuple[str, str]] = {

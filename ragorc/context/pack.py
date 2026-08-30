@@ -35,7 +35,7 @@ from ragorc.security.injection import wrap_untrusted
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["ContextPack", "ContextPacker", "reorder_lost_in_middle"]
+__all__ = ["ContextPack", "ContextPacker", "expand_units", "reorder_lost_in_middle"]
 
 _PASSAGE_SEPARATOR = "\n\n"
 
@@ -62,6 +62,63 @@ def _provenance(value: str) -> str:
     """
     flat = " ".join(value.split()).replace("<", "&lt;").replace(">", "&gt;")
     return flat if len(flat) <= _MAX_PROVENANCE_CHARS else f"{flat[:_MAX_PROVENANCE_CHARS]}..."
+
+
+def expand_units(
+    chunks: Sequence[ScoredChunk],
+    settings: Settings,
+    *,
+    enabled: bool | None = None,
+) -> list[ScoredChunk]:
+    """Swap in the wider text a chunk points at.
+
+    Two multi-representation patterns converge here: the sentence-window splitter
+    stores its surrounding sentences in ``metadata["window_text"]``, and parent
+    expansion stores the parent body in ``metadata["parent_text"]``. Both search a
+    *precise* unit and generate from a *wide* one, and this is where the
+    substitution happens — after ranking, so precision is preserved where it
+    matters.
+
+    A module function rather than a method on the packer, because the packer was
+    the only caller and it is not the only consumer. A LangChain user wrapping
+    ``rag.retriever`` got the 299-character child, or the LLM's summary, where a
+    ragorc user got the source — same index, same settings, different evidence,
+    with nothing to indicate the two differed.
+    """
+    resolved = enabled
+    if resolved is None:
+        resolved = settings.retrieval.parent_expansion
+    if not resolved:
+        return list(chunks)
+
+    out: list[ScoredChunk] = []
+    seen_parents: set[str] = set()
+    for scored in chunks:
+        meta = scored.chunk.metadata
+        # *Which* expansion happened, not merely that one did. The citation layer
+        # needs the base offset of the text it substituted, and the two keys can
+        # both be present: a summary built from a sentence-window chunk inherits
+        # `window_*` from its source and gains `parent_*` from the expansion.
+        # Picking a key by fixed priority on the other side let the two halves
+        # disagree about which span the prompt actually held, and the citation was
+        # then off by a whole window.
+        expansion = "parent" if meta.get("parent_text") else "window"
+        wider = meta.get("parent_text") or meta.get("window_text")
+        if not wider or wider == scored.chunk.content:
+            out.append(scored)
+            continue
+        key = scored.chunk.parent_id or scored.chunk.id
+        if key in seen_parents:
+            # Several child chunks can share one parent; emitting the parent
+            # once per child would duplicate the same text in the prompt.
+            continue
+        seen_parents.add(key)
+        # A new ScoredChunk *and* a new Chunk. Wrapping alone was not enough:
+        # the wrapper shared the caller's `Chunk`, and assigning the wider body
+        # to it rewrote the retrieved text under the caller — this substitution
+        # is meant to change what the prompt shows, not what was retrieved.
+        out.append(_repacked(scored, wider, expanded=True, expansion=expansion))
+    return out
 
 
 def _repacked(scored: ScoredChunk, content: str, **explain: Any) -> ScoredChunk:
@@ -399,48 +456,8 @@ class ContextPacker:
     def _expand(
         self, chunks: Sequence[ScoredChunk], expand_parents: bool | None
     ) -> list[ScoredChunk]:
-        """Swap in the wider text a chunk points at.
-
-        Two multi-representation patterns converge here: the sentence-window
-        splitter stores its surrounding sentences in ``metadata["window_text"]``,
-        and the parent-document retriever stores the parent body in
-        ``metadata["parent_text"]``. Both search a *precise* unit and generate
-        from a *wide* one, and this is where the substitution happens — after
-        ranking, so precision is preserved where it matters.
-        """
-        if expand_parents is None:
-            expand_parents = self.settings.retrieval.parent_expansion
-        if not expand_parents:
-            return list(chunks)
-
-        out: list[ScoredChunk] = []
-        seen_parents: set[str] = set()
-        for scored in chunks:
-            meta = scored.chunk.metadata
-            # *Which* expansion happened, not merely that one did. The citation
-            # layer needs the base offset of the text it substituted, and the two
-            # keys can both be present: a summary built from a sentence-window
-            # chunk inherits `window_*` from its source and gains `parent_*` from
-            # the expansion. Picking a key by fixed priority on the other side let
-            # the two halves disagree about which span the prompt actually held,
-            # and the citation was then off by a whole window.
-            expansion = "parent" if meta.get("parent_text") else "window"
-            wider = meta.get("parent_text") or meta.get("window_text")
-            if not wider or wider == scored.chunk.content:
-                out.append(scored)
-                continue
-            key = scored.chunk.parent_id or scored.chunk.id
-            if key in seen_parents:
-                # Several child chunks can share one parent; emitting the parent
-                # once per child would duplicate the same text in the prompt.
-                continue
-            seen_parents.add(key)
-            # A new ScoredChunk *and* a new Chunk. Wrapping alone was not enough:
-            # the wrapper shared the caller's `Chunk`, and assigning the wider body
-            # to it rewrote the retrieved text under the caller — this substitution
-            # is meant to change what the prompt shows, not what was retrieved.
-            out.append(_repacked(scored, wider, expanded=True, expansion=expansion))
-        return out
+        """Swap in the wider text a chunk points at. See :func:`expand_units`."""
+        return expand_units(chunks, self.settings, enabled=expand_parents)
 
     # -- rendering ---------------------------------------------------------
     def _render(self, chunks: Sequence[ScoredChunk], *, isolate: bool) -> str:
