@@ -141,6 +141,11 @@ def _env_value(value: Any) -> str:
     return str(value)
 
 
+_ENV_PREFIX = str(Settings.model_config.get("env_prefix") or "RAGORC_")
+"""Read from the settings model rather than retyped, so a rename cannot leave
+this guard checking for a prefix nothing uses."""
+
+
 def _apply(overrides: dict[str, Any]) -> None:
     """Publish flag values as ``RAGORC_*`` environment variables.
 
@@ -151,6 +156,27 @@ def _apply(overrides: dict[str, Any]) -> None:
     flag silently overrides the environment every time the command runs.
     """
     for key, value in overrides.items():
+        if not key.startswith(_ENV_PREFIX):
+            # A key that is not an environment variable name is silently ignored
+            # by pydantic-settings, so the flag it came from would reach nothing
+            # and the command would run against whatever the environment said.
+            #
+            # Two commands spelled these as their *typer parameter* names —
+            # `_settings(collection=collection, tenant=tenant)` — while the other
+            # six spelled them as the variable. `delete --collection scratch`
+            # therefore deleted from the default collection and printed
+            # `documents found 1 / vectors removed 2`: a report identical to a
+            # correct delete, from a command whose own docstring says "the blast
+            # radius is kept equal to what was typed".
+            #
+            # Raising rather than warning, because this is a programming error in
+            # a call site inside this module and every one of them is reachable
+            # from a test.
+            raise ValueError(
+                f"override key {key!r} is not a settings variable; "
+                f"use the {_ENV_PREFIX}* name pydantic-settings reads "
+                f"(e.g. {_ENV_PREFIX}QDRANT__COLLECTION)"
+            )
         if value is not None:
             os.environ[key] = _env_value(value)
 
@@ -621,7 +647,9 @@ def documents(
     `--source` matches a substring of the path, which is how you get from "I
     deleted this file" to the id that removes it.
     """
-    settings = _settings(collection=collection, tenant=tenant)
+    settings = _settings(
+        RAGORC_QDRANT__COLLECTION=collection, RAGORC_TENANT_ID=tenant
+    )
 
     async def run() -> None:
         async with _service(settings) as service:
@@ -666,7 +694,9 @@ def delete(
     Confirms first unless `--yes`, because this is the one command in the CLI that
     destroys data.
     """
-    settings = _settings(collection=collection, tenant=tenant)
+    settings = _settings(
+        RAGORC_QDRANT__COLLECTION=collection, RAGORC_TENANT_ID=tenant
+    )
     ids = [i for i in document_ids if i]
     if not ids:
         err.print("[yellow]no document ids given[/yellow]")
