@@ -11,7 +11,7 @@ that needs it, and the route must never take a parameter. The third did not:
 anonymous caller got:
 
     "stores": {"qdrant": "http://localhost:6333",
-               "postgres": "db.internal:5433/prod",
+               "postgres": "db.internal:5433/prod",   # the measured leak
                "neo4j": "bolt://localhost:7687"}
 
 A fine line for a log file; the wrong one for an open endpoint. Liveness and
@@ -27,6 +27,11 @@ import pytest
 
 from ragorc.core.settings import Settings, get_settings
 
+# Deliberately unmistakable as a fixture. `.invalid` is the reserved TLD for
+# exactly this, and the credential parts say what they are: the test needs a host
+# to look for and a password to not find, and nothing else. A plausible-looking
+# DSN here would be entirely invented and still trip a secret scanner on a public
+# repository — a cost with no benefit, and a reviewer's time spent clearing it.
 _DSN = "postgresql://PLACEHOLDER_USER:PLACEHOLDER_PW@db.example.invalid:5433/prod"
 
 
