@@ -341,6 +341,24 @@ class MultiStoreRetriever:
                 for leg, message in nested.errors.items():
                     result.errors[f"{store.value}/{leg}"] = message
                 chunks = list(nested.chunks)
+                if nested.errors and not chunks:
+                    # Every leg failed and nothing came back — an outage, however
+                    # gracefully it was reported. This branch is exempt from the
+                    # outer deadline because the retriever bounds its own legs, and
+                    # `HybridRetriever.retrieve_detailed` also converts *all* leg
+                    # failures into `RetrievalResult.errors` and returns normally.
+                    # So neither `except` below could fire here and
+                    # `record_success()` ran on a total outage: the breaker never
+                    # opened, and a wedged Qdrant cost every request the full
+                    # per-store deadline forever — measured, six requests at
+                    # 1001 ms each with `failures=0`.
+                    #
+                    # Recorded, not raised: the fan-out already has the per-leg
+                    # errors and degrades on them. What was missing is the breaker
+                    # learning, so the *next* request fails fast instead of
+                    # spending the deadline again.
+                    breaker.record_failure()
+                    return chunks
             else:
                 coro = retriever.retrieve(query, top_k=fetch_k, **dict(passthrough))
                 chunks = (

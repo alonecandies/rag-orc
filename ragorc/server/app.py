@@ -645,10 +645,25 @@ class _LinearEngine:
         if resolved is PipelineName.ADAPTIVE:
             route, usage = await self._route(query)
             query = await self._expand(query)
-            trace_step("route", stores=[s.value for s in route.stores], usage=usage)
+            trace_step(
+                "route",
+                stores=[s.value for s in route.stores] if route else ["*"],
+                usage=usage,
+            )
+
+        # The per-store errors, kept so they can reach the answer. `_cache_set`
+        # refuses to cache a degraded answer by reading `answer.metadata["errors"]`
+        # and its docstring says why — "the HTTP path implemented no such rule, so
+        # it served the outage for the whole TTL, long after the store came back".
+        # Only `RAGPipeline._finalize` ever wrote that key, so on this path the
+        # guard's predicate was never true: the outage appeared in no response
+        # field, no warning and no metadata, and the degraded answer was cached.
+        store_errors: dict[str, str] = {}
 
         async def retrieve(current: Query) -> RetrievalResult:
-            return await self._retrieve_and_rerank(retriever, current, route=route)
+            result = await self._retrieve_and_rerank(retriever, current, route=route)
+            store_errors.update(result.errors)
+            return result
 
         # Every loop's bill, collected as it is spent. `SelfRAGResult.usage` and
         # `RRRResult.usage` are computed by their owners and had no reader here,
@@ -709,6 +724,12 @@ class _LinearEngine:
 
         answer.metadata["orchestrator"] = "linear"
         answer.metadata["pipeline"] = resolved.value
+        if store_errors:
+            answer.metadata["errors"] = [f"{store}: {why}" for store, why in store_errors.items()]
+            warnings.extend(
+                f"{store} was unavailable; the answer may be incomplete"
+                for store in store_errors
+            )
         return answer, resolved, warnings
 
     async def stream(
@@ -767,18 +788,26 @@ class _LinearEngine:
         )
 
     # -- stages ------------------------------------------------------------
-    async def _route(self, query: Query) -> tuple[RouteDecision, Usage]:
+    async def _route(self, query: Query) -> tuple[RouteDecision | None, Usage]:
         """Route, degrading to "query everything" on failure.
 
         A router that cannot decide is not a reason to fail a request that a
         full fan-out would have answered — it only costs the saving the router
         exists to make.
+
+        The fallback is ``None``, not ``RouteDecision(stores=())``. "Query
+        everything" is what `MultiStoreRetriever` does for *no* route; a route that
+        is present and names no store takes the opposite branch in `_plan`, where
+        `selected = list(route.stores)` is empty and nothing is planned. So the
+        documented degradation queried nothing, returned zero chunks and recorded
+        no error — measured: `multi_store_no_stores route=[]`, `chunks=0
+        errors={}`, against `chunks=1` for the same retriever with `route=None`.
         """
         try:
             return await self._router().route(query)
         except Exception as exc:  # noqa: BLE001 - routing is an optimization
-            log.warning("route_failed", error=str(exc)[:200])
-            return RouteDecision(stores=(), method="fallback", reasoning=str(exc)[:200]), Usage()
+            log.warning("route_failed", error=str(exc)[:200], fallback="query everything")
+            return None, Usage()
 
     async def _expand(self, query: Query) -> Query:
         """Add query variants before a multi-store fan-out.
