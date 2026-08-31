@@ -312,3 +312,53 @@ def test_health_reports_the_predicate_not_its_narrowest_flag() -> None:
     assert settings.embedding.enable_late_interaction is False, (
         "the narrow flag is still off — which is exactly why reporting it lied"
     )
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["query", "stream"])
+def test_log_prompts_reaches_both_answer_paths(streamed: bool) -> None:
+    """Same setting, two endpoints. The previous round's fix threaded the answer
+    text through `query` and not `stream`, so whether an answer was recorded
+    depended on which endpoint a caller used — and an operator auditing an
+    incident does not choose that."""
+    import ast
+    import inspect
+    import textwrap
+
+    from ragorc.pipeline.builder import RAGPipeline
+
+    method = RAGPipeline.stream if streamed else RAGPipeline.query
+    source = textwrap.dedent(inspect.getsource(method))
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "answered"
+    ]
+    # `query` delegates its audit to `_finish`; follow it.
+    if not calls:
+        source = textwrap.dedent(inspect.getsource(RAGPipeline._finish))
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "answered"
+        ]
+    assert calls, "no audit call on this path"
+    for call in calls:
+        assert "answer" in {kw.arg for kw in call.keywords}, (
+            "this path records no answer text, so log_prompts does nothing here"
+        )
+
+
+def test_the_streamed_text_is_only_buffered_when_it_will_be_recorded() -> None:
+    """`log_prompts` is off by default and buffering a whole answer to discard it
+    is a cost with no reader."""
+    import inspect
+
+    from ragorc.pipeline.builder import RAGPipeline
+
+    source = inspect.getsource(RAGPipeline.stream)
+    assert "keep_text = self._audit.log_prompts" in source
+    assert "if keep_text:" in source

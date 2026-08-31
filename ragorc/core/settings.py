@@ -989,9 +989,24 @@ class Settings(BaseSettings):
             self.security.enable_cypher_guard = True
             self.observability.log_prompts = False
 
-    def summary(self) -> dict[str, Any]:
-        """Redacted snapshot for logs and the ``/health`` endpoint."""
-        return {
+    def summary(self, *, topology: bool = True) -> dict[str, Any]:
+        """Redacted snapshot for logs and the ``/health`` endpoint.
+
+        "Redacted" meant *credentials*, and the `/health` route's docstring cited
+        that as its reason for being unauthenticated — "every field it returns is
+        already redacted by `Settings.summary`". The DSN's password is stripped;
+        its host, port and database name are not, so an unauthenticated caller on a
+        service where every data route returns 401 was handed::
+
+            "stores": {"qdrant": "http://localhost:6333",
+                       "postgres": "db.internal:5433/prod",
+                       "neo4j": "bolt://localhost:7687"}
+
+        That is a fine line for a log file and the wrong one for an open endpoint.
+        ``topology=False`` omits the block; models, features and environment stay,
+        because none of them names a host an attacker can reach.
+        """
+        out: dict[str, Any] = {
             "environment": self.environment,
             "llm": {
                 "model": self.llm.model,
@@ -1002,11 +1017,6 @@ class Settings(BaseSettings):
                 "provider": self.embedding.provider,
                 "dense_model": self.embedding.dense_model,
                 "sparse_model": self.embedding.sparse_model,
-            },
-            "stores": {
-                "qdrant": self.qdrant.url,
-                "postgres": self.postgres.dsn.get_secret_value().split("@")[-1],
-                "neo4j": self.neo4j.uri,
             },
             "features": {
                 "hybrid": self.retrieval.hybrid_enabled,
@@ -1019,6 +1029,13 @@ class Settings(BaseSettings):
                 "raptor": self.indexing.raptor_enabled,
             },
         }
+        if topology:
+            out["stores"] = {
+                "qdrant": self.qdrant.url,
+                "postgres": self.postgres.dsn.get_secret_value().split("@")[-1],
+                "neo4j": self.neo4j.uri,
+            }
+        return out
 
 
 @functools.lru_cache(maxsize=1)

@@ -579,6 +579,13 @@ class DeleteResponse(_Body):
     answers_invalidated: int = 0
     complete: bool = True
     errors: dict[str, str] = Field(default_factory=dict)
+    skipped: dict[str, str] = Field(default_factory=dict)
+    """Stores that were not consulted, and why.
+
+    Distinct from ``errors``, which is a store that was asked and failed. A
+    deployment with no graph is not a failed delete — but it is also not a delete
+    that checked the graph, and ``complete`` must not be read as covering a store
+    nobody asked. The CLI prints these; this is the same fact over HTTP."""
 
 
 class EvalItem(_Body):

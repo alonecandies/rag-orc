@@ -1562,6 +1562,12 @@ class RAGPipeline:
             await self._rate_limit(tenant)
             self._audit.query(tenant_id=tenant, principal=None, question=question)
             chunks = 0
+            # Accumulated only when it will be recorded: `log_prompts` is off by
+            # default and buffering a whole answer to discard it is a cost with no
+            # reader. A stream that disconnects halfway still records what left
+            # the process, which is the case an audit reader most needs.
+            emitted: list[str] = []
+            keep_text = self._audit.log_prompts
             try:
                 state, nodes = await self._retrieve_for_stream(
                     question, tenant=tenant, top_k=top_k, filters=filters, pipeline=pipeline
@@ -1577,6 +1583,8 @@ class RAGPipeline:
                     route=state.get("route"),
                     prompt_name=nodes.prompt_for(state),
                 ):
+                    if keep_text:
+                        emitted.append(delta)
                     yield delta
             finally:
                 # `answered` lives in `_finish`, which only `query` calls — so the
@@ -1591,6 +1599,14 @@ class RAGPipeline:
                     chunks=chunks,
                     grounded=False,
                     streamed=True,
+                    # What the caller was actually sent. `log_prompts` reached the
+                    # non-streamed path and not this one, so the same setting
+                    # recorded an answer or did not depending on which endpoint was
+                    # used — and an operator auditing an incident cannot choose.
+                    # Joined from the emitted deltas because there is no Answer
+                    # object here: a stream that disconnects halfway still has to
+                    # record what left the process.
+                    answer="".join(emitted),
                 )
 
     async def _retrieve_for_stream(

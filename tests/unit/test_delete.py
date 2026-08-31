@@ -580,3 +580,16 @@ async def test_a_skipped_store_is_named_in_the_report() -> None:
     assert "graph build" in report.skipped["graph"], "the note does not name the remedy"
     # A skip is not an error: the stores that were asked all answered.
     assert report.complete
+
+
+def test_the_http_response_carries_what_was_skipped() -> None:
+    """The CLI printed it and the HTTP caller could not see it — so the same
+    delete was honest at one interface and silent at the other."""
+    import inspect
+
+    from ragorc.server.app import RagService
+    from ragorc.server.schemas import DeleteResponse
+
+    assert "skipped" in DeleteResponse.model_fields
+    source = inspect.getsource(RagService.delete)
+    assert "skipped=dict(report.skipped)" in source, "the field exists and is never populated"

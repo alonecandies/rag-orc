@@ -155,3 +155,31 @@ async def test_the_token_ceiling_actually_throttles() -> None:
     started = loop.time()
     await limiter.acquire(30)
     assert loop.time() - started > 0.5, "a spent token budget did not wait"
+
+
+def test_both_provider_paths_debit_the_token_ceiling() -> None:
+    """The gap in the previous round's fix, and its shape.
+
+    Two methods reach the provider — `_post_once` and the streaming generator —
+    and the fix landed in one. Streaming spends the same tokens and, held across
+    every yield, spends them for longer, so the *more* expensive path was the one
+    still unbounded. Enumerating every site that reaches the resource is the
+    checklist item; this is the test that makes it stick.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from ragorc.llm.openrouter import OpenRouterLLM
+
+    source = textwrap.dedent(inspect.getsource(OpenRouterLLM))
+    bare: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "acquire"
+            and not node.args
+        ):
+            bare.append(node.lineno)
+    assert not bare, f"a provider call acquires the limiter without a token cost: lines {bare}"

@@ -1417,6 +1417,7 @@ class RagService:
             answers_invalidated=report.answers_invalidated,
             complete=report.complete,
             errors=dict(report.errors),
+            skipped=dict(report.skipped),
         )
 
     async def ingest(
@@ -1590,7 +1591,7 @@ class RagService:
         return answer
 
     # -- health ------------------------------------------------------------
-    async def health(self) -> HealthResponse:
+    async def health(self, *, topology: bool = True) -> HealthResponse:
         """Probe every wired store, then report with a redacted config summary.
 
         Each store is probed with a real query under its own short deadline, and
@@ -1631,7 +1632,7 @@ class RagService:
             uptime_s=round(time.monotonic() - self.started_at, 1),
             pipelines=list(PipelineName),
             stores=stores,
-            settings=self.settings.summary(),
+            settings=self.settings.summary(topology=topology),
             cache=self._cache_stats(),
             warnings=warnings,
         )
@@ -2266,6 +2267,27 @@ def create_app(settings: Settings | None = None) -> Any:
 
     require_key = _api_key_dependency(resolved, HTTPException, status)
 
+    async def presented_key(request: Request) -> bool:
+        """Whether a *valid* key was presented, without requiring one.
+
+        `/health` stays unauthenticated — a health endpoint behind a key cannot be
+        scraped by the load balancer that needs it most — and stays without
+        parameters, because an unauthenticated endpoint that takes input is one
+        that does work. What changes is how much it *says*: an anonymous scrape
+        gets liveness and per-store status, an authenticated operator gets the
+        configuration summary too.
+        """
+        if not resolved.server.api_keys:
+            return True
+        candidate = _presented_key(request)
+        if not candidate:
+            return False
+        return any(
+            hmac.compare_digest(candidate, k.encode())
+            for k in resolved.server.api_keys
+            if k
+        )
+
     async def guard(
         request: Request,
         service: RagService = Depends(service_dependency),
@@ -2510,16 +2532,25 @@ def create_app(settings: Settings | None = None) -> Any:
         return await service.evaluate(body, request_id=_request_id(request), principal=principal)
 
     @app.get("/health", response_model=HealthResponse, summary="Store health and configuration.")
-    async def health(service: RagService = Depends(service_dependency)) -> HealthResponse:
-        """Unauthenticated on purpose.
+    async def health(
+        service: RagService = Depends(service_dependency),
+        authenticated: bool = Depends(presented_key),
+    ) -> HealthResponse:
+        """Unauthenticated on purpose, and less talkative when it is.
 
         A health endpoint behind an API key cannot be scraped by the thing that
-        needs it most — the load balancer — and every field it returns is already
-        redacted by :meth:`Settings.summary`. What it must never do is grow a
-        parameter, because an unauthenticated endpoint that takes input is an
-        unauthenticated endpoint that does work.
+        needs it most — the load balancer — and it must never grow a parameter,
+        because an unauthenticated endpoint that takes input is an unauthenticated
+        endpoint that does work. Both of those still hold.
+
+        What did not hold was the third reason this docstring used to give: that
+        "every field it returns is already redacted by `Settings.summary`".
+        `summary()` redacts credentials, not topology, so an anonymous caller on a
+        service where all twelve data routes return 401 was handed the host, port
+        and database name of every backing store. Liveness and per-store status
+        are what a probe needs; the configuration summary now needs a key.
         """
-        return await service.health()
+        return await service.health(topology=authenticated)
 
     @app.get("/metrics", summary="Prometheus exposition.")
     async def prometheus() -> Response:

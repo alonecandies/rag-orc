@@ -626,7 +626,11 @@ class OpenRouterLLM:
             response_format=None,
             extra=kwargs,
         )
-        await self._limiter.acquire()
+        # The same debit `_post_once` makes. Fixing the ceiling in one of the two
+        # methods that reach the provider left it unenforced on the *more*
+        # expensive path: a streamed generation spends the same tokens and, held
+        # across every yield, spends them for longer.
+        await self._limiter.acquire(self._token_cost(body))
         # `_stream_semaphore`, not `_semaphore`: this block stays entered across
         # every `yield` below, for as long as the caller takes to consume the
         # generator. Held on the shared pool, `max_concurrency` slow readers were
