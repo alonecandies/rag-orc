@@ -124,3 +124,39 @@ def test_summary_topology_is_opt_out_not_opt_in() -> None:
     settings = Settings(llm={"api_key": "k"})
     assert "stores" in settings.summary()
     assert "stores" not in settings.summary(topology=False)
+
+
+# ---------------------------------------------------------------------------
+# What the audit log records when redaction is on
+# ---------------------------------------------------------------------------
+def test_the_audit_log_records_the_redacted_question(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`RagService.prepare` audited `request.question` — the raw body field —
+    while the validator's redacted output, two lines up, was what every downstream
+    stage and every store filter actually used. So the response told the caller
+    "PII redacted from query: EMAIL, CREDIT_CARD" while the audit file recorded the
+    address and the card number verbatim. An audit log that copies customer data
+    is what `enable_pii_redaction` exists to prevent.
+    """
+    import inspect
+
+    from ragorc.server.app import RagService
+
+    source = inspect.getsource(RagService.prepare)
+    assert "question=query.text" in source, "the audit line reads the raw request body again"
+    assert "question=request.question" not in source
+
+
+def test_the_redacted_text_is_what_the_validator_produced() -> None:
+    """Behaviour under the setting, so the identifier swap above is anchored to a
+    real difference rather than to a spelling."""
+    from ragorc.core.settings import Settings
+    from ragorc.validate.input import QueryValidator
+
+    settings = Settings(
+        llm={"api_key": "k"},
+        security={"enable_pii_redaction": True, "enforce_tenant_isolation": False},
+    )
+    validated = QueryValidator(settings).validate("email alice@corp.example about the refund")
+
+    assert "alice@corp.example" not in validated.query.text
+    assert "REDACTED" in validated.query.text

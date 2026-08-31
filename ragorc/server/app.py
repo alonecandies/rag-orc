@@ -1268,9 +1268,14 @@ class RagService:
         )
         query.tenant_id = tenant
         query.filters = scope_filter(request.filters, tenant, self.settings.security)
-        self.audit.query(
-            tenant_id=tenant, principal=principal, question=request.question
-        )
+        # `query.text`, not `request.question`. The validator's output is the
+        # PII-redacted question and is what every downstream stage and every store
+        # filter actually used; auditing the raw body field meant the response told
+        # the caller "PII redacted from query: EMAIL, CREDIT_CARD" while the audit
+        # file recorded the address and the card number verbatim — an audit log
+        # that copies customer data being precisely what `enable_pii_redaction`
+        # exists to prevent. One identifier, and the two disagreed.
+        self.audit.query(tenant_id=tenant, principal=principal, question=query.text)
         if validated.injection_risk:
             log.info(
                 "query_injection_risk",
@@ -2257,7 +2262,13 @@ def create_app(settings: Settings | None = None) -> Any:
         # reject the combination outright, so a service configured with "*" would
         # appear to allow everything and work for nothing.
         allow_credentials="*" not in resolved.server.cors_origins,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        # DELETE included because `DELETE /documents` exists. Starlette's preflight
+        # compares the requested method against this list and answers 400
+        # "Disallowed CORS method" before the route is consulted, so
+        # `server.cors_origins` could not express "this origin may delete" — the
+        # method list refused it, not the origin list, and the endpoint documents
+        # itself as the only way to take a document out of every store.
+        allow_methods=["DELETE", "GET", "POST", "OPTIONS"],
         allow_headers=["*"],
         expose_headers=["X-Request-ID"],
     )
@@ -2482,13 +2493,21 @@ def create_app(settings: Settings | None = None) -> Any:
         indexed is a list of what exists, which is exactly the enumeration the
         400-not-403 choice elsewhere in this service exists to avoid leaking.
         """
-        return await service.documents(
-            tenant_id=tenant_id,
-            source=source,
-            limit=limit,
-            request_id=_request_id(request),
-            principal=principal,
-        )
+        # The same ceiling `/query` honours. `ingest` and `eval` are exempt because
+        # they are long-running by nature and a 120-second cap would abort them
+        # mid-run — the reason the deadline lives in handlers rather than a
+        # middleware. These two are point reads and deletes against
+        # Postgres/Qdrant/Neo4j, were added after that reasoning was written, and
+        # ran with no upper bound of any kind: measured, a 5-second store answered
+        # in full against a 0.5-second `request_timeout_s`.
+        async with asyncio.timeout(resolved.server.request_timeout_s):
+            return await service.documents(
+                tenant_id=tenant_id,
+                source=source,
+                limit=limit,
+                request_id=_request_id(request),
+                principal=principal,
+            )
 
     @app.delete(
         "/documents",
@@ -2514,7 +2533,12 @@ def create_app(settings: Settings | None = None) -> Any:
         removes hundreds — and a URL is the wrong place for hundreds of ids and
         the wrong place for anything that ends up in an access log.
         """
-        return await service.delete(body, request_id=_request_id(request), principal=principal)
+        # Bounded like `/query` and `GET /documents`; see the note there on why
+        # ingest and eval stay exempt.
+        async with asyncio.timeout(resolved.server.request_timeout_s):
+            return await service.delete(
+                body, request_id=_request_id(request), principal=principal
+            )
 
     @app.post(
         "/eval",
@@ -2582,8 +2606,104 @@ def create_app(settings: Settings | None = None) -> Any:
 # ---------------------------------------------------------------------------
 # Cross-cutting wiring
 # ---------------------------------------------------------------------------
+_TOO_LARGE = orjson.dumps(
+    {"error": "PayloadTooLarge", "message": "request body exceeds server.max_body_bytes"}
+)
+"""Rendered once: the body ceiling's reply carries no per-request detail, and
+building it per rejection would allocate on exactly the path being abused."""
+
+
+class _BodyLimitMiddleware:
+    """Bound the request body by what actually arrives, on every route.
+
+    The declared ``Content-Length`` is a *claim*, and a chunked request makes
+    none. Only ``/ingest`` counted real bytes (``_read_bounded`` and
+    ``_capped_receive``); every other body-taking route declares its body as a
+    Pydantic parameter, so FastAPI buffered it with ``await request.body()``
+    before any handler ran. Measured with the ceiling at 4096: a 64 MiB chunked
+    body was buffered in full and answered 200 on ``DELETE /documents``, and
+    buffered in full on ``/query`` for a caller with no credential — the bypass
+    sits in front of authentication, which is what makes it worth an attacker's
+    time.
+
+    Pure ASGI rather than ``@app.middleware("http")``: the latter hands the
+    endpoint a *different* ``Request`` built from the same channel, so replacing
+    ``request._receive`` there does not reach the endpoint — and wrapping a
+    ``Request``'s own ``receive`` makes the wrapper call itself. At this layer the
+    channel is the thing being passed down, so there is one place to wrap and it
+    composes with ``/ingest``'s narrower per-file wrappers, which stay as they are.
+    """
+
+    def __init__(self, app: Any, limit: int) -> None:
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        received = 0
+        exceeded = False
+
+        async def counted() -> Any:
+            nonlocal received, exceeded
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.limit:
+                    exceeded = True
+                    # Truncate rather than raise: an exception from the receive
+                    # channel surfaces as "error parsing the body", which tells the
+                    # caller nothing about the limit they crossed. The flag is read
+                    # below and answered with a 413 that names it.
+                    return {"type": "http.disconnect"}
+            return message
+
+        replaced = False
+
+        async def guarded_send(message: Any) -> None:
+            # Whatever the app made of a truncated body — usually a 400 "error
+            # parsing the body" — is replaced with the answer that names the limit
+            # the caller crossed. Substituted on the way out rather than raised on
+            # the way in, because a body ceiling has to hold for a route whose
+            # handler never runs.
+            nonlocal replaced
+            if not exceeded:
+                await send(message)
+                return
+            if message["type"] == "http.response.start":
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                )
+                return
+            if message["type"] == "http.response.body":
+                if replaced:
+                    return
+                replaced = True
+                await send({"type": "http.response.body", "body": _TOO_LARGE, "more_body": False})
+                return
+            await send(message)
+
+        await self.app(scope, counted, guarded_send)
+        if exceeded:
+            log.info(
+                "request_body_too_large",
+                path=scope.get("path"),
+                limit_bytes=self.limit,
+                received_bytes=received,
+            )
+
+
 def _install_middleware(app: Any, settings: Settings) -> None:
     """Request ids, structlog binding, and a body-size ceiling."""
+    # Outermost, so it bounds the body before authentication, rate limiting or
+    # routing has a chance to buffer it.
+    app.add_middleware(_BodyLimitMiddleware, limit=settings.server.max_body_bytes)
 
     @app.middleware("http")
     async def request_context(request: Any, call_next: Callable[[Any], Awaitable[Any]]) -> Any:
@@ -2597,18 +2717,20 @@ def _install_middleware(app: Any, settings: Settings) -> None:
         )
         request.state.request_id = request_id
 
+        limit = settings.server.max_body_bytes
         declared = request.headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > settings.server.max_body_bytes:
+        if declared and declared.isdigit() and int(declared) > limit:
             return _json_error(
                 413,
                 ErrorResponse(
                     error="PayloadTooLarge",
                     message="request body exceeds server.max_body_bytes",
-                    detail={"limit_bytes": settings.server.max_body_bytes},
+                    detail={"limit_bytes": limit},
                     request_id=request_id,
                 ),
                 request_id,
             )
+
 
         # Bound before the task that runs the endpoint is created, so the
         # endpoint's context inherits it; unbinding afterwards happens in this
