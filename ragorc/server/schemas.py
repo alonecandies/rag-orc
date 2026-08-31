@@ -474,6 +474,17 @@ class IngestResponse(_Body):
     because the same reason recurs across documents and a dict keyed by reason
     would lose which documents it applied to."""
     failures: list[list[str]] = Field(default_factory=list)
+    empty: int = 0
+    """Documents that produced no chunks. Distinct from ``rejected`` — these were
+    read and split and yielded nothing, which is what an unsupported encoding or a
+    scanned PDF looks like from here."""
+    points_in_store: int = 0
+    """What the vector store held after the read-back.
+
+    With ``chunks`` this is the "did it land?" check, and it was the one number a
+    machine caller could not run: the field existed on the report and was dropped
+    on the way out, so an HTTP client saw `indexed: 10` and had nothing to compare
+    it against."""
 
     @classmethod
     def from_report(cls, report: Any, *, request_id: str) -> IngestResponse:
@@ -497,6 +508,8 @@ class IngestResponse(_Body):
             warnings=list(report.warnings),
             rejections=[[doc, reason] for doc, reason in report.rejected],
             failures=[[doc, reason] for doc, reason in report.failed],
+            empty=summary["empty"],
+            points_in_store=int(summary["points_in_store"] or 0),
         )
 
 

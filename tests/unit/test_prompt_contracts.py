@@ -274,3 +274,49 @@ async def test_the_inline_style_still_counts_markers() -> None:
     answer = await generator.generate(Query(text="q"), retrieval)
     coverage = (answer.metadata.get("validation") or {}).get("citation_coverage")
     assert coverage == 1.0, coverage
+
+
+def test_an_unanswerable_case_is_graded_on_abstention() -> None:
+    """The shipped dataset labels two cases `answerable: false` and nothing read
+    it, so they were graded by text overlap against a reference that *is* a
+    refusal — rewarding a confident fabrication and able to score a correct
+    abstention lower. The cases exist to measure the opposite."""
+    from ragorc.eval.dataset import EvalCase
+
+    unanswerable = EvalCase(
+        question="How many weeks of parental leave?",
+        expected_answer="The available documents do not say.",
+        metadata={"answerable": False},
+    )
+    ordinary = EvalCase(question="What is the refund window?", expected_answer="30 days")
+
+    assert unanswerable.unanswerable
+    assert not ordinary.unanswerable, "a case with no label is answerable"
+
+
+async def test_the_grader_scores_the_behaviour_not_the_wording() -> None:
+    from ragorc.core.models import Answer
+    from ragorc.eval.dataset import EvalCase
+    from ragorc.eval.runner import EvalRunner
+
+    case = EvalCase(
+        question="How many weeks of parental leave?",
+        expected_answer="The available documents do not say.",
+        metadata={"answerable": False},
+    )
+
+    async def _answer_fn(question: str, **kw: Any) -> Answer:
+        return Answer(text="x")
+
+    runner = EvalRunner(_answer_fn, _settings(), metric_names=())
+
+    refused = await runner._score(case, Answer(text="I cannot answer that.", abstained=True))
+    fabricated = await runner._score(
+        case, Answer(text="The available documents do not say.", abstained=False)
+    )
+
+    assert refused is not None and fabricated is not None
+    assert refused["abstention"].score == 1.0
+    assert fabricated["abstention"].score == 0.0, (
+        "a fabrication that echoes the reference's wording still scored full marks"
+    )

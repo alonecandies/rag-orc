@@ -68,6 +68,7 @@ import asyncio
 import contextlib
 import importlib
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -97,7 +98,7 @@ from ragorc.core.protocols import (
 )
 from ragorc.core.registry import resolve
 from ragorc.core.settings import Settings, get_settings
-from ragorc.core.telemetry import configure_logging, current_trace, new_request_context
+from ragorc.core.telemetry import configure_logging, new_request_context
 from ragorc.core.tokens import load_encoder
 from ragorc.generate.answer import AnswerGenerator
 from ragorc.generate.self_rag import SelfRAG
@@ -1485,6 +1486,7 @@ class RAGPipeline:
         tenant = self._scoped_tenant(tenant_id)
         request_id = uuid.uuid4().hex[:16]
         cost = self.settings.cost
+        started = time.perf_counter()
         with new_request_context(
             request_id=request_id,
             max_cost_usd=cost.max_cost_per_query_usd if cost.track_costs else None,
@@ -1514,7 +1516,12 @@ class RAGPipeline:
                 config={"recursion_limit": spec.recursion_limit(self.settings)},
             )
             answer = self._finish(
-                final, name=name, request_id=request_id, trace=trace, ledger=ledger
+                final,
+                name=name,
+                request_id=request_id,
+                trace=trace,
+                ledger=ledger,
+                started=started,
             )
             await self._cache_set(question, tenant, answer, final, top_k, filters, pipeline=name)
             return answer
@@ -1687,6 +1694,7 @@ class RAGPipeline:
         request_id: str,
         trace: list[Any],
         ledger: Any,
+        started: float,
     ) -> Answer:
         """Attach the request-level facts the graph could not know.
 
@@ -1752,7 +1760,12 @@ class RAGPipeline:
             errors=len(state.get("errors") or ()),
         )
         slow_ms = self.settings.observability.slow_query_ms
-        elapsed_ms = sum(step.duration_ms for step in current_trace())
+        # The query's own duration. Summing the trace steps measures something
+        # else twice over: steps nest, so a parent's time is counted again in each
+        # child, and concurrent legs are added rather than overlapped — a fast
+        # fan-out could exceed the threshold while a genuinely slow query with
+        # tracing off measured zero and never fired at all.
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
         if slow_ms and elapsed_ms > slow_ms:
             # A separate line at WARNING, because that is what an operator alerts
             # on. The threshold was configurable and compared against nothing, so

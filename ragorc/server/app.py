@@ -1617,7 +1617,14 @@ class RagService:
                 top_k=request.top_k,
                 pipeline=pipeline,
             )
-            with new_request_context(request_id=_new_request_id()):
+            with new_request_context(
+                request_id=_new_request_id(),
+                # Honoured here too: a step trace records what each stage did with
+                # the retrieved passages, so `trace_enabled=false` is a privacy
+                # decision and a wiring that ignores it is a wiring where the
+                # decision does not hold.
+                trace=self.settings.observability.trace_enabled,
+            ):
                 query, _warnings = self.prepare(body, principal=principal)
                 result, _pipeline, _notes = await self._dispatch(body, query)
                 return result
@@ -2166,6 +2173,26 @@ def _service_metrics() -> _Metrics | None:
     return _METRICS
 
 
+def _record_outcome(
+    metrics: _Metrics | None, pipeline: PipelineName, outcome: str, elapsed_s: float
+) -> None:
+    """Count a query that produced no ``QueryResponse``.
+
+    Only the success path was counted, so an outage read as *traffic stopped* —
+    the query counter simply went flat, which is what a healthy quiet period looks
+    like and the opposite of what an alert should fire on. A streamed deployment
+    reported nothing at all, since `/query/stream` never reached `_record`.
+
+    Latency is still observed: how long a request took before failing is what
+    distinguishes a rejection from a timeout. Cost and groundedness are not —
+    there is no answer to attribute them to.
+    """
+    if metrics is None:
+        return
+    metrics.queries.labels(pipeline=pipeline.value, outcome=outcome).inc()
+    metrics.latency.observe(elapsed_s)
+
+
 def _record(metrics: _Metrics | None, response: QueryResponse, elapsed_s: float) -> None:
     if metrics is None:
         return
@@ -2399,10 +2426,17 @@ def create_app(settings: Settings | None = None) -> Any:
         already lost its caller.
         """
         started = time.perf_counter()
-        async with asyncio.timeout(resolved.server.request_timeout_s):
-            response = await service.query(
-                body, request_id=_request_id(request), principal=principal
-            )
+        try:
+            async with asyncio.timeout(resolved.server.request_timeout_s):
+                response = await service.query(
+                    body, request_id=_request_id(request), principal=principal
+                )
+        except TimeoutError:
+            _record_outcome(metrics, body.pipeline, "timeout", time.perf_counter() - started)
+            raise
+        except Exception:
+            _record_outcome(metrics, body.pipeline, "failed", time.perf_counter() - started)
+            raise
         _record(metrics, response, time.perf_counter() - started)
         return response
 
@@ -2431,15 +2465,26 @@ def create_app(settings: Settings | None = None) -> Any:
         prepared = service.prepare(body, principal=principal)
 
         async def events() -> AsyncIterator[Any]:
+            # A stream is a query, and this endpoint reached no metric at all: an
+            # SSE-only deployment reported zero traffic on `/metrics` while serving
+            # every request. The outcome is set by the handlers below, which
+            # already distinguish the terminal states, and recorded once on the way
+            # out — including when the client hangs up mid-answer.
+            stream_started = time.perf_counter()
+            outcome = "streamed"
             try:
                 async for event, data in service.stream(
                     body, request_id=request_id, principal=principal, prepared=prepared
                 ):
                     yield sse.ServerSentEvent(event=event, data=data)
             except asyncio.CancelledError:
-                # The client hung up. Not an error, and not something to report.
+                # The client hung up. Not an error, but still an outcome: a
+                # deployment where most streams are abandoned is one an operator
+                # wants to see, and it is invisible in the answered count.
+                outcome = "cancelled"
                 raise
             except RagOrcError as exc:
+                outcome = "failed"
                 log.warning("stream_failed", request_id=request_id, error=str(exc)[:300])
                 yield sse.ServerSentEvent(
                     event="error",
@@ -2453,6 +2498,7 @@ def create_app(settings: Settings | None = None) -> Any:
                     ).decode(),
                 )
             except Exception as exc:  # noqa: BLE001 - the stream must close cleanly
+                outcome = "failed"
                 log.exception("stream_crashed", request_id=request_id)
                 yield sse.ServerSentEvent(
                     event="error",
@@ -2465,6 +2511,10 @@ def create_app(settings: Settings | None = None) -> Any:
                     ).decode(),
                 )
                 del exc
+            finally:
+                _record_outcome(
+                    metrics, body.pipeline, outcome, time.perf_counter() - stream_started
+                )
 
         return sse.EventSourceResponse(events(), headers={"X-Request-ID": request_id})
 

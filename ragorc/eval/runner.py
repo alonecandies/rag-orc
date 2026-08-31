@@ -66,7 +66,13 @@ from ragorc.core.errors import ConfigError
 from ragorc.core.models import Answer, FloatArray, Usage
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import Timer
-from ragorc.eval.answer_metrics import ALL_METRICS, AnswerMetrics, Scorecard, cheap_baseline
+from ragorc.eval.answer_metrics import (
+    ALL_METRICS,
+    AnswerMetrics,
+    MetricScore,
+    Scorecard,
+    cheap_baseline,
+)
 from ragorc.eval.dataset import EvalCase, EvalDataset
 from ragorc.eval.retrieval_metrics import DEFAULT_KS, RetrievalReport, evaluate_retrieval
 
@@ -668,6 +674,25 @@ class EvalRunner:
         return CaseResult(case=case, answer=answer, latency_ms=latency_ms, scorecard=scorecard)
 
     async def _score(self, case: EvalCase, answer: Answer) -> Scorecard | None:
+        if case.unanswerable:
+            # Graded on the behaviour the case exists to measure, not on wording.
+            # These two cases carry a reference that *is* a refusal, so text
+            # similarity rewarded a confident fabrication and could score a correct
+            # abstention lower — the metric ran, produced a number, and measured
+            # the opposite of the property.
+            card = Scorecard()
+            card.add(
+                MetricScore(
+                    name="abstention",
+                    score=1.0 if answer.abstained else 0.0,
+                    reasoning=(
+                        "abstained on a question the corpus cannot answer"
+                        if answer.abstained
+                        else "answered a question the corpus cannot answer"
+                    ),
+                )
+            )
+            return card
         if self.metrics is not None:
             return await self.metrics.evaluate(
                 case.question,

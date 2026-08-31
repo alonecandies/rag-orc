@@ -637,7 +637,18 @@ def ingest(
             report = await _ingest_batched(service, documents, batch_size, force=force)
 
         if as_json:
-            _print_json(report.summary())
+            # `summary()` is the counters. The warnings are where the read-back
+            # says the vector store holds fewer points than this run wrote — the
+            # one line that distinguishes "indexed" from "retrievable" — and a
+            # machine caller had no way to see it.
+            _print_json(
+                {
+                    **report.summary(),
+                    "warnings": list(report.warnings),
+                    "rejections": [[doc, why] for doc, why in report.rejected],
+                    "failures": [[doc, why] for doc, why in report.failed],
+                }
+            )
             return
         console.print(_report_table(report))
         if report.rejected or report.failed:
@@ -866,16 +877,22 @@ async def _ingest_batched(
         console=err,
     ) as progress:
         task = progress.add_task("indexing", total=len(documents))
-        for start in range(0, len(documents), batch):
-            window = list(documents[start : start + batch])
-            report = await service.linear.ingest(window, force=force)
-            _merge_report(merged, report)
-            progress.update(
-                task,
-                advance=len(window),
-                description=f"indexing · {merged.chunks_created} chunks · "
-                f"{merged.documents_skipped} unchanged",
-            )
+        # One bulk-load window across every batch. Each `ingest` call opens its
+        # own otherwise, so a 640-document directory turned HNSW construction off
+        # and back on ten times and rebuilt the graph over everything written so
+        # far at each exit — the repeated rebuild the single-window design removed,
+        # reinstated by the batching one level up.
+        async with service.linear.ingest_pipeline.bulk_run():
+            for start in range(0, len(documents), batch):
+                window = list(documents[start : start + batch])
+                report = await service.linear.ingest(window, force=force)
+                _merge_report(merged, report)
+                progress.update(
+                    task,
+                    advance=len(window),
+                    description=f"indexing · {merged.chunks_created} chunks · "
+                    f"{merged.documents_skipped} unchanged",
+                )
     return merged
 
 

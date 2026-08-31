@@ -539,6 +539,9 @@ class IngestPipeline:
         #: confirmed applied. Their checksums — the marker that makes the next
         #: run skip them — are stamped only after `_flush_vectors` returns.
         self._awaiting_confirmation: list[Document] = []
+        #: Nesting depth of `bulk_run`, so a batching caller's window suppresses
+        #: the per-call one rather than fighting it.
+        self._bulk_depth = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -611,7 +614,13 @@ class IngestPipeline:
             # so far and then waited for green. That is the repeated rebuilding
             # bulk-load mode exists to prevent, performed on a schedule.
             async with contextlib.AsyncExitStack() as bulk_stack:
-                bulk_loading = False
+                # Suppressed when a caller already holds one: `ragorc ingest`
+                # calls this once per --batch-size documents, so the window the
+                # comment above describes was reopened every 64 documents and
+                # every exit rebuilt HNSW over everything written so far — the
+                # repeated rebuild bulk-load mode exists to prevent, on a
+                # schedule, one nesting level up from where it was fixed.
+                bulk_loading = self._bulk_depth > 0
                 async for documents in self._document_windows(target, report, options):
                     report.documents_in += len(documents)
                     accepted = await self._validate(documents, report)
@@ -656,6 +665,30 @@ class IngestPipeline:
         report.total_ms = _elapsed_ms(run_started)
         log.info("ingest_complete", **report.summary())
         return report
+
+    @contextlib.asynccontextmanager
+    async def bulk_run(self) -> AsyncIterator[None]:
+        """Hold one bulk-load window across several :meth:`ingest` calls.
+
+        A caller that batches for progress reporting or memory — `ragorc ingest`
+        does both — otherwise gets one window per call, which is the thing
+        `_ingest`'s own comment says was fixed a level down.
+        """
+        if self.vector is None:
+            await self._prepare(IngestReport())
+        self._bulk_depth += 1
+        try:
+            # `bulk_load` is an optimization, not part of the store contract —
+            # `_ingest` guards it the same way, and a store without it has nothing
+            # to suspend.
+            window = getattr(self.vector, "bulk_load", None)
+            if self._bulk_depth == 1 and callable(window):
+                async with window():
+                    yield
+            else:
+                yield
+        finally:
+            self._bulk_depth -= 1
 
     async def close(self) -> None:
         """Release the stores this pipeline created.

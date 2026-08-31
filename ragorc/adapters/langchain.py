@@ -327,6 +327,11 @@ def _request_context(settings: Settings, label: str) -> Any:
         max_cost_usd=cost.max_cost_per_query_usd if cost.track_costs else None,
         max_calls=cost.max_llm_calls_per_query,
         max_tokens=cost.max_tokens_per_query,
+        # Honoured here too. Five wirings read this and this one did not, so an
+        # operator who turned tracing off — a *privacy* control, since a step trace
+        # records what each stage did with the retrieved passages and is attached
+        # to every Answer — still got a trace through the adapter.
+        trace=settings.observability.trace_enabled,
     )
 
 

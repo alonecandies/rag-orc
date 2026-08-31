@@ -235,6 +235,20 @@ class EvalCase:
     metadata: dict[str, Any] = field(default_factory=dict)
     id: str = ""
 
+    @property
+    def unanswerable(self) -> bool:
+        """Whether the corpus cannot answer this question.
+
+        The shipped dataset labels two cases ``answerable: false`` and nothing in
+        the library read it, so they were graded like any other: by text overlap
+        against a reference that happens to be a refusal. A model that invents a
+        confident parental-leave policy scores on wording, and a correct
+        abstention — whose phrasing comes from ``generation.abstain_message`` and
+        differs from the reference — can score *lower* than the fabrication. The
+        cases exist to measure exactly the opposite.
+        """
+        return not bool(self.metadata.get("answerable", True))
+
     def __post_init__(self) -> None:
         # Content-derived id, for the same reason chunk ids are: A/B comparison
         # pairs results by case id across two runs, and a random id would break

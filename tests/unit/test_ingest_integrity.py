@@ -148,3 +148,68 @@ async def test_nothing_is_stamped_when_the_run_never_reaches_the_flush() -> None
 
     assert not stamped, "documents were stamped without confirmation"
     assert len(pipeline._awaiting_confirmation) == 2, "the buffer lost the pending documents"
+
+
+# ---------------------------------------------------------------------------
+# What a machine caller can see, and what the batching costs
+# ---------------------------------------------------------------------------
+def test_the_did_it_land_check_survives_both_interfaces() -> None:
+    """`chunks` against `points_in_store` is the one check that distinguishes
+    "indexed" from "retrievable", and neither machine interface carried both:
+    the HTTP response dropped `points_in_store` and `empty`, and `--json` dropped
+    the warnings — including the read-back's own shortfall line."""
+    from ragorc.server.schemas import IngestResponse
+
+    for field in ("chunks", "points_in_store", "empty", "warnings"):
+        assert field in IngestResponse.model_fields, f"the HTTP caller cannot see {field}"
+
+    cli_source = inspect.getsource(_cli().ingest)
+    assert '"warnings": list(report.warnings)' in cli_source, "--json still drops the warnings"
+
+
+def _cli() -> Any:
+    from ragorc import cli
+
+    return cli
+
+
+def test_a_batching_caller_holds_one_bulk_load_window() -> None:
+    """`_ingest`'s own comment explains why one window per *document window* was a
+    bug — "every exit rebuilt the graph over everything written so far and then
+    waited for green". `ragorc ingest` reintroduced it one level up, calling
+    `ingest()` once per --batch-size documents."""
+    from ragorc.index.pipeline import IngestPipeline
+
+    assert hasattr(IngestPipeline, "bulk_run")
+    cli_source = inspect.getsource(_cli()._ingest_batched)
+    assert "bulk_run()" in cli_source, "the CLI opens a window per batch again"
+
+
+async def test_the_window_is_reentrant() -> None:
+    """An outer window must suppress the inner one rather than fight it — nesting
+    two `bulk_load` contexts is what turns indexing off and on repeatedly."""
+    from ragorc.index.pipeline import IngestPipeline
+
+    entered = 0
+
+    class _Store:
+        def bulk_load(self) -> Any:
+            import contextlib
+
+            @contextlib.asynccontextmanager
+            async def _cm() -> Any:
+                nonlocal entered
+                entered += 1
+                yield
+
+            return _cm()
+
+    pipeline = object.__new__(IngestPipeline)
+    pipeline.vector = _Store()
+    pipeline._bulk_depth = 0
+
+    async with pipeline.bulk_run(), pipeline.bulk_run():
+        pass
+
+    assert entered == 1, f"the window was opened {entered} times"
+    assert pipeline._bulk_depth == 0, "the depth was not restored"
