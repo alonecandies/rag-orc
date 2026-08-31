@@ -163,6 +163,28 @@ def test_the_did_it_land_check_survives_both_interfaces() -> None:
     for field in ("chunks", "points_in_store", "empty", "warnings"):
         assert field in IngestResponse.model_fields, f"the HTTP caller cannot see {field}"
 
+    # Declared *and* populated. A field with no assignment in `from_report`
+    # serializes its default, so `points_in_store: 0` on a run that wrote 20
+    # chunks reads as a total loss — a worse answer than the absent field.
+    class _Report:
+        def __init__(self) -> None:
+            self.warnings = ["vector store holds 12 points but this run wrote 20 chunks"]
+            self.rejected: list[tuple[str, str]] = []
+            self.failed: list[tuple[str, str]] = []
+
+        def summary(self) -> dict[str, Any]:
+            return {
+                "documents_in": 10, "indexed": 10, "skipped": 0, "rejected": 0,
+                "duplicate": 0, "failed": 0, "chunks": 20, "vectors": 40,
+                "strategy": "early", "skip_rate": 0.0, "cost_usd": 0.0, "llm_calls": 0,
+                "total_ms": 1.0, "timings_ms": {}, "empty": 3, "points_in_store": 12,
+            }
+
+    response = IngestResponse.from_report(_Report(), request_id="r")
+    assert response.points_in_store == 12, "the read-back's count is dropped on the way out"
+    assert response.empty == 3
+    assert response.warnings, "the shortfall warning never reaches the caller"
+
     cli_source = inspect.getsource(_cli().ingest)
     assert '"warnings": list(report.warnings)' in cli_source, "--json still drops the warnings"
 

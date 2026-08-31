@@ -108,10 +108,17 @@ def test_both_query_endpoints_record_an_outcome() -> None:
     from ragorc.server import app as app_module
 
     source = inspect.getsource(app_module.create_app)
-    for handler in ("query(", "query_stream("):
+    for handler, wanted in (("query(", {"failed", "timeout"}), ("query_stream(", {"failed"})):
         start = source.index(f"async def {handler}")
         body = source[start : start + 4000]
-        assert "_record_outcome(" in body, f"{handler} records no outcome"
+        # Per outcome, not "the call appears somewhere": removing just the failed
+        # branch left the timeout branch and the weaker assertion passed, so a
+        # crashing deployment still reported no traffic.
+        for outcome in wanted:
+            assert f'"{outcome}"' in body, f"{handler} does not record a {outcome} outcome"
+        assert body.count("_record_outcome(") >= len(wanted), (
+            f"{handler} has fewer recorders than terminal states"
+        )
 
 
 def test_the_stream_records_every_terminal_state() -> None:

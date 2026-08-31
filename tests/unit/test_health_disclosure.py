@@ -207,6 +207,23 @@ def test_no_unauthenticated_response_names_a_backing_host(
 
     for token in ("neo4j-secret.internal.example", "7999"):
         assert token not in anonymous, f"an anonymous caller learned {token!r}"
+
+    # The *success* path too. `Neo4jStore.health()` returns a detail dict whose
+    # first key is the address, so a healthy deployment disclosed it
+    # unconditionally — and an all-unavailable fixture cannot see that, because
+    # a failed probe carries no detail. Redacting only `error` left this open.
+    from ragorc.server.app import RagService
+    from ragorc.server.schemas import StoreHealth
+
+    healthy = StoreHealth(
+        name="neo4j",
+        status="ok",
+        latency_ms=3.0,
+        detail={"address": "neo4j-secret.internal.example:7999", "version": "5.20"},
+    )
+    public = RagService._public_store_health(healthy)
+    assert public.detail == {}, f"a healthy store still names its address: {public.detail}"
+    assert public.status == "ok" and public.latency_ms == 3.0, "the probe lost its verdict"
     # The operator keeps the diagnostic: hiding it from them to hide it from a
     # stranger would be the wrong trade, and a redacted probe is unactionable.
     assert "neo4j-secret.internal.example" in operator

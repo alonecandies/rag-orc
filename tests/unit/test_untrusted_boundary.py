@@ -286,7 +286,7 @@ async def test_the_global_graph_map_fences_its_community_report() -> None:
     assert "<untrusted_document" in prompts, "the map stage was handed a raw report"
 
 
-def test_a_truncated_preview_still_closes_its_fence() -> None:
+async def test_a_truncated_preview_still_closes_its_fence() -> None:
     """CRAG rendered the passages, then truncated the rendered string — cutting it
     mid-fence, so the untrusted region opened and never closed. Everything after
     it, including the prompt's own instruction, landed inside a block the model has
@@ -304,10 +304,41 @@ def test_a_truncated_preview_still_closes_its_fence() -> None:
     window = source[max(0, fence - 400) : fence]
     assert "truncate_to_tokens(joined" not in window, "still truncating the rendered string"
 
-    # And the property: whatever the budget, the fence is balanced.
-    from ragorc.core.tokens import truncate_to_tokens
-    from ragorc.security.injection import render_untrusted_passages
+    # And the property, driven through the real stage: a long passage is bounded
+    # *and* the fence closes. Asserting only that the fence is balanced passed
+    # with the budget set to a billion tokens — the preview was then unbounded,
+    # which is the other half of what the truncation is for.
+    from ragorc.core.models import Chunk, Query, ScoredChunk
+    from ragorc.core.tokens import count_tokens
+    from ragorc.retrieve.crag import _REWRITE_PREVIEW_TOKENS, CorrectiveRAG
+    from tests.fakes import StubLLM
 
-    long_passage = ("Refunds take thirty days. " * 200) + CANARY
-    rendered = render_untrusted_passages([truncate_to_tokens(long_passage, 20)])
-    assert rendered.count("<untrusted_document") == rendered.count("</untrusted_document>") == 1
+    llm = StubLLM()
+    crag = CorrectiveRAG(_Inner(), llm, _settings())
+    graded = [
+        type(
+            "G",
+            (),
+            {"scored": ScoredChunk(chunk=Chunk(id=f"c{i}", content=body), score=0.1)},
+        )()
+        for i, body in enumerate([("Refunds take thirty days. " * 400) + CANARY] * 3)
+    ]
+    await crag._rewrite(Query(text="refunds?"), graded)
+
+    sent = "\n".join(str(call.get("prompt", "")) for call in llm.calls)
+    assert "<untrusted_document" in sent, "the preview reached no prompt"
+    assert sent.count("<untrusted_document") == sent.count("</untrusted_document>"), (
+        "the preview was cut mid-fence"
+    )
+    assert count_tokens(sent) < _REWRITE_PREVIEW_TOKENS * 4, (
+        f"the preview is unbounded: {count_tokens(sent)} tokens"
+    )
+
+
+class _Inner:
+    """The retriever CRAG wraps; the rewrite path does not call it."""
+
+    name = "inner"
+
+    async def retrieve(self, query: Any, **kw: Any) -> list[Any]:
+        return []
