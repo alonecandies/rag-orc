@@ -44,6 +44,7 @@ from ragorc.core.telemetry import trace_step
 from ragorc.generate.groundedness import GroundednessChecker, GroundednessResult
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -281,7 +282,11 @@ class SelfRAG:
                 "The previous answer made claims the retrieved documents did not support. "
                 "Rewrite the query to find documents that directly state these facts."
             )
-            retrieved = "; ".join(c.chunk.content[:120] for c in answer.chunks[:3])
+            # Fenced, like the other two rewrite excerpts: an instruction here
+            # steers the rewrite, and the rewrite steers the next retrieval.
+            retrieved = render_untrusted_passages(
+                [c.chunk.content[:120] for c in answer.chunks[:3]]
+            )
         else:
             hint = (
                 "The previous answer was supported but did not address the question. "

@@ -109,6 +109,7 @@ from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import Timer, timed, trace_step
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.injection import render_untrusted_passages
 from ragorc.security.tenancy import require_graph_tenant_isolation
 
 log = structlog.get_logger(__name__)
@@ -970,7 +971,12 @@ class GraphGlobalRetriever:
         if community.title:
             report = f"{community.title}\n\n{report}"
         answer, usage = await self.llm.structured(
-            self.prompt.render(question=query.text, report=report),
+            # Fenced. A community summary is LLM-written from corpus text, so an
+            # instruction in an ingested document can survive into it and arrive
+            # here as though it were the graph's own analysis.
+            self.prompt.render(
+                question=query.text, report=render_untrusted_passages([report])
+            ),
             MapAnswer,
             system=self.prompt.system,
             model=model,

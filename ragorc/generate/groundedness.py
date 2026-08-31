@@ -43,6 +43,7 @@ from ragorc.core.schemas import ClaimList, ClaimVerdict, GroundednessGrade
 from ragorc.core.settings import Settings, get_settings
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -134,7 +135,10 @@ class GroundednessChecker:
                 grounded=False, score=0.0, method=method, unsupported=[answer[:200]]
             )
 
-        evidence = "\n\n".join(f"[{i}] {c.chunk.content}" for i, c in enumerate(chunks, 1))
+        # Fenced, like the answer prompt's context. An instruction inside a
+        # retrieved passage that persuades this grader defeats the
+        # hallucination guard outright — the grader is the check.
+        evidence = render_untrusted_passages([c.chunk.content for c in chunks])
 
         if method == "nli":
             return await self._check_nli(answer, chunks)
@@ -254,7 +258,7 @@ class GroundednessChecker:
         model = self._load_nli()
         if model is None:
             log.info("nli_unavailable", fallback="llm")
-            evidence = "\n\n".join(c.chunk.content for c in chunks)
+            evidence = render_untrusted_passages([c.chunk.content for c in chunks])
             return await self._check_holistic(answer, evidence)
 
         import re

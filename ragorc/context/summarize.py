@@ -37,6 +37,7 @@ from ragorc.core.settings import Settings, get_settings
 from ragorc.core.tokens import count_tokens
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -116,7 +117,10 @@ class ContextSummarizer:
         per_group = max(int(budget / max(len(groups), 1) * 0.8), 120)
 
         async def summarize(group: list[ScoredChunk]) -> tuple[str, Usage]:
-            joined = "\n\n".join(c.chunk.content for c in group)
+            # Fenced. This stage's output is inserted into the answer prompt as
+            # retrieved evidence, so an instruction that survives it has been
+            # laundered through a model and arrives looking like source text.
+            joined = render_untrusted_passages([c.chunk.content for c in group])
             text, usage = await self.llm.complete(
                 prompt.render(question=question, document=joined),
                 system=prompt.system,
@@ -156,7 +160,10 @@ class ContextSummarizer:
         usages: list[Usage] = []
         running = ""
         for group in groups:
-            joined = "\n\n".join(c.chunk.content for c in group)
+            # Fenced. This stage's output is inserted into the answer prompt as
+            # retrieved evidence, so an instruction that survives it has been
+            # laundered through a model and arrives looking like source text.
+            joined = render_untrusted_passages([c.chunk.content for c in group])
             instruction = (
                 f"Question: {question}\n\n"
                 f"Summary so far:\n{running or '(none yet)'}\n\n"

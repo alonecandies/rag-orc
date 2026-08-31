@@ -119,6 +119,7 @@ from ragorc.index.split.base import split_sentences
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
 from ragorc.retrieve.web import NullWebRetriever, make_web_retriever
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -487,7 +488,13 @@ class CorrectiveRAG:
         """
         prompt = get_prompt("grade_relevance")
         model = self.router.model_for(Task.GRADE_RELEVANCE)
-        prompts = [prompt.render(question=question, document=text) for text in texts]
+        # Fenced individually: a passage that instructs this grader to answer
+        # CORRECT keeps itself in the candidate set, which is the whole point of
+        # the grade. One passage per prompt, so each is numbered [1].
+        prompts = [
+            prompt.render(question=question, document=render_untrusted_passages([text]))
+            for text in texts
+        ]
 
         if isinstance(self.llm, BatchStructuredLLM):
             rows = await self.llm.batch_structured(
@@ -703,7 +710,10 @@ class CorrectiveRAG:
 
         prompt = get_prompt("rewrite_query")
         if irrelevant:
-            joined = "\n\n".join(g.scored.chunk.content for g in irrelevant)
+            # Fenced. This preview is retrieved text shown to the rewriter, and a
+            # rewritten query is what the next retrieval runs — so an instruction
+            # here steers the search itself.
+            joined = render_untrusted_passages([g.scored.chunk.content for g in irrelevant])
             preview = truncate_to_tokens(joined, _REWRITE_PREVIEW_TOKENS)
         else:
             preview = "(retrieval returned nothing)"

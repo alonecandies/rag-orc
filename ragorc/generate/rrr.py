@@ -35,6 +35,7 @@ from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import trace_step
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -131,7 +132,11 @@ class RRR:
     ) -> tuple[Query, Usage]:
         prompt = get_prompt("rewrite_query")
         if previous_result is not None and previous_result.chunks:
-            retrieved = "; ".join(c.chunk.content[:100] for c in previous_result.chunks[:3])
+            # Fenced, for the reason `nodes.rewrite` gives: this excerpt steers a
+            # rewrite, and the rewrite steers the next retrieval.
+            retrieved = render_untrusted_passages(
+                [c.chunk.content[:100] for c in previous_result.chunks[:3]]
+            )
         elif previous_result is not None:
             retrieved = "(nothing was retrieved)"
         else:

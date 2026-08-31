@@ -73,6 +73,7 @@ from ragorc.core.tokens import truncate_to_tokens
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
 from ragorc.retrieve.rerank import BaseReranker
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -284,7 +285,8 @@ class RankGPTReranker(BaseReranker):
         """
         share = int(self.settings.llm.context_window * 0.6 / max(len(passages), 1))
         limit = max(share, _MIN_PASSAGE_TOKENS)
-        return "\n\n".join(
-            f"[{i}] {truncate_to_tokens(text.strip(), limit)}"
-            for i, text in enumerate(passages, start=1)
+        # Fenced: a passage that instructs the ranker to place it first is the
+        # cheapest way to promote attacker-controlled text into the answer.
+        return render_untrusted_passages(
+            [truncate_to_tokens(text.strip(), limit) for text in passages]
         )

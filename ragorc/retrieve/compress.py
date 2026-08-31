@@ -76,6 +76,7 @@ from ragorc.core.tokens import count_tokens, count_tokens_batch
 from ragorc.index.split.base import split_sentences
 from ragorc.llm.prompts import get_prompt
 from ragorc.llm.router import ModelRouter, Task
+from ragorc.security.injection import render_untrusted_passages
 
 log = structlog.get_logger(__name__)
 
@@ -534,7 +535,12 @@ class LLMExtractCompressor(BaseCompressor):
     ) -> tuple[ScoredChunk | None, Usage]:
         source = scored.chunk.content
         result, usage = await self.llm.structured(
-            prompt.render(question=question, document=source),
+            # Fenced. `verbatim_excerpt` below is not a substitute: it only checks
+            # the excerpt is a substring of the source, which an instruction
+            # embedded in that source trivially is — and the verified excerpt then
+            # replaces the chunk body and is packed into the answer prompt as
+            # retrieved evidence.
+            prompt.render(question=question, document=render_untrusted_passages([source])),
             CompressedExcerpt,
             system=prompt.system,
             model=model,

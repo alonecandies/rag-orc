@@ -87,6 +87,7 @@ from ragorc.llm.router import ModelRouter, Task
 from ragorc.pipeline.state import RAGState, evidence, failure, gathered
 from ragorc.retrieve.fusion import fuse
 from ragorc.retrieve.noise import NoiseFilter
+from ragorc.security.injection import render_untrusted_passages
 from ragorc.security.tenancy import require_tenant, scope_filter
 from ragorc.validate.input import QueryValidator
 
@@ -869,7 +870,9 @@ class PipelineNodes:
         prompt = get_prompt("rewrite_query")
         retrieval = state.get("retrieval")
         if retrieval is not None and retrieval.chunks:
-            seen = "; ".join(c.chunk.content[:120] for c in retrieval.chunks[:3])
+            # Fenced: an instruction in a retrieved excerpt steers the rewrite,
+            # and the rewritten query is what the next retrieval runs.
+            seen = render_untrusted_passages([c.chunk.content[:120] for c in retrieval.chunks[:3]])
         else:
             seen = "(nothing relevant was retrieved)"
 
