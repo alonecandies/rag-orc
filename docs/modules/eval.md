@@ -13,7 +13,7 @@ EvalDataset(cases=[], name="eval", source=None)
     async load(path) / save(path)   # JSONL; blank and '#' lines are skipped
     extend(cases)                   # de-duplicates on the question-derived id
     slice(*, paraphrases=None, with_reference=None, with_labels=None, tag=None)
-    sample(n, *, seed=0)  ·  stats()  ·  EvalCase.relevant_ids / .is_paraphrase
+    sample(n, *, seed=0)  ·  stats()  ·  EvalCase.relevant_ids / .is_paraphrase / .unanswerable
 
 SyntheticQuestionGenerator(llm, settings=None, *, router=None, questions_per_chunk=2,
                            paraphrase=True, min_chunk_chars=240, model=None)
@@ -82,6 +82,14 @@ noise instead of reported as an improvement.
 tagged `single_hop`, `multi_hop`, `aggregation`, `unanswerable`, `pricing`, `policy`,
 `late_chunking`. Two are unanswerable on purpose: abstention is a success state, so a
 harness that cannot score it measures the wrong thing.
+
+**An unanswerable case is graded on whether the pipeline abstained**, not on text
+overlap. A case is unanswerable when its `metadata.answerable` is `false`
+(`EvalCase.unanswerable`), and the runner short-circuits to a single
+`abstention` score of 1.0 or 0.0. Grading these the ordinary way compares the answer
+to a reference that *is itself a refusal*, so a confident fabrication scores on
+wording and a correct abstention — phrased from `generation.abstain_message` rather
+than the reference — can score lower than the fabrication.
 
 It carries reference answers and **no** `expected_chunk_ids`: chunk ids are
 content-derived, so a hard-coded one becomes unmatchable the moment the splitter or the

@@ -954,6 +954,100 @@ And two commits this round initially swept unrelated fixes under a single
 topic-specific message; both were split before pushing, but `git add -A` after a
 multi-fix session is how that happens and it happened in round sixteen too.
 
+## 11r. Closed: round eighteen — the previous round's own output, again
+
+Twelve findings. For the sixth consecutive round the highest-yield lens was
+**auditing the previous round's fixes**, and four of round eighteen's twelve came
+from there — three of them mine. The round's shape: **a fix applied to the
+instance in front of me rather than to the property I meant to establish.**
+
+**`/health` still named the backing hosts.** Round seventeen withheld
+`settings.stores` because it names a host an attacker can reach, and the same
+information kept flowing through `stores[].error` — driver exceptions carry the
+address verbatim — and through `stores[].detail`, whose first key on the Neo4j
+*success* path is the address, so a healthy deployment disclosed it
+unconditionally. One field secured; the property untouched. It is now enforced
+once over the whole store entry and asserted over the whole response body, so a
+probe that grows a new field is covered by construction.
+
+**The breaker rule opened the circuit on a healthy store.** `nested.errors and not
+chunks` was written to mean "every leg failed" and fires on *any* failed leg plus
+a legitimately empty result — a filtered query matching nothing on a store that
+answered correctly. `timings_ms` records a leg attempted, `errors` a leg failed,
+so the real question is `attempted and attempted <= set(errors)`. Unknown is not
+an outage: a retriever recording no timings is not judged, because a breaker that
+fails to open leaves the status quo while one that opens wrongly removes a working
+store.
+
+**Two ways a document was reported indexed and was not retrievable.** `_purge`'s
+docstring calls it "Mandatory, not hygiene" — `chunk_id` folds the content in, so
+an edited document's chunks get new ids and the upsert leaves the old ones live
+and citable. Every bypass in `_select_changed` returned an empty `changed` set,
+which is the purge's only input, so `--force` and `skip_unchanged=false` silently
+disabled it. That lands hardest on the one path that exists to re-index what the
+checksum would skip: re-chunking after a splitter change. **No test in the repo
+passed `force=True`.** Separately, the commit marker was written before the
+vectors were confirmed — batches do not wait, so `_stamp_checksums` marked a
+document indexed while its points were only *accepted*, and the read-back that
+exists to catch exactly this ran afterwards and only warned. Measured: 4 of 10
+unretrievable, and the rerun reported `skip_rate=1.0`, which reads as a clean bill
+of health.
+
+**Observability measured the wrong thing.** `slow_query_ms` was compared against
+the sum of the trace steps — steps nest, so a parent's time is counted again in
+each child and concurrent legs are added rather than overlapped; a fast fan-out
+could exceed the threshold while a genuinely slow query with tracing *off*
+measured zero and never fired. And `/metrics` counted only the success path, so an
+outage read as *traffic stopped* — indistinguishable from a quiet night, and the
+opposite of what should page someone.
+
+### What the round is actually about
+
+Three of the four regressions above are the same mistake: I fixed the case I could
+see. The counter-move is to state the invariant and enforce it over the tree
+rather than over the sites named in the finding — and it paid immediately. The
+`trace_enabled` guard, written as "every `new_request_context` call passes
+`trace`" over the AST, found a **seventh** caller the audit had not reported.
+
+Two further pieces of hygiene came out of the same reasoning:
+
+* **Test doubles narrower than the real object hide the calls they cannot
+  receive.** `_GracefullyDead` omitted `timings_ms`, which the real
+  `HybridRetriever` always populates — which is precisely why a predicate unable
+  to distinguish "empty result" from "total outage" looked correct.
+  `_WriteOnlyRelational.delete_document` took no `tenant_id`. Twice in one round.
+
+* **"Prose satisfies a grep"** — `<literal> in inspect.getsource(X)` where the
+  literal is in X's own comment — had happened four times in three rounds, each
+  found by mutation rounds later. `tests/unit/test_source_assertions.py` now asks
+  the question at test time against code with prose blanked. It catches two of the
+  four historical cases and, as its docstring says, structurally cannot catch the
+  other two: those literals do appear in code, just on a different line of the
+  same scope than the test meant. It is a floor under the mutation harness, not a
+  replacement. It caught its first live case in this round's own next commit.
+
+### Two mistakes of mine worth recording
+
+**A failure that does not reproduce on the first retry is a flake to hunt, not a
+transient to note.** The per-commit verifier reported a failure on three different
+commits; each time I retried, it passed, and each time I recorded it and moved on.
+Three data points on three different commits is the signature of a flake rather
+than a bad commit, and I read it as noise three times. Running the suite in a loop
+found it in three runs: my own health test asserted on a probe's error text, which
+names the host only when DNS fails before the 3-second deadline.
+
+**Every one of the four surviving mutations was a test asserting that something
+appeared rather than that the behaviour held** — the field was declared, the call
+was present somewhere in the handler, the fence was balanced. Each passed with the
+fix reverted. The general form: asserting on the shape of the fix reproduces the
+fix, and a test that reproduces the fix cannot fail when the fix is removed. All
+four were rewritten to drive the code and read the result back; 19/19 caught.
+
+### Not re-verified
+
+The end-to-end purge check was run against live stores by the auditor. Docker was
+down when I came to re-run it, so my own evidence for that fix is unit-level.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::

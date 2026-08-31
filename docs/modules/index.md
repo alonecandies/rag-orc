@@ -49,6 +49,7 @@ IngestPipeline(*, vector_store=None, relational_store=None, splitter=None,
                dense_embedder=None, sparse_embedder=None, late_embedder=None,
                late_chunker=None, llm=None, validator=None, settings=None)
     async ingest(target) -> IngestReport      # a Document, a path, or an iterable of either
+    bulk_run()                                # async ctx manager: one bulk-load window across many ingest() calls
     async close() -> None                     # closes only the stores it created
 
 IngestReport(documents_in, documents_indexed, documents_skipped, documents_rejected,
@@ -73,7 +74,27 @@ zero.
 foreign key to `documents(id)` with `ON DELETE CASCADE`, so the order is: per
 window, build chunks → purge the stale ones → write document rows → write chunks;
 then once, at the end of the run, write everything the enrichment stages wanted
-persisted (parents, summarised sources).
+persisted (parents, summarised sources); then the read-back; then the checksums.
+
+**The checksum stamp is written last, after the read-back.** A checksum is the
+marker that says "this document is indexed, skip it next run", and batches do not
+wait for Qdrant to apply them (`qdrant.wait_on_upsert`), so a document whose points
+were merely *accepted* must not be marked. `_flush_vectors` is the read-back that
+exists to catch exactly that; stamping before it ran meant a partially-landed run
+reported `skip_rate=1.0` on the rerun, which reads as a clean bill of health. The
+flush still runs outside the bulk-load stack, so it asks a restored index.
+
+**`bulk_run()` is for a caller that batches.** `ingest()` opens and closes a
+bulk-load window itself, which is right for one call and wrong for a loop: closing
+the window rebuilds the HNSW index, so ingesting 640 documents in batches of 64
+rebuilt it ten times. `bulk_run()` is re-entrant — hold it around the loop and the
+inner windows are no-ops. `ragorc ingest` holds it.
+
+**`--force` purges.** The purge is not hygiene: `chunk_id` folds the content in, so
+an edited document's chunks get *new* ids and an upsert leaves the old ones live and
+citable. Every path that re-indexes a document — `--force` and
+`skip_unchanged=false` included — removes its prior chunks first, and invalidates
+the cached answers that cited them.
 
 Parent-document and multi-representation writes are buffered during processing and
 flushed last because three things have to be true at once, and that is the only

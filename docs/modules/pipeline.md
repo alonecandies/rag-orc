@@ -120,4 +120,5 @@ and the cost ceilings apply; `RAGPipeline.query` already does.
 `graph.local_search_*` · `global_search_*` | which mode the `search_mode` channel selects |
 `retrieval.max_concurrent_retrievers` · `per_store_timeout_s` | superstep width and deadline |
 `cost.max_llm_calls_per_query` · `max_cost_per_query_usd` | the only real bound on a cyclic graph |
-`observability.trace_enabled` · `slow_query_ms` | per-stage timings on `Answer.trace` |
+`observability.trace_enabled` | per-stage timings on `Answer.trace`; off withholds them (a trace records what each stage did with the retrieved text) |
+`observability.slow_query_ms` | warn-log threshold on the query's **wall time** — independent of `trace_enabled`, and not the sum of the steps, which double-counts nesting and adds concurrent legs |
