@@ -341,10 +341,23 @@ class MultiStoreRetriever:
                 for leg, message in nested.errors.items():
                     result.errors[f"{store.value}/{leg}"] = message
                 chunks = list(nested.chunks)
-                if nested.errors and not chunks:
-                    # Every leg failed and nothing came back — an outage, however
-                    # gracefully it was reported. This branch is exempt from the
-                    # outer deadline because the retriever bounds its own legs, and
+                # Every leg that was *attempted* failed. `timings_ms` gets an entry
+                # per attempt and `errors` only per failure, so this is the whole
+                # question and the previous rule — `nested.errors and not chunks` —
+                # was a case that happened to be true in the test I wrote. It also
+                # fires on one failed leg plus a legitimately empty result, which is
+                # a filtered query matching nothing on a *healthy* store: the
+                # breaker would open on a store that answered correctly, which is
+                # worse than the outage it was added to detect.
+                #
+                # Unknown is not an outage: a retriever that records no timings
+                # cannot be judged, and a breaker that does not open leaves the
+                # status quo while one that opens wrongly removes a working store.
+                attempted = set(nested.timings_ms)
+                if attempted and attempted <= set(nested.errors):
+                    # An outage, however gracefully it was reported. This branch
+                    # is exempt from the outer deadline because the retriever
+                    # bounds its own legs, and
                     # `HybridRetriever.retrieve_detailed` also converts *all* leg
                     # failures into `RetrievalResult.errors` and returns normally.
                     # So neither `except` below could fire here and

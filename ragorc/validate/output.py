@@ -176,13 +176,49 @@ class AnswerValidator:
         self._strip_leaks(answer, report)
 
         # --- how much of the answer is actually attributed ----------------
-        report.citation_coverage = self._coverage(answer.text)
+        # Measured from the citations when the style does not use inline markers.
+        # `citation_style="json"` sends a system block that relocates attribution
+        # into `statements` and tells the model *not* to write `[n]`, so counting
+        # markers reported 0% on a fully attributed answer and warned about it —
+        # a metric that measures the other style's output.
+        if gen.citation_style == "json":
+            report.citation_coverage = self._coverage_from_citations(answer)
+        else:
+            report.citation_coverage = self._coverage(answer.text)
         if gen.cite_sources and chunks and report.citation_coverage < 0.5:
             report.warnings.append(f"only {report.citation_coverage:.0%} of sentences are cited")
 
         if report.warnings:
             log.info("answer_validation", valid=report.valid, warnings=report.warnings)
         return report
+
+    @staticmethod
+    def _coverage_from_citations(answer: Answer) -> float:
+        """Attributed share, for a style whose attribution is not inline.
+
+        The same quantity `_coverage` computes — what fraction of the answer's
+        sentences carry a source — read from `Answer.citations` instead of from
+        `[n]` markers, because the JSON style's prompt forbids the markers.
+
+        Each citation carries the claim it attributes, and the generator builds
+        those from the model's own statements, so the ratio is over statements
+        rather than re-split sentences: splitting again would disagree with the
+        split the model was asked to perform.
+        """
+        if not answer.citations:
+            return 0.0
+        claims = {c.claim.strip() for c in answer.citations if c.claim.strip()}
+        # The same split `_coverage` uses, so the two styles report a comparable
+        # number rather than two differently-defined ratios under one name.
+        sentences = [s for s in re.split(r"(?<=[.!?])\s+", answer.text.strip()) if len(s) > 15]
+        if not sentences:
+            return 1.0 if claims else 0.0
+        cited = sum(
+            1
+            for sentence in sentences
+            if any(claim in sentence or sentence in claim for claim in claims)
+        )
+        return round(cited / len(sentences), 4)
 
     def stream_filter(self) -> StreamLeakFilter:
         """A leak filter for a token stream.

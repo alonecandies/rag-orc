@@ -238,3 +238,39 @@ def test_only_our_own_fence_counts_as_a_leak() -> None:
 
     leaked = "Here is the answer <untrusted_document index='1'> oops"
     assert "<untrusted_document" not in _SCAFFOLD.sub("", leaked)
+
+
+async def test_the_json_style_reports_its_own_coverage() -> None:
+    """The fix restored `answer.citations` and left `citation_coverage` counting
+    inline `[n]` markers — which this style's system prompt forbids. A fully
+    attributed answer therefore reported 0% cited and warned about it: a metric
+    measuring the other style's output."""
+    answer, _llm = await _answer()
+
+    assert answer.citations, "precondition: the style produced citations"
+    report = answer.metadata.get("validation") or {}
+    coverage = report.get("citation_coverage")
+    assert coverage is not None, f"no coverage recorded: {sorted(report)}"
+    assert coverage > 0.0, f"a fully attributed answer reported {coverage:.0%} cited"
+    assert not [w for w in (report.get("warnings") or []) if "cited" in w], report.get("warnings")
+
+
+async def test_the_inline_style_still_counts_markers() -> None:
+    """Two styles, one number — but each measured from what its own prompt asks
+    the model to produce."""
+    from ragorc.core.models import Chunk, Query, RetrievalResult, ScoredChunk
+    from ragorc.generate.answer import AnswerGenerator
+    from tests.fakes import StubLLM
+
+    llm = StubLLM(text="Refunds take 14 days [1]. Shipping is separate [1].")
+    generator = AnswerGenerator(llm, _settings(generation={"citation_style": "inline"}))
+    retrieval = RetrievalResult(
+        chunks=[
+            ScoredChunk(
+                chunk=Chunk(id="c1", content="Refunds take 14 days.", document_id="d"), score=1.0
+            )
+        ]
+    )
+    answer = await generator.generate(Query(text="q"), retrieval)
+    coverage = (answer.metadata.get("validation") or {}).get("citation_coverage")
+    assert coverage == 1.0, coverage

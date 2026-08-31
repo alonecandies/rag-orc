@@ -165,3 +165,73 @@ def test_the_redacted_text_is_what_the_validator_produced() -> None:
 
     assert "alice@corp.example" not in validated.query.text
     assert "REDACTED" in validated.query.text
+
+
+# ---------------------------------------------------------------------------
+# The property, not the field
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("store_uri", ["bolt://neo4j-secret.internal.example:7999"])
+def test_no_unauthenticated_response_names_a_backing_host(
+    monkeypatch: pytest.MonkeyPatch, store_uri: str
+) -> None:
+    """Withholding `settings.stores` was fixing the field I was looking at. The
+    same information flowed through `stores[].error` — driver exceptions carry the
+    address verbatim (`Failed to DNS resolve address neo4j.internal:7999`) — and
+    through `stores[].detail`, whose first key on the Neo4j *success* path is the
+    address, so a healthy deployment disclosed it unconditionally.
+
+    The property is that no unauthenticated response names a backing host. It is
+    asserted over the whole body, so a probe that grows a new field is covered.
+    """
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from ragorc.server.app import create_app
+
+    monkeypatch.setenv("RAGORC_SERVER__API_KEYS", '["secret-key"]')
+    monkeypatch.setenv("RAGORC_LLM__API_KEY", "k")
+    monkeypatch.setenv("RAGORC_CACHE__ENABLED", "false")
+    monkeypatch.setenv("RAGORC_GRAPH__ENABLED", "true")
+    monkeypatch.setenv("RAGORC_SECURITY__ENFORCE_TENANT_ISOLATION", "false")
+    monkeypatch.setenv("RAGORC_NEO4J__URI", store_uri)
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app(), raise_server_exceptions=False) as client:
+            anonymous = _json.dumps(client.get("/health").json())
+            operator = _json.dumps(
+                client.get("/health", headers={"X-API-Key": "secret-key"}).json()
+            )
+    finally:
+        get_settings.cache_clear()
+
+    for token in ("neo4j-secret.internal.example", "7999"):
+        assert token not in anonymous, f"an anonymous caller learned {token!r}"
+    # The operator keeps the diagnostic: hiding it from them to hide it from a
+    # stranger would be the wrong trade, and a redacted probe is unactionable.
+    assert "neo4j-secret.internal.example" in operator
+
+
+def test_an_anonymous_probe_still_gets_a_usable_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redacting must not turn the endpoint into a constant. A load balancer keys
+    off the per-store status, and that is what stays."""
+    from fastapi.testclient import TestClient
+
+    from ragorc.server.app import create_app
+
+    monkeypatch.setenv("RAGORC_SERVER__API_KEYS", '["secret-key"]')
+    monkeypatch.setenv("RAGORC_LLM__API_KEY", "k")
+    monkeypatch.setenv("RAGORC_CACHE__ENABLED", "false")
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app(), raise_server_exceptions=False) as client:
+            body = client.get("/health").json()
+    finally:
+        get_settings.cache_clear()
+
+    assert body["status"]
+    assert body["stores"], "a probe with no per-store entries tells a balancer nothing"
+    for store in body["stores"]:
+        assert store["name"] and store["status"]

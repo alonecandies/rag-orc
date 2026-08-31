@@ -284,3 +284,30 @@ async def test_the_global_graph_map_fences_its_community_report() -> None:
     prompts = "\n".join(str(call.get("prompt", "")) for call in llm.calls)
     assert CANARY in prompts, "the fixture never reached the map stage"
     assert "<untrusted_document" in prompts, "the map stage was handed a raw report"
+
+
+def test_a_truncated_preview_still_closes_its_fence() -> None:
+    """CRAG rendered the passages, then truncated the rendered string — cutting it
+    mid-fence, so the untrusted region opened and never closed. Everything after
+    it, including the prompt's own instruction, landed inside a block the model has
+    been told to distrust, and the payload the fence was guarding was the last
+    thing still inside it.
+
+    Truncate the passages, then fence.
+    """
+    import inspect
+
+    from ragorc.retrieve.crag import CorrectiveRAG
+
+    source = inspect.getsource(CorrectiveRAG)
+    fence = source.index("render_untrusted_passages(\n")
+    window = source[max(0, fence - 400) : fence]
+    assert "truncate_to_tokens(joined" not in window, "still truncating the rendered string"
+
+    # And the property: whatever the budget, the fence is balanced.
+    from ragorc.core.tokens import truncate_to_tokens
+    from ragorc.security.injection import render_untrusted_passages
+
+    long_passage = ("Refunds take thirty days. " * 200) + CANARY
+    rendered = render_untrusted_passages([truncate_to_tokens(long_passage, 20)])
+    assert rendered.count("<untrusted_document") == rendered.count("</untrusted_document>") == 1

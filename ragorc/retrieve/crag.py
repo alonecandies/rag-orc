@@ -713,8 +713,18 @@ class CorrectiveRAG:
             # Fenced. This preview is retrieved text shown to the rewriter, and a
             # rewritten query is what the next retrieval runs — so an instruction
             # here steers the search itself.
-            joined = render_untrusted_passages([g.scored.chunk.content for g in irrelevant])
-            preview = truncate_to_tokens(joined, _REWRITE_PREVIEW_TOKENS)
+            # Truncated *then* fenced. The other order cuts the rendered string
+            # mid-fence, so the untrusted region opens and never closes — every
+            # instruction after it, including the prompt's own, lands inside a
+            # block the model has been told to distrust, and the payload the fence
+            # was guarding is the last thing still inside it.
+            budget = max(_REWRITE_PREVIEW_TOKENS // max(len(irrelevant), 1), 1)
+            preview = render_untrusted_passages(
+                [
+                    truncate_to_tokens(g.scored.chunk.content, budget)
+                    for g in irrelevant
+                ]
+            )
         else:
             preview = "(retrieval returned nothing)"
 

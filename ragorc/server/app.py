@@ -1625,6 +1625,34 @@ class RagService:
         return answer
 
     # -- health ------------------------------------------------------------
+    @staticmethod
+    def _public_store_health(store: StoreHealth) -> StoreHealth:
+        """One store's status with everything that names a host removed.
+
+        Round seventeen withheld ``settings.stores`` from an anonymous caller
+        because it named a host an attacker can reach, and left the same
+        information flowing through ``error`` and ``detail``. Driver exceptions
+        carry the address verbatim — the Neo4j driver's is
+        ``Failed to DNS resolve address neo4j.internal:7999`` — and
+        ``Neo4jStore.health()`` returns a detail dict whose first key is the
+        address, so a *healthy* deployment disclosed it unconditionally.
+
+        Fixing the field I was looking at rather than the property is why this is
+        a second finding. The property is: **no unauthenticated response names a
+        backing host.** So the redaction happens once, here, over the whole entry,
+        and a probe that grows a new field is covered by construction.
+
+        Status and latency stay: they are what a probe is for, and neither names
+        anything.
+        """
+        return StoreHealth(
+            name=store.name,
+            status=store.status,
+            latency_ms=store.latency_ms,
+            detail={},
+            error=None if store.error is None else "unavailable",
+        )
+
     async def health(self, *, topology: bool = True) -> HealthResponse:
         """Probe every wired store, then report with a redacted config summary.
 
@@ -1649,6 +1677,8 @@ class RagService:
             for name, value in probed.items()
         ]
         degraded = [store.name for store in stores if store.status != "ok"]
+        if not topology:
+            stores = [self._public_store_health(store) for store in stores]
         warnings = list(self.warnings)
         if not self.settings.server.api_keys:
             warnings.append("server.api_keys is empty: this service is unauthenticated")

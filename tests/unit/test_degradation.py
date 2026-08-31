@@ -56,6 +56,12 @@ class _GracefullyDead:
         await asyncio.sleep(0)
         result = RetrievalResult()
         result.errors = {"dense": "timed out after 10s"}
+        # `timings_ms` gets an entry per leg *attempted* — `HybridRetriever._collect`
+        # records one unconditionally and only adds to `errors` on failure. The
+        # first version of this double omitted it, which is exactly why a predicate
+        # that could not tell "every leg failed" from "one leg failed and the rest
+        # found nothing" looked correct here.
+        result.timings_ms = {"dense": 10_000.0}
         return result
 
 
@@ -64,6 +70,7 @@ class _Healthy(_GracefullyDead):
         self.calls += 1
         result = RetrievalResult()
         result.chunks = [ScoredChunk(chunk=Chunk(id="c1", content="ok"), score=1.0)]
+        result.timings_ms = {"dense": 1.0}
         return result
 
 
@@ -92,6 +99,7 @@ async def test_a_partial_result_is_still_a_success() -> None:
             result = RetrievalResult()
             result.errors = {"sparse": "down"}
             result.chunks = [ScoredChunk(chunk=Chunk(id="c1", content="ok"), score=1.0)]
+            result.timings_ms = {"dense": 1.0, "sparse": 5.0}
             return result
 
     retriever = _multi(_Partial())
@@ -196,3 +204,46 @@ def test_the_guard_still_reads_what_the_path_now_writes() -> None:
     reader = inspect.getsource(RagService._cache_set)
     assert 'metadata["errors"]' in writer
     assert 'metadata.get("errors")' in reader
+
+
+async def test_a_healthy_store_that_matched_nothing_is_not_an_outage() -> None:
+    """The case the previous rule got wrong, and the reason it is now phrased as a
+    property rather than a case.
+
+    `nested.errors and not chunks` fires whenever *one* leg failed and the rest
+    legitimately found nothing — a filtered query matching no documents on a store
+    that answered correctly. The breaker would then open on a working store, which
+    is worse than the outage it was added to detect. "Every leg attempted failed"
+    is the actual question.
+    """
+    class _OneLegDownRestEmpty(_GracefullyDead):
+        async def retrieve_detailed(self, query: Query, **kw: Any) -> RetrievalResult:
+            self.calls += 1
+            result = RetrievalResult()
+            result.timings_ms = {"dense": 2.0, "sparse": 3.0}
+            result.errors = {"sparse": "down"}
+            result.per_store = {"dense": []}  # healthy, and the filter matched nothing
+            return result
+
+    retriever = _multi(_OneLegDownRestEmpty())
+    for _ in range(12):
+        await retriever.retrieve_detailed(Query(text="q"), top_k=3)
+
+    breaker = retriever.breakers[DataStore.VECTOR]
+    assert breaker._failures == 0, "the breaker opened on a store that answered"
+    assert not breaker.is_open
+
+
+async def test_a_retriever_that_reports_no_timings_is_not_judged() -> None:
+    """Unknown is not an outage. A breaker that does not open leaves the status
+    quo; one that opens wrongly removes a working store."""
+    class _NoTimings(_GracefullyDead):
+        async def retrieve_detailed(self, query: Query, **kw: Any) -> RetrievalResult:
+            self.calls += 1
+            result = RetrievalResult()
+            result.errors = {"dense": "down"}
+            return result
+
+    retriever = _multi(_NoTimings())
+    await retriever.retrieve_detailed(Query(text="q"), top_k=3)
+    assert retriever.breakers[DataStore.VECTOR]._failures == 0
