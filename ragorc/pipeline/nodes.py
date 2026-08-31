@@ -82,7 +82,7 @@ from ragorc.core.schemas import RewriteOutput, SufficiencyCheck, UtilityGrade
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import timed, trace_step
 from ragorc.generate.answer import AnswerGenerator
-from ragorc.llm.prompts import PROMPTS, get_prompt
+from ragorc.llm.prompts import get_prompt, resolve_prompt_name
 from ragorc.llm.router import ModelRouter, Task
 from ragorc.pipeline.state import RAGState, evidence, failure, gathered
 from ragorc.retrieve.fusion import fuse
@@ -139,23 +139,6 @@ def _resolved(component: _T | None, name: str) -> _T:
     if component is None:  # pragma: no cover - __post_init__ makes this unreachable
         raise RuntimeError(f"PipelineNodes.{name} was not initialised")
     return component
-
-
-def resolve_prompt_name(name: str | None) -> str | None:
-    """Accept both a prompt's registered name and its bare form.
-
-    ``generation.prompt_name`` defaults to ``"default"`` while the prompt library
-    registers it as ``"answer_default"`` — the same shorthand a user will type when
-    they ask for ``"concise"`` or ``"technical"``. Resolving the ``answer_``-prefixed
-    form here means a perfectly reasonable setting value does not become a
-    ``KeyError`` three stages later, inside the generator, on the request path.
-    """
-    if not name:
-        return None
-    if name in PROMPTS:
-        return name
-    prefixed = f"answer_{name}"
-    return prefixed if prefixed in PROMPTS else name
 
 
 def _replace_chunks(

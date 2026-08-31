@@ -971,9 +971,15 @@ class Settings(BaseSettings):
         # Fail at startup on an unknown prompt name. Discovering it as a
         # KeyError inside the generator means the first real request 500s.
         try:
-            from ragorc.llm.prompts import PROMPTS
+            # Through the resolver, because the shorthand is legitimate: the
+            # whole reason `resolve_prompt_name` exists is that
+            # `generation.prompt_name` defaults to "default" while the library
+            # registers "answer_default". Checking the raw value rejected the
+            # documented shorthand at startup — the setting the resolver was
+            # written for could not be set.
+            from ragorc.llm.prompts import PROMPTS, resolve_prompt_name
 
-            if self.generation.prompt_name not in PROMPTS:
+            if resolve_prompt_name(self.generation.prompt_name) not in PROMPTS:
                 from ragorc.core.errors import ConfigError
 
                 raise ConfigError(

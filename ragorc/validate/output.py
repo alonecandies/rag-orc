@@ -68,9 +68,25 @@ def _marker_indices(text: str) -> list[int]:
     return out
 
 
-_SCAFFOLD = re.compile(
-    r"</?(?:untrusted_document|system|instruction|context)\b[^>]*>", re.IGNORECASE
-)
+_SCAFFOLD = re.compile(r"</?untrusted_document\b[^>]*>", re.IGNORECASE)
+"""Scaffolding *this library* emits, and nothing else.
+
+``system``, ``instruction`` and ``context`` were borrowed from the *inbound*
+injection-detection pattern (:mod:`ragorc.security.injection`), where they are
+defensive. Here they delete legitimate answer content, and the ``\b`` after the
+tag name matches an XML namespace prefix — so an answer written by
+``answer_technical``, whose whole job is to reproduce code exactly, came back
+mangled::
+
+    model wrote : Add `<context:component-scan base-package="com.acme"/>` to the
+                  beans file [1]. Do not use the `<system>` element [1].
+    reader gets : Add `` to the beans file [1]. Do not use the `` element [1].
+
+and the answer was flagged ``scaffold_leak`` for containing Spring configuration.
+The only tag the packer produces is ``<untrusted_document>``
+(:func:`~ragorc.security.injection.wrap_untrusted`), so that is the only one whose
+appearance in an answer means the fence leaked.
+"""
 
 
 #: Typographic characters that carry no meaning difference from their ASCII form.

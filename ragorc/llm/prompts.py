@@ -15,7 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["PROMPTS", "Prompt", "get_prompt", "register_prompt"]
+__all__ = [
+    "PROMPTS",
+    "Prompt",
+    "get_prompt",
+    "register_prompt",
+    "resolve_prompt_name",
+]
 
 
 @dataclass(slots=True, frozen=True)
@@ -42,9 +48,33 @@ def register_prompt(prompt: Prompt) -> Prompt:
     return prompt
 
 
+def resolve_prompt_name(name: str | None) -> str | None:
+    """Accept both a prompt's registered name and its bare form.
+
+    ``generation.prompt_name`` defaults to ``"default"`` while the library
+    registers it as ``"answer_default"`` — the same shorthand a user will type when
+    they ask for ``"concise"`` or ``"technical"``.
+
+    Defined here, beside :data:`PROMPTS`, because it was defined in
+    ``pipeline.nodes`` and therefore reached one of the two wirings that consume a
+    routed prompt name: the RAGPipeline node resolved it, and
+    ``AnswerGenerator.generate``/``stream`` — the path the HTTP engine takes — did
+    not. Two spellings of one predicate is the shape half this library's defects
+    take, so :func:`get_prompt` now applies it and there is nothing left to
+    remember at a call site.
+    """
+    if not name:
+        return None
+    if name in PROMPTS:
+        return name
+    prefixed = f"answer_{name}"
+    return prefixed if prefixed in PROMPTS else name
+
+
 def get_prompt(name: str) -> Prompt:
+    resolved = resolve_prompt_name(name) or name
     try:
-        return PROMPTS[name]
+        return PROMPTS[resolved]
     except KeyError:
         raise KeyError(f"unknown prompt {name!r}; known: {sorted(PROMPTS)}") from None
 

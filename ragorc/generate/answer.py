@@ -35,6 +35,7 @@ from ragorc.context.pack import ContextPacker
 from ragorc.context.summarize import ContextSummarizer
 from ragorc.core.models import (
     Answer,
+    Citation,
     Query,
     RetrievalResult,
     RouteDecision,
@@ -47,7 +48,7 @@ from ragorc.core.schemas import AnswerWithCitations
 from ragorc.core.settings import Settings, get_settings
 from ragorc.core.telemetry import current_trace, timed, trace_step
 from ragorc.generate.abstain import AbstentionDecision, AbstentionPolicy
-from ragorc.generate.citations import extract_citations
+from ragorc.generate.citations import _base_offset, attribute_spans, extract_citations
 from ragorc.generate.consistency import SelfConsistencyChecker
 from ragorc.generate.groundedness import GroundednessChecker, GroundednessResult
 from ragorc.llm.prompts import get_prompt
@@ -57,6 +58,55 @@ from ragorc.validate.output import AnswerValidator
 log = structlog.get_logger(__name__)
 
 __all__ = ["AnswerGenerator"]
+
+
+def _citations_from_statements(
+    structured: AnswerWithCitations, packed: Sequence[ScoredChunk]
+) -> list[Citation]:
+    """Turn the model's ``statements`` into citations.
+
+    This style's whole purpose is attribution, and its system prompt relocates
+    attribution out of inline ``[n]`` markers and into ``statements`` — which had
+    no reader anywhere in the package. So the branch parsed the field and threw it
+    away, then ran the inline-marker regex over an answer that by construction
+    contains no markers.
+
+    ``source_ids`` are 1-based passage numbers, the same numbering
+    :func:`~ragorc.generate.citations.extract_citations` resolves and the packer
+    renders. Out-of-range ids are dropped rather than clamped: a model naming
+    passage 9 of 3 is guessing, and a citation pointing at the wrong passage is
+    worse than one that is absent.
+    """
+    out: list[Citation] = []
+    seen: set[tuple[str, str]] = set()
+    for statement in structured.statements:
+        claim = statement.text.strip()
+        if not claim:
+            continue
+        for number in statement.source_ids:
+            index = int(number) - 1
+            if not 0 <= index < len(packed):
+                continue
+            chunk = packed[index].chunk
+            key = (chunk.id, claim[:80])
+            if key in seen:
+                continue
+            seen.add(key)
+            quote, start, end, support = attribute_spans(claim, chunk.content)
+            base = _base_offset(packed[index])
+            out.append(
+                Citation(
+                    chunk_id=chunk.id,
+                    document_id=chunk.document_id,
+                    quote=quote,
+                    claim=claim,
+                    support=support,
+                    source=chunk.metadata.get("source") or chunk.metadata.get("title"),
+                    start_char=None if base is None or start is None else base + start,
+                    end_char=None if base is None or end is None else base + end,
+                )
+            )
+    return out
 
 
 @register("generator", "answer", "default")
@@ -147,6 +197,7 @@ class AnswerGenerator:
         rendered = prompt.render(context=pack.text, question=query.text)
         model = self.router.model_for(Task.ANSWER)
 
+        json_citations: list[Citation] | None = None
         if gen.self_consistency_samples > 1:
             checker = SelfConsistencyChecker(self.llm, self.settings)
             with timed("generate_self_consistent", samples=gen.self_consistency_samples):
@@ -160,7 +211,15 @@ class AnswerGenerator:
             structured, usage = await self.llm.structured(
                 rendered,
                 AnswerWithCitations,
-                system=get_prompt("answer_with_citations").system,
+                # The routed prompt's system block *plus* the attribution
+                # contract, not instead of it. Hardcoding
+                # `answer_with_citations.system` discarded the router's choice, so
+                # `answer_technical` and `answer_concise` had no effect under this
+                # style while `answer.metadata["prompt"]` still reported the routed
+                # name.
+                system="\n\n".join(
+                    filter(None, [prompt.system, get_prompt("answer_with_citations").system])
+                ),
                 model=model,
                 # The same cap the plain path applies. Without it this path ran at
                 # the global `llm.max_tokens`, and the context packer had already
@@ -174,6 +233,13 @@ class AnswerGenerator:
             text = structured.answer
             model_insufficient = not structured.sufficient
             confidence = 1.0
+            # The attribution this style exists for. The system block above tells
+            # the model to put it in `statements` and *not* to write inline `[n]`,
+            # and `statements` had no reader anywhere in the package — so
+            # `extract_citations` below regexed for markers the prompt had
+            # explicitly relocated, `answer.citations` came back empty and
+            # `citation_coverage` was 0.0 with `report.valid` still True.
+            json_citations = _citations_from_statements(structured, packed)
         else:
             with timed("generate_answer", model=model):
                 text, usage = await self.llm.complete(
@@ -190,7 +256,10 @@ class AnswerGenerator:
         text = text.strip()
 
         # --- citations + validation (cheap, decisive) -----------------------
-        citations = extract_citations(text, packed) if gen.cite_sources else []
+        if json_citations is not None:
+            citations = json_citations if gen.cite_sources else []
+        else:
+            citations = extract_citations(text, packed) if gen.cite_sources else []
         answer = Answer(
             text=text,
             citations=citations,
