@@ -893,6 +893,67 @@ retrieval; the effect was invisible because `retrieve_detailed` returns
 `max(fetch_k, top_k)`, so below the default 50 the flag moved a floor. Fixed as
 the milder thing it is.
 
+## 11q. Closed: round seventeen — the prompts, degradation, and the transport
+
+Seventeen findings across three surfaces none of the previous nine rounds had
+touched. The round's shape: **the library's stated security and degradation
+properties were implemented at one site each, and named in docstrings as though
+they held everywhere.**
+
+**Retrieved text was fenced only in the answer prompt.** `ContextPacker` wraps
+passages in `<untrusted_document>` and `validate/output.py` spends ~200 lines
+detecting forgery of that tag, so the position is explicit — and nine other
+query-time stages interpolated raw. The attacks are concrete and each promotes
+attacker text into the answer: persuade the groundedness grader and the
+hallucination guard passes; persuade CRAG and a document grades CORRECT; persuade
+RankGPT and it ranks first. A compressor's output then enters the answer prompt
+*as retrieved evidence*, laundered through a model.
+
+The guard test's first draft listed seven module paths and omitted the eighth,
+`retrieve/compress.py` — which `render_untrusted_passages`' own docstring named,
+in the same commit, as one of "both compressors". Its AST rule also only matched
+`"...".join(...)`, the shape that file does not use, so adding the path would not
+have caught it. It now *discovers* query-path prompt consumers and matches both
+shapes. **A list of sites is a thing that goes stale the moment one is added; the
+question can be asked of the tree instead.**
+
+**`server.max_body_bytes` was not enforced on the wire.** The middleware checked
+the declared `Content-Length`, and a chunked request declares none — so a 64 MiB
+body was buffered in full and answered 200 on `DELETE /documents`, and buffered in
+full on `/query` for a caller with **no credential**. The bypass sat in front of
+authentication. Closed with a pure-ASGI middleware; the first attempt used
+`@app.middleware("http")` and turned every request into a parse error, because
+that layer hands the endpoint a *different* `Request` built from the same channel
+and wrapping a `Request`'s own `receive` makes the wrapper call itself.
+
+**Three degradation claims were true in a docstring and not in the code.** A total
+outage was recorded as a circuit-breaker *success*, because the exempt
+self-bounding retriever converts every leg failure into `errors` and returns
+normally — so the breaker never opened and a wedged Qdrant cost every request the
+full deadline forever. `_route`'s documented "query everything" fallback returned
+`RouteDecision(stores=())`, which is the *opposite* branch and planned nothing.
+And `_cache_set` refuses to cache a degraded answer by reading
+`answer.metadata["errors"]`, a key only the graph path ever wrote — so the HTTP
+path cached the outage for the full TTL, which its own docstring says it was
+written to stop.
+
+**The prompts had never been audited.** `citation_style="json"` sends a system
+block that relocates attribution into `statements` and *away* from inline `[n]`,
+then discarded `statements` and ran the inline-marker regex — zero citations on the
+one style whose purpose is attribution. The same branch hardcoded that system
+block, so the router's prompt choice had no effect while `metadata["prompt"]` still
+reported it. And `_SCAFFOLD` matched `<system>`/`<instruction>`/`<context>`
+borrowed from the *inbound* injection pattern, deleting legitimate answer content:
+an `answer_technical` answer containing Spring configuration came back as
+``Add `` to the beans file`` and was flagged `scaffold_leak` for it.
+
+**Two mistakes of mine worth recording.** A module-level helper inserted above a
+decorated class captured its `@register` decorator — the same near miss as round
+fifteen, caught by mypy again, and now twice is a pattern rather than an accident.
+And two commits this round initially swept unrelated fixes under a single
+topic-specific message; both were split before pushing, but `git add -A` after a
+multi-fix session is how that happens and it happened in round sixteen too.
+
 ## 12. Open: an intermittent SIGABRT at interpreter teardown on macOS
 
 Still open, but no longer a mystery. A macOS crash report names the frames::

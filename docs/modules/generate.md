@@ -113,7 +113,7 @@ print(result.report())  # iterations, accepted_at, abstained, verdict per attemp
 
 | Setting | Effect |
 |---|---|
-`generation.prompt_name` · `cite_sources` · `citation_style` | `json` uses the structured `AnswerWithCitations` schema |
+`generation.prompt_name` · `cite_sources` · `citation_style` | `prompt_name` accepts the shorthand (`concise` resolves to `answer_concise`). `json` returns attribution in `AnswerWithCitations.statements`, converted to `Answer.citations`; its system prompt tells the model *not* to write inline `[n]`, so the two styles differ at the parsing layer, and the routed prompt's system block is composed with the attribution contract rather than replaced by it |
 `generation.check_groundedness` · `groundedness_method` · `groundedness_threshold` | `llm` \| `nli` \| `both` |
 `generation.verify_citations` · `decompose_claims` | the free check and the highest-fidelity one |
 `generation.self_consistency_samples` · `self_consistency_threshold` | >1 multiplies synthesis cost by N |

@@ -313,6 +313,43 @@ after redaction), `flag`.
 - All credentials are `SecretStr`; `Settings.summary()` is redaction-safe.
 - The log processor redacts any key containing `api_key`, `password`, `token`,
   `secret`, `authorization`, `dsn`.
+### Retrieved text is fenced in every prompt, not just the answer's
+
+`ContextPacker` wraps each passage in `<untrusted_document>`, and so does every
+other stage that reads retrieved text: the groundedness grader, CRAG's relevance
+grader and its rewrite preview, RankGPT, both compressors, the context summarizer,
+the three rewrite excerpts, and graph-global's community report. One renderer —
+`security.render_untrusted_passages` — so there is one tag and not two spellings
+of one; a second tag would defeat the output validator, which matches on it.
+
+Only the answer prompt had the fence, and the attacks the others enabled were
+concrete: an instruction that persuades the groundedness grader defeats the
+hallucination guard, one that persuades CRAG marks a document CORRECT, one that
+persuades RankGPT ranks it first. A compressor's output is inserted into the
+answer prompt *as retrieved evidence*, so an instruction surviving it has been
+laundered through a model. `verbatim_excerpt` is not a backstop — it only checks
+the excerpt is a substring of the source, which an embedded instruction is.
+
+### `/health` is open, and says less to a stranger
+
+Liveness and per-store status to anyone — a probe behind an API key cannot be
+scraped by the load balancer that needs it. The configuration summary needs a key,
+because `Settings.summary()` redacts *credentials* and not *topology*: an
+anonymous caller was receiving `postgres: "db.internal:5433/prod"` on a service
+where all twelve data routes return 401. A deployment with no keys configured
+hides nothing.
+
+### The body ceiling holds before authentication
+
+`server.max_body_bytes` is enforced by a pure-ASGI middleware installed outermost,
+counting bytes as they arrive. The declared `Content-Length` is a claim and a
+chunked request makes none, so checking the header alone let a 64 MiB body be
+buffered in full on `/query` for a caller with no credential.
+
+`server.request_timeout_s` bounds `/query`, `GET /documents` and
+`DELETE /documents`. `ingest` and `eval` are exempt by design — long-running by
+nature, and a 120-second cap would abort them mid-run.
+
 - `observability.log_prompts` is **off by default** — prompts contain retrieved
   customer data, and an audit log that copies it becomes the thing it was meant
   to protect against. Turning it on records the question on the `query` line and
