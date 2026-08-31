@@ -227,3 +227,60 @@ async def test_the_ranker_sees_fenced_passages() -> None:
     joined = "\n".join(str(c.get("prompt", "")) for c in llm.calls)
     assert CANARY in joined
     assert "<untrusted_document" in joined, "the ranker was handed raw passages"
+
+
+# ---------------------------------------------------------------------------
+# Behaviour at the two stages the AST rule cannot see
+# ---------------------------------------------------------------------------
+# Both assign chunk text to a local first — `source = scored.chunk.content`,
+# `report = community.summary` — so the keyword the prompt receives is a plain
+# Name and the rule above walks past it. Found by mutation: reverting either call
+# left the whole suite green. Drive them instead.
+async def test_the_extract_compressor_fences_its_document() -> None:
+    """`verbatim_excerpt` is no backstop: it only checks the excerpt is a
+    substring of the source, which an embedded instruction is — and the verified
+    excerpt then replaces the chunk body and is packed as retrieved evidence."""
+    from ragorc.core.models import Chunk, Query, ScoredChunk
+    from ragorc.retrieve.compress import LLMExtractCompressor
+    from tests.fakes import StubLLM
+
+    llm = StubLLM()
+    compressor = LLMExtractCompressor(llm, _settings())
+    chunk = ScoredChunk(
+        chunk=Chunk(id="c1", content=f"Refunds take 30 days. {CANARY}", document_id="d"),
+        score=1.0,
+    )
+
+    await compressor.compress(Query(text="refund window?"), [chunk])
+
+    prompts = "\n".join(str(call.get("prompt", "")) for call in llm.calls)
+    assert CANARY in prompts, "the fixture never reached the compressor"
+    assert "<untrusted_document" in prompts, "the compressor was handed raw retrieved text"
+
+
+async def test_the_global_graph_map_fences_its_community_report() -> None:
+    """A community summary is LLM-written from corpus text, so an instruction in
+    an ingested document can survive into it and arrive as the graph's own
+    analysis."""
+    from ragorc.core.models import Community, Query
+    from ragorc.retrieve.graph import GraphGlobalRetriever
+    from tests.fakes import FakeGraphStore, StubLLM
+
+    graph = FakeGraphStore()
+    graph.communities_list = [  # type: ignore[attr-defined]
+        Community(id="k1", level=0, title="Refunds", summary=f"Thirty days. {CANARY}")
+    ]
+
+    async def _communities(**kw: Any) -> list[Community]:
+        return graph.communities_list  # type: ignore[attr-defined]
+
+    graph.communities = _communities  # type: ignore[method-assign]
+    llm = StubLLM()
+
+    await GraphGlobalRetriever(llm, graph, settings=_settings()).retrieve(
+        Query(text="what are the themes?"), top_k=3
+    )
+
+    prompts = "\n".join(str(call.get("prompt", "")) for call in llm.calls)
+    assert CANARY in prompts, "the fixture never reached the map stage"
+    assert "<untrusted_document" in prompts, "the map stage was handed a raw report"

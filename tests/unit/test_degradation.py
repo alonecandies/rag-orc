@@ -160,14 +160,29 @@ async def test_no_route_reaches_every_store() -> None:
 def test_the_linear_path_stamps_store_errors_on_the_answer() -> None:
     """`_cache_set`'s guard reads `answer.metadata["errors"]`, and only the graph
     path wrote it — so on the HTTP path the predicate was never true and the
-    outage answer was served for the whole TTL."""
+    outage answer was served for the whole TTL.
+
+    Comments stripped before the search. The first version grepped the method
+    source and the *comment explaining the fix* contains the key, so deleting the
+    assignment left it green — the same trap that has now caught four tests in this
+    repo. An AST walk sees code and not prose.
+    """
+    import ast
     import inspect
+    import textwrap
 
     from ragorc.server.app import _LinearEngine
 
-    source = inspect.getsource(_LinearEngine.query)
-    assert 'answer.metadata["errors"]' in source, "the cache guard has no writer on this path"
-    assert "store_errors" in source
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_LinearEngine.query)))
+    written = {
+        ast.unparse(target)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+    }
+    assert "answer.metadata['errors']" in written, (
+        f"the cache guard has no writer on this path: {sorted(written)}"
+    )
 
 
 def test_the_guard_still_reads_what_the_path_now_writes() -> None:
