@@ -182,12 +182,31 @@ def test_no_unauthenticated_response_names_a_backing_host(
 
     The property is that no unauthenticated response names a backing host. It is
     asserted over the whole body, so a probe that grows a new field is covered.
-    """
-    import json as _json
 
+    Over the body's *strings*, though, not over its JSON text. A disclosure can
+    only be a string — a host or a port that leaked is text in some field — while
+    the JSON text also carries the latency floats, and a 4-digit port collides with
+    those about one run in eight: `"latency_ms": 253.6327999713` contains `7999`.
+    Walking the parsed structure keeps every field in scope and removes the
+    coincidence.
+    """
     from fastapi.testclient import TestClient
 
     from ragorc.server.app import create_app
+
+    def strings(node: object) -> list[str]:
+        """Every string anywhere in the response, keys included."""
+        if isinstance(node, str):
+            return [node]
+        if isinstance(node, dict):
+            return [
+                text
+                for key, value in node.items()
+                for text in (str(key), *strings(value))
+            ]
+        if isinstance(node, list):
+            return [text for item in node for text in strings(item)]
+        return []
 
     monkeypatch.setenv("RAGORC_SERVER__API_KEYS", '["secret-key"]')
     monkeypatch.setenv("RAGORC_LLM__API_KEY", "k")
@@ -198,15 +217,14 @@ def test_no_unauthenticated_response_names_a_backing_host(
     get_settings.cache_clear()
     try:
         with TestClient(create_app(), raise_server_exceptions=False) as client:
-            anonymous = _json.dumps(client.get("/health").json())
-            operator = _json.dumps(
-                client.get("/health", headers={"X-API-Key": "secret-key"}).json()
-            )
+            anonymous = strings(client.get("/health").json())
+            operator = client.get("/health", headers={"X-API-Key": "secret-key"}).json()
     finally:
         get_settings.cache_clear()
 
     for token in ("neo4j-secret.internal.example", "7999"):
-        assert token not in anonymous, f"an anonymous caller learned {token!r}"
+        leaked = [text for text in anonymous if token in text]
+        assert not leaked, f"an anonymous caller learned {token!r} via {leaked}"
 
     # The *success* path too. `Neo4jStore.health()` returns a detail dict whose
     # first key is the address, so a healthy deployment disclosed it
@@ -233,7 +251,7 @@ def test_no_unauthenticated_response_names_a_backing_host(
     # "probe exceeded 3.0s" and names nothing. The first version asserted on that
     # text and failed roughly one run in three — a flake I chased across three
     # different commits before running the suite in a loop to catch it.
-    assert "stores" in (_json.loads(operator).get("settings") or {}), (
+    assert "stores" in (operator.get("settings") or {}), (
         "the operator lost the configuration summary"
     )
 

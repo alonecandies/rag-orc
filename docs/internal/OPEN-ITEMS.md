@@ -1036,6 +1036,16 @@ than a bad commit, and I read it as noise three times. Running the suite in a lo
 found it in three runs: my own health test asserted on a probe's error text, which
 names the host only when DNS fails before the 3-second deadline.
 
+Running the loop *again after that fix* found a second flake in the same test, at
+about one run in eight. This one was not a timing dependency: the test asserted the
+port `7999` was absent from the response's JSON **text**, and a latency float
+contains a given four-digit run often enough to matter —
+`"latency_ms": 253.6327999713`. It now walks the parsed body and searches only its
+strings, which is where a disclosure can actually live; the floats are out of scope
+by construction rather than by luck. The lesson generalises past the flake: a
+substring search over a serialized document is a different assertion from the one
+you meant, because serialization invents text the document does not contain.
+
 **Every one of the four surviving mutations was a test asserting that something
 appeared rather than that the behaviour held** — the field was declared, the call
 was present somewhere in the handler, the fence was balanced. Each passed with the
