@@ -535,6 +535,10 @@ class IngestPipeline:
         #: recursive one, and per-request metadata never reached a document.
         self.loader_options: dict[str, Any] = dict(loader_options or {})
         self._owns_stores = False
+        #: Documents whose chunks are written but whose vectors are not yet
+        #: confirmed applied. Their checksums — the marker that makes the next
+        #: run skip them — are stamped only after `_flush_vectors` returns.
+        self._awaiting_confirmation: list[Document] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -641,6 +645,13 @@ class IngestPipeline:
             # Outside the bulk-load stack, so the read-back sees an index that has
             # been restored and finished building rather than one still suspended.
             await self._flush_vectors(report)
+            # And *then* the commit marker. Everything above can fail, and a
+            # failure that leaves the marker behind is worse than the failure: the
+            # retry skips the document and reports success over an index that never
+            # received it. That was true of the vector write too, which the marker
+            # used to precede.
+            await self._stamp_checksums(self._awaiting_confirmation, report)
+            self._awaiting_confirmation.clear()
 
         report.total_ms = _elapsed_ms(run_started)
         log.info("ingest_complete", **report.summary())
@@ -811,9 +822,29 @@ class IngestPipeline:
     async def _select_changed(
         self, documents: Sequence[Document], report: IngestReport, *, force: bool = False
     ) -> tuple[list[Document], set[str]]:
-        """Split into work and no-ops. Returns ``(to_index, ids_that_changed)``."""
+        """Split into work and no-ops. Returns ``(to_index, ids_that_changed)``.
+
+        On every bypass the second element is *every* document, not the empty set.
+        It is the only input to the stale purge — `_run` computes
+        ``stale = [doc for doc in ready if doc.id in changed]`` — so returning
+        nothing silently disabled a step `_purge` calls "Mandatory, not hygiene",
+        along with the answer-cache invalidation nested inside it.
+
+        Measured on `--force`: editing "Refunds … within 30 days" to "… within 7
+        days" left both versions retrievable and citable, and
+        `answers_invalidated: 0`. `chunk_id` folds the content in, so the edited
+        document's chunks get new ids and the upsert leaves the old ones in place.
+        `--force` is documented as "ignores the checksum skip"; disabling the purge
+        was a second, unstated effect, and it is the effect that matters most on
+        the one path that exists to re-index content the checksum would skip —
+        re-chunking after a `chunk_size` or splitter change.
+
+        Purging a document that has no prior chunks is a no-op delete, and the
+        purge runs before this window's chunks are written, so naming every
+        document is safe as well as correct.
+        """
         if force or not self.config.skip_unchanged or self.relational is None:
-            return list(documents), set()
+            return list(documents), {doc.id for doc in documents}
 
         started = time.perf_counter()
         known = await self._existing_checksums([doc.id for doc in documents])
@@ -1304,11 +1335,14 @@ class IngestPipeline:
         # vector write left parents behind, and the retry then skipped the
         # document as already done with none of its searchable content indexed.
         await self._flush_deferred(deferred, report)
-        # The commit marker, written last and deliberately. Everything above can
-        # fail, and a failure that leaves the marker behind is worse than the
-        # failure: the retry skips the document and reports success over an index
-        # that never received it.
-        await self._stamp_checksums(landed, report)
+        # The commit marker is *not* written here. It is written by `_ingest`,
+        # after `_flush_vectors` has confirmed the points are applied — see
+        # `_stamp_checksums`. Batches do not wait (`qdrant.wait_on_upsert`), so
+        # stamping at the end of this window marked a document indexed while its
+        # vectors were still only *accepted*, and the retry then skipped it:
+        # measured, 4 of 10 documents unretrievable and `skip_rate=1.0` on the
+        # rerun, which reads as a clean bill of health.
+        self._awaiting_confirmation.extend(landed)
 
     async def _process_window(
         self,

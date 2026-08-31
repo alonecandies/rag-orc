@@ -533,6 +533,7 @@ class _WriteOnlyRelational:
     def __init__(self) -> None:
         self.documents: list[Document] = []
         self.chunks: list[Chunk] = []
+        self.deleted: list[tuple[str, str | None]] = []
 
     async def ensure_schema(self) -> None:
         return None
@@ -545,7 +546,12 @@ class _WriteOnlyRelational:
         self.chunks.extend(chunks)
         return len(chunks)
 
-    async def delete_document(self, document_id: str) -> int:
+    async def delete_document(self, document_id: str, *, tenant_id: str | None = None) -> int:
+        # The real `PostgresStore.delete_document` is tenant-scoped, and `_purge`
+        # passes the scope. The double omitted the keyword, which only surfaced
+        # once the purge began running on this fixture's path — a double narrower
+        # than the thing it stands in for hides the call it cannot receive.
+        self.deleted.append((document_id, tenant_id))
         return 0
 
     async def close(self) -> None:
